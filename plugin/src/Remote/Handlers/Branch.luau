@@ -3,12 +3,14 @@
 --
 --   branch_checkpoint {name}        main   serialize each content service,
 --                                          then number the tree in the same
---                                          op so blobs and numbering agree;
+--                                          op so blobs and numbering agree,
+--                                          and pin a shape of that numbering;
 --                                          starts main's own recorder and
 --                                          marks it for this branch
---   branch_adopt {checkpoint,count} branch number the freshly loaded clone,
---                                          verify it agrees with main's
---                                          count, start the journal
+--   branch_adopt {checkpoint, count, branch align the freshly loaded clone
+--                 shapeBlob?}               against main's shape (or, without
+--                                          shapeBlob, against its count) and
+--                                          start the journal
 --   journal_flush {}                both   push everything pending now
 --   journal_status {}               both   what the recorder is holding
 --   journal_replay {checkpoint,     main   apply a branch's stream inside one
@@ -150,7 +152,38 @@ function BranchOps.ops.branch_checkpoint(args: Args, _ctx)
 		blobIds[content.Name] = blobId :: string
 	end
 
-	local numbered = Journal.checkpoint(services)
+	local numbered = Journal.checkpoint(services, true)
+
+	-- The shape is what a clone aligns against. Studio adds instances of its
+	-- own when it opens a place file, so the clone can never reproduce main's
+	-- count exactly; it can reproduce main's *tree*, and that is what this
+	-- describes.
+	local encoded = nil
+
+	if numbered.shape ~= nil then
+		local okEncode, json = pcall(function()
+			return HttpService:JSONEncode(numbered.shape)
+		end)
+
+		if not okEncode then
+			pluginError(`could not encode the checkpoint shape: {tostring(json)}`)
+		end
+
+		local shapeId = Journal.captureBlobBytes(buffer.fromstring(json :: string))
+
+		if shapeId == nil then
+			pluginError("the journal blob store rejected the checkpoint shape")
+		end
+
+		local shapeInfo = Journal.blobInfo(shapeId :: string)
+
+		encoded = {
+			artifactId = shapeId,
+			bytes = if shapeInfo ~= nil then shapeInfo.bytes else #(json :: string),
+			sha256 = if shapeInfo ~= nil then shapeInfo.sha256 else nil,
+		}
+	end
+
 	local checkpoint = HttpService:GenerateGUID(false)
 
 	-- Main records its own stream from here, with a mark this branch's merge
@@ -160,17 +193,39 @@ function BranchOps.ops.branch_checkpoint(args: Args, _ctx)
 
 	Log.stage(`Branch checkpoint '{name}': {numbered.count} instances, {checkpoint}`)
 
-	return { checkpoint = checkpoint, count = numbered.count, blobs = blobs, blobIds = blobIds }
+	return {
+		checkpoint = checkpoint,
+		count = numbered.count,
+		blobs = blobs,
+		blobIds = blobIds,
+		shape = encoded,
+		shapeId = if encoded ~= nil then encoded.artifactId else nil,
+	}
 end
 
 --------------------------------------------------------------------------------
 -- branch_adopt (branch clone)
 --------------------------------------------------------------------------------
 
---- `branch_adopt {checkpoint, count}` → `{ok, count}`. Numbers the loaded
---- clone and refuses to start the journal unless the count matches main's:
---- a numbering the two Studios do not share is a journal whose ids mean
---- different instances on each side, which is worse than no journal at all.
+--- `branch_adopt {checkpoint, count, shapeBlob?}` →
+--- `{ok, matched, extras, missing, count, ...}`.
+---
+--- With `shapeBlob`, the clone adopts main's numbering by SHAPE: it pulls the
+--- shape from its own daemon (`GET /journal/blob/<id>`) and aligns the live
+--- tree against it parent by parent, in order, by `(name, class)` with skips.
+--- This is not a refinement — it is the only thing that can work. Studio adds
+--- instances of its own while it opens a place file (a Lighting
+--- post-processing child, for one), so a clone's count is reliably main's
+--- count plus a few and an exact-count gate refuses every real branch.
+---
+--- A live child with no counterpart is a migration extra: it takes a `new:`
+--- id so events about it resolve, and it is never journalled as an `add`
+--- because nobody added it. A shape child with no live counterpart simply
+--- leaves its id unused. The adoption is refused when it matched less than
+--- `ALIGN_MIN_RATIO` of main's nodes, or when any service main described
+--- matched nothing at all — a tree that loose is not the same tree.
+---
+--- Without `shapeBlob` the old exact-count behaviour is kept verbatim.
 function BranchOps.ops.branch_adopt(args: Args, _ctx)
 	local checkpoint = args.checkpoint
 
@@ -184,18 +239,67 @@ function BranchOps.ops.branch_adopt(args: Args, _ctx)
 		invalid("count must be a non-negative integer")
 	end
 
+	if args.shapeBlob ~= nil and (type(args.shapeBlob) ~= "string" or args.shapeBlob == "") then
+		invalid("shapeBlob must be a non-empty artifact id")
+	end
+
 	local services = Journal.services()
-	local numbered = Journal.checkpoint(services)
 
-	if numbered.count ~= expected then
-		Log.warn(`Branch adopt refused: numbered {numbered.count}, main numbered {expected}`)
+	if args.shapeBlob == nil then
+		local numbered = Journal.checkpoint(services)
 
-		return { ok = false, count = numbered.count, expected = expected }
+		if numbered.count ~= expected then
+			Log.warn(`Branch adopt refused: numbered {numbered.count}, main numbered {expected}`)
+
+			return { ok = false, count = numbered.count, expected = expected }
+		end
+
+		Journal.start(checkpoint, services)
+
+		return { ok = true, count = numbered.count }
+	end
+
+	local body, reason = Journal.fetchBlob(args.shapeBlob)
+
+	if body == nil then
+		error(Error.new(Error.PLUGIN_ERROR, reason or "the checkpoint shape could not be fetched"), 0)
+	end
+
+	local okDecode, shape = pcall(function()
+		return HttpService:JSONDecode(body :: string)
+	end)
+
+	if not okDecode or type(shape) ~= "table" or type(shape.services) ~= "table" then
+		invalid(`the checkpoint shape in {args.shapeBlob} is not a readable shape document`)
+	end
+
+	if shape.v ~= Journal.SHAPE_VERSION then
+		invalid(`the checkpoint shape is version {tostring(shape.v)}; this plugin speaks {Journal.SHAPE_VERSION}`)
+	end
+
+	if type(shape.count) ~= "number" then
+		shape.count = expected
+	end
+
+	local result = Journal.adoptShape(shape, services)
+
+	if result.ok ~= true then
+		Log.warn(
+			`Branch adopt refused: matched {result.matched}/{result.shapeCount} `
+				.. `({result.extras} extras, {result.missing} missing)`
+		)
+
+		return result
 	end
 
 	Journal.start(checkpoint, services)
 
-	return { ok = true, count = numbered.count }
+	Log.stage(
+		`Branch adopt {checkpoint}: matched {result.matched}/{result.shapeCount}, `
+			.. `{result.extras} extras, {result.missing} missing`
+	)
+
+	return result
 end
 
 --------------------------------------------------------------------------------

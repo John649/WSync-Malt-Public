@@ -207,19 +207,27 @@ local function assign(instance: Instance, id: string)
 	byId[id] = instance
 end
 
-local function walk(instance: Instance, service: Instance, visit: (Instance) -> ())
-	for _, child in instance:GetChildren() do
-		if not Journal.isExcluded(child, service) then
-			visit(child)
-			walk(child, service, visit)
-		end
-	end
-end
+--- The compact tree shape a branch aligns against (SHAPE_VERSION 1):
+---
+---   { v = 1, count = <total>, services = {
+---       { service = "Workspace", base = <ids before this service>,
+---         nodes = { {name, class, childCount}, ... } }, ... } }
+---
+--- `nodes` is the service's walk in numbering order, so the node at index `k`
+--- carries the id `base + k`, and `childCount` is what makes the flat array
+--- reconstructible into a tree (pre-order: a node is followed by its whole
+--- first subtree, then the next). Written by main in `branch_checkpoint` and
+--- read by a clone in `branch_adopt`; the engine only moves the bytes.
+Journal.SHAPE_VERSION = 1
+
+export type ShapeService = { service: string, base: number, nodes: { { any } } }
+export type Shape = { v: number, count: number, services: { ShapeService } }
 
 --- Number the tree. Every previous id is dropped: a checkpoint is the new
---- origin, and two Studios that number the same tree must agree exactly.
---- Returns `{count}` — the number of instances the walk numbered.
-function Journal.checkpoint(services: { Instance }?): { count: number }
+--- origin, and two Studios that number the same tree agree by construction.
+--- Returns `{count}`, plus `shape` when `withShape` asks for it — built by
+--- the SAME walk that numbers, so the two can never describe different trees.
+function Journal.checkpoint(services: { Instance }?, withShape: boolean?): { count: number, shape: Shape? }
 	local list = services or Journal.services()
 
 	table.clear(idOf)
@@ -229,19 +237,306 @@ function Journal.checkpoint(services: { Instance }?): { count: number }
 	newCounter = 0
 
 	local n = 0
+	local shape: Shape? = if withShape then { v = Journal.SHAPE_VERSION, count = 0, services = {} } else nil
+
+	--- Number `instance`'s children, recording them into `nodes` when asked.
+	--- Returns how many children were numbered (the parent's `childCount`).
+	local function collect(instance: Instance, service: Instance, nodes: { { any } }?): number
+		local children = 0
+
+		for _, child in instance:GetChildren() do
+			if Journal.isExcluded(child, service) then
+				continue
+			end
+
+			children += 1
+			n += 1
+			assign(child, tostring(n))
+
+			if nodes == nil then
+				collect(child, service, nil)
+				continue
+			end
+
+			-- Appended before the recursion, so the index IS the pre-order
+			-- position, and patched after it, once the count is known.
+			local entry = { child.Name, child.ClassName, 0 }
+			table.insert(nodes, entry)
+			entry[3] = collect(child, service, nodes)
+		end
+
+		return children
+	end
 
 	for _, service in list do
 		byId[serviceIdOf(service)] = service
 
-		walk(service, service, function(child)
-			n += 1
-			assign(child, tostring(n))
-		end)
+		if shape == nil then
+			collect(service, service, nil)
+			continue
+		end
+
+		local entry: ShapeService = { service = service.Name, base = n, nodes = {} }
+
+		collect(service, service, entry.nodes)
+		table.insert((shape :: Shape).services, entry)
 	end
 
 	checkpointCount = n
 
-	return { count = n }
+	if shape ~= nil then
+		(shape :: Shape).count = n
+	end
+
+	return { count = n, shape = shape }
+end
+
+--------------------------------------------------------------------------------
+-- Adopting main's numbering through a shape
+--------------------------------------------------------------------------------
+
+--- How far ahead the aligner looks for a match before it gives up on the pair
+--- in front of it. Bounded on purpose: an unbounded search would be O(n²) on a
+--- parent with tens of thousands of children.
+Journal.ALIGN_WINDOW = 32
+
+--- The share of main's nodes a clone must match for its adoption to be
+--- trusted. Studio adds instances of its own when it opens a place file (a
+--- Lighting post-processing child, for one), so an exact count can never be
+--- required — but a tree that matches only loosely is not the same tree.
+Journal.ALIGN_MIN_RATIO = 0.99
+
+type ShapeNode = { index: number, name: string, class: string, size: number, children: { ShapeNode } }
+
+--- Rebuild a service's flat pre-order array into a forest. Each node keeps its
+--- flat index (its id, once `base` is added) and its subtree size (what a
+--- skipped node costs in unused ids).
+local function parseShapeNodes(nodes: { { any } }): { ShapeNode }
+	local cursor = 1
+
+	local function parseNode(): ShapeNode
+		local entry = nodes[cursor]
+		local node: ShapeNode = {
+			index = cursor,
+			name = tostring(entry[1]),
+			class = tostring(entry[2]),
+			size = 1,
+			children = {},
+		}
+
+		cursor += 1
+
+		for _ = 1, (tonumber(entry[3]) or 0) do
+			if cursor > #nodes then
+				break
+			end
+
+			local child = parseNode()
+
+			table.insert(node.children, child)
+			node.size += child.size
+		end
+
+		return node
+	end
+
+	local roots: { ShapeNode } = {}
+
+	while cursor <= #nodes do
+		table.insert(roots, parseNode())
+	end
+
+	return roots
+end
+
+local function liveChildrenOf(instance: Instance, service: Instance): { Instance }
+	local out: { Instance } = {}
+
+	for _, child in instance:GetChildren() do
+		if not Journal.isExcluded(child, service) then
+			table.insert(out, child)
+		end
+	end
+
+	return out
+end
+
+type AlignStats = { matched: number, extras: number, missing: number }
+
+--- A live instance main never had: Studio's own migration additions land here.
+--- It gets a `new:` id so events about it still resolve, and the whole subtree
+--- under it goes the same way — but it is NEVER journalled as an `add`, it
+--- simply exists on this side.
+local function markExtra(instance: Instance, service: Instance, stats: AlignStats)
+	newCounter += 1
+	assign(instance, `new:{newCounter}`)
+	stats.extras += 1
+
+	for _, child in liveChildrenOf(instance, service) do
+		markExtra(child, service, stats)
+	end
+end
+
+--- Align one parent's children against the shape's, in order, allowing skips
+--- on either side. A greedy two-pointer with a bounded lookahead: whichever
+--- side has the nearer match is the side that skips, so a run of insertions on
+--- one side does not desynchronise everything after it.
+local function align(
+	liveList: { Instance },
+	shapeList: { ShapeNode },
+	base: number,
+	service: Instance,
+	stats: AlignStats
+)
+	local i, j = 1, 1
+
+	while i <= #liveList and j <= #shapeList do
+		local live = liveList[i]
+		local node = shapeList[j]
+
+		if live.Name == node.name and live.ClassName == node.class then
+			assign(live, tostring(base + node.index))
+			stats.matched += 1
+
+			align(liveChildrenOf(live, service), node.children, base, service, stats)
+
+			i += 1
+			j += 1
+			continue
+		end
+
+		local aheadShape: number? = nil
+
+		for k = j + 1, math.min(#shapeList, j + Journal.ALIGN_WINDOW) do
+			if shapeList[k].name == live.Name and shapeList[k].class == live.ClassName then
+				aheadShape = k
+				break
+			end
+		end
+
+		local aheadLive: number? = nil
+
+		for k = i + 1, math.min(#liveList, i + Journal.ALIGN_WINDOW) do
+			if liveList[k].Name == node.name and liveList[k].ClassName == node.class then
+				aheadLive = k
+				break
+			end
+		end
+
+		if aheadShape ~= nil and (aheadLive == nil or (aheadShape - j) <= (aheadLive - i)) then
+			for k = j, (aheadShape :: number) - 1 do
+				stats.missing += shapeList[k].size
+			end
+
+			j = aheadShape :: number
+		elseif aheadLive ~= nil then
+			for k = i, (aheadLive :: number) - 1 do
+				markExtra(liveList[k], service, stats)
+			end
+
+			i = aheadLive :: number
+		else
+			-- Neither side can find the other within the window: charge one to
+			-- each and move both on, so the walk always makes progress.
+			markExtra(live, service, stats)
+			stats.missing += node.size
+
+			i += 1
+			j += 1
+		end
+	end
+
+	while i <= #liveList do
+		markExtra(liveList[i], service, stats)
+		i += 1
+	end
+
+	while j <= #shapeList do
+		stats.missing += shapeList[j].size
+		j += 1
+	end
+end
+
+--- Number the live tree by aligning it against main's shape rather than by
+--- counting. Returns `{ok, matched, extras, missing, count, shapeCount,
+--- services}`; on a refusal every id is dropped again, so a refused adopt
+--- leaves no half-numbering behind.
+function Journal.adoptShape(shape: Shape, services: { Instance }?): { [string]: any }
+	local list = services or Journal.services()
+
+	table.clear(idOf)
+	table.clear(byId)
+	table.clear(addedRoots)
+
+	newCounter = 0
+
+	local byService: { [string]: ShapeService } = {}
+
+	for _, entry in shape.services do
+		byService[entry.service] = entry
+	end
+
+	local stats: AlignStats = { matched = 0, extras = 0, missing = 0 }
+	local report: { { [string]: any } } = {}
+	local starved: { string } = {}
+
+	for _, service in list do
+		byId[serviceIdOf(service)] = service
+
+		local entry = byService[service.Name]
+		local before = stats.matched
+
+		if entry == nil then
+			-- Main had no shape for this service at all: everything live in it
+			-- is an extra.
+			for _, child in liveChildrenOf(service, service) do
+				markExtra(child, service, stats)
+			end
+		else
+			align(liveChildrenOf(service, service), parseShapeNodes(entry.nodes), entry.base, service, stats)
+
+			if #entry.nodes > 0 and stats.matched == before then
+				table.insert(starved, service.Name)
+			end
+		end
+
+		table.insert(report, {
+			service = service.Name,
+			expected = if entry ~= nil then #entry.nodes else 0,
+			matched = stats.matched - before,
+		})
+	end
+
+	local expected = shape.count
+	local ratio = if expected > 0 then stats.matched / expected else 1
+
+	local ok = #starved == 0 and ratio >= Journal.ALIGN_MIN_RATIO
+
+	local result: { [string]: any } = {
+		ok = ok,
+		matched = stats.matched,
+		extras = stats.extras,
+		missing = stats.missing,
+		count = stats.matched + stats.extras,
+		shapeCount = expected,
+		ratio = ratio,
+		services = report,
+	}
+
+	if not ok then
+		table.clear(idOf)
+		table.clear(byId)
+
+		newCounter = 0
+		result.unmatchedServices = starved
+
+		return result
+	end
+
+	-- The id space both Studios share is main's numbering, not the live count.
+	checkpointCount = expected
+
+	return result
 end
 
 --------------------------------------------------------------------------------
@@ -505,6 +800,36 @@ function Journal.blobInfo(blobId: string): { bytes: number, sha256: string }?
 	end
 
 	return { bytes = buffer.len(entry.bytes), sha256 = entry.sha256 }
+end
+
+--- Pull a blob back OUT of this Studio's own daemon: `GET /journal/blob/<id>`
+--- answers raw bytes, which the caller decodes. The clone's shape alignment is
+--- the one place the plugin reads from the daemon instead of the daemon
+--- reading from the plugin — the shape was pinned in MAIN's Studio, so this
+--- Studio has no copy of it to serve.
+---
+--- Returns `(body, nil)` or `(nil, reason)`.
+function Journal.fetchBlob(blobId: string): (string?, string?)
+	if endpoint == nil then
+		return nil, "the journal has no daemon to fetch from — this Studio is not connected"
+	end
+
+	local scheme = if (endpoint :: any).https then "https" else "http"
+	local url = `{scheme}://{(endpoint :: any).host}:{(endpoint :: any).port}/journal/blob/{blobId}`
+
+	local ok, body = pcall(function()
+		return Http.getJson(url):expect().Body
+	end)
+
+	if not ok then
+		return nil, `GET /journal/blob/{blobId} failed: {tostring(body)}`
+	end
+
+	if type(body) ~= "string" or body == "" then
+		return nil, `GET /journal/blob/{blobId} answered no bytes`
+	end
+
+	return body :: string, nil
 end
 
 --- Drop a pinned blob. Returns false when there was nothing to drop, so a

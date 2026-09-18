@@ -13,10 +13,10 @@
 //! around them.
 //!
 //! The plugin ops are the ones `plugin/src/Remote/Handlers/Branch.luau`
-//! serves: `branch_checkpoint {name}` → `{checkpoint, count, blobs, blobIds}`
-//! where each blob is `{artifactId, bytes, sha256}`; `branch_adopt
-//! {checkpoint, count}` → `{ok, count, expected?}`, which answers `ok: false`
-//! on a mismatch instead of failing; the blob pump `branch_blob_open
+//! serves: `branch_checkpoint {name}` → `{checkpoint, count, blobs, blobIds,
+//! shape}` where each blob is `{artifactId, bytes, sha256}`; `branch_adopt
+//! {checkpoint, count, shapeBlob?}` → `{ok, count, matched?, extras?,
+//! missing?}`, which answers `ok: false` on a refusal instead of failing; the blob pump `branch_blob_open
 //! {artifactId}` → `{bytes, sha256}` / `branch_blob_read` / `branch_blob_close`;
 //! `journal_flush`; and `journal_replay {checkpoint, events, blobs?,
 //! decisions?}` → `{applied, skipped, conflicts}`.
@@ -51,7 +51,7 @@ use std::{
 
 use crate::{
 	cli::{
-		client::{print_json, Client, Target, Targeting},
+		client::{print_json, truncate, Client, Target, Targeting},
 		live::transfer,
 	},
 	ext::PathExt,
@@ -67,6 +67,12 @@ const MARKER_NAME: &str = "WSyncBranch";
 /// Number attribute on that marker carrying main's universe id, because a
 /// clone opened from an `.rbxl` reports `game.GameId == 0`
 const GAME_ID_ATTRIBUTE: &str = "GameId";
+
+/// The compact DFS shape of the numbered tree, beside the branch record.
+/// Studio adds instances of its own when it opens a place file, so a clone
+/// never numbers to exactly main's count; `branch_adopt` aligns against this
+/// by name and class and skips what Studio put there
+const SHAPE_FILE: &str = "checkpoint.shape.json";
 
 /// Live branch Studios allowed at once: past Roblox's window cap a launch
 /// succeeds into a windowless stub, so the budget is a real guardrail
@@ -156,6 +162,8 @@ struct Record {
 	synthetic_place_id: u64,
 	owner: Owner,
 	created_at: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	shape_blob: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	daemon_port: Option<u16>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -392,11 +400,23 @@ impl New {
 		for (service, blob) in blobs {
 			let file = clone_dir.join(format!("{service}.rbxm"));
 
-			download_service_blob(&client, service, blob, &file, self.raw)
+			download_blob_to(&client, service, blob, &file, self.raw)
 				.with_context(|| format!("Failed to download the {service} blob"))?;
 
 			services.push((service.clone(), file));
 		}
+
+		// The shape travels the same way the service blobs do. Without it
+		// `branch_adopt` has only the count to go on, and Studio's own additions
+		// guarantee the count will not match
+		let shape_blob = match checkpoint.get("shape").filter(|shape| !shape.is_null()) {
+			Some(shape) => Some(
+				download_blob_to(&client, "shape", shape, &root.join(SHAPE_FILE), self.raw)
+					.context("Failed to download the checkpoint shape")?
+					.0,
+			),
+			None => None,
+		};
 
 		let place = root.join(format!("{name}.rbxl"));
 		assemble_place(&services, &name, game_id, &place, self.raw)?;
@@ -423,6 +443,7 @@ impl New {
 			synthetic_place_id: synthetic,
 			owner: Owner::here(),
 			created_at: now(),
+			shape_blob,
 			daemon_port: None,
 			studio_pid: None,
 		};
@@ -441,7 +462,7 @@ impl New {
 		// (8) the branch plugin adopts main's numbering
 		let branch = Client::connect(&record.targeting(&main.project))?;
 		wait_for_plugin(&branch, PLUGIN_WAIT)?;
-		adopt(&branch, &record, self.raw)?;
+		adopt(&branch, &record, &root, self.raw)?;
 
 		if self.raw {
 			print_json(&json!(record));
@@ -564,7 +585,7 @@ impl Up {
 		// The clone is immutable, so the reopened Studio is the tree the
 		// checkpoint numbered: adopt it, then replay the branch's own journal
 		// back over it — a self-replay, which the plugin takes only under `own`
-		adopt(&branch, &record, self.raw)?;
+		adopt(&branch, &record, &root, self.raw)?;
 
 		let journal = fetch_journal(&branch, &record.checkpoint)?;
 		let decisions = read_decisions(&root);
@@ -1180,31 +1201,139 @@ fn wait_for_plugin(client: &Client, patience: Duration) -> Result<()> {
 	}
 }
 
-/// `branch_adopt` — the branch's plugin takes main's numbering. A count that
-/// does not match means the clone is not the tree the checkpoint numbered,
-/// and every id in the journal would be pointing at the wrong instance
-fn adopt(client: &Client, record: &Record, raw: bool) -> Result<()> {
+/// `branch_adopt` — the branch's plugin takes main's numbering, aligning
+/// against the checkpoint shape by name and class. The counts are NOT
+/// expected to match: Studio adds instances of its own as it opens a place
+/// file, so the clone always numbers a little higher than main did
+fn adopt(client: &Client, record: &Record, root: &Path, raw: bool) -> Result<()> {
+	// The plugin asks its own daemon for the shape, so it has to be there
+	// first — and a daemon that restarted since `new` serves a fresh store
+	push_shape(record, root)?;
+
+	let mut args = json!({ "checkpoint": record.checkpoint, "count": record.count });
+
+	if let Some(shape) = &record.shape_blob {
+		args["shapeBlob"] = json!(shape);
+	}
+
 	let adopted = client
-		.request_with_timeout(
-			"branch_adopt",
-			json!({ "checkpoint": record.checkpoint, "count": record.count }),
-			HEAVY_TIMEOUT_MS,
-		)?
+		.request_with_timeout("branch_adopt", args, HEAVY_TIMEOUT_MS)?
 		.into_value(raw)?;
 
-	let count = adopted
-		.get("count")
-		.and_then(Value::as_u64)
-		.context("The plugin answered `branch_adopt` without a count")?;
+	// A refusal is data, not an error envelope: the plugin reports what it
+	// could and could not line up
+	if adopted.get("ok").and_then(Value::as_bool) == Some(true) {
+		return Ok(());
+	}
 
-	// A mismatch comes back as `{ok: false, count, expected}`, not an error
-	if adopted.get("ok").and_then(Value::as_bool) != Some(true) || count != record.count {
+	let count = adopted.get("count").and_then(Value::as_u64).unwrap_or_default();
+	let matched = adopted.get("matched").cloned().unwrap_or(Value::Null);
+	let extras = adopted.get("extras").cloned().unwrap_or(Value::Null);
+	let missing = adopted.get("missing").cloned().unwrap_or(Value::Null);
+
+	if raw {
+		print_json(&json!({
+			"ok": false,
+			"stage": "adopt",
+			"branch": record.name,
+			"checkpoint": record.checkpoint,
+			"count": count,
+			"expected": record.count,
+			"shapeBlob": record.shape_blob,
+			"matched": matched,
+			"extras": extras,
+			"missing": missing,
+		}));
+	}
+
+	bail!(
+		"Branch `{}` refused to adopt checkpoint {}: it numbered {count} instances against main's {}, matched {}, \
+		 extras {}, missing {}{}. Nothing was adopted — a numbering the two Studios do not share is a journal whose \
+		 ids mean different instances on each side. Rebuild the branch (`{}`)",
+		record.name,
+		record.checkpoint,
+		record.count,
+		render_side(&matched),
+		render_side(&extras),
+		render_side(&missing),
+		if record.shape_blob.is_none() {
+			", and this checkpoint carried no shape to align against"
+		} else {
+			""
+		},
+		format!("wsync branch rm {} --purge", record.name).bold()
+	)
+}
+
+/// A refusal's `matched`/`extras`/`missing`: a count, or a bounded list of
+/// the paths the plugin could not line up
+fn render_side(value: &Value) -> String {
+	match value {
+		Value::Null => "none reported".to_owned(),
+		Value::Array(items) => {
+			let shown: Vec<String> = items
+				.iter()
+				.take(8)
+				.map(|item| match item {
+					Value::String(text) => text.clone(),
+					other => other.to_string(),
+				})
+				.collect();
+
+			if shown.is_empty() {
+				"0".to_owned()
+			} else if items.len() > shown.len() {
+				format!(
+					"{} ({}, … {} more)",
+					items.len(),
+					shown.join(", "),
+					items.len() - shown.len()
+				)
+			} else {
+				format!("{} ({})", items.len(), shown.join(", "))
+			}
+		}
+		other => other.to_string(),
+	}
+}
+
+/// Puts the checkpoint shape on the branch's OWN daemon under the id main's
+/// plugin gave it, so `branch_adopt` can fetch it from there. Idempotent, and
+/// a no-op for a checkpoint that carried no shape
+fn push_shape(record: &Record, root: &Path) -> Result<bool> {
+	let (Some(shape), Some(port)) = (record.shape_blob.as_deref(), record.daemon_port) else {
+		return Ok(false);
+	};
+
+	let file = root.join(SHAPE_FILE);
+	let payload =
+		fs::read(&file).with_context(|| format!("Failed to read the checkpoint shape {}", file.to_string()))?;
+
+	upload_blob(port, shape, &payload)?;
+
+	Ok(true)
+}
+
+/// `POST /journal/blob/<id>` — the raw bytes, verbatim. The daemon keeps
+/// blobs beside the journal that names them precisely because the plugin
+/// that made them is usually gone by the time something reads them
+fn upload_blob(port: u16, id: &str, payload: &[u8]) -> Result<()> {
+	let response = reqwest::blocking::Client::builder()
+		.no_proxy()
+		.timeout(Duration::from_secs(30))
+		.redirect(reqwest::redirect::Policy::none())
+		.build()?
+		.post(format!("http://localhost:{port}/journal/blob/{id}"))
+		.body(payload.to_vec())
+		.send()
+		.with_context(|| format!("Failed to upload blob {id} to the branch daemon on port {port}"))?;
+
+	let status = response.status();
+
+	if !status.is_success() {
 		bail!(
-			"Branch `{}` numbered {count} instances but its checkpoint numbered {} — the clone is not the tree this \
-			 checkpoint describes, so nothing was adopted. Rebuild the branch (`{}`)",
-			record.name,
-			record.count,
-			format!("wsync branch rm {} --purge", record.name).bold()
+			"The branch daemon on port {port} refused blob {id} (HTTP {status}): {}",
+			truncate(&response.text().unwrap_or_default(), 200)
 		);
 	}
 
@@ -1498,12 +1627,13 @@ fn print_paths(headline: &str, paths: &[String], raw: bool) {
 // The clone
 // ---------------------------------------------------------------------------
 
-/// One checkpoint service blob onto disk. The descriptor `branch_checkpoint`
-/// returned already carries `bytes` and `sha256`, so the `branch_blob_open`
-/// round trip is only made when a compat `blobIds` entry left them out. A
-/// service blob IS closed afterwards: the checkpoint pulls each one once
-fn download_service_blob(client: &Client, service: &str, blob: &Value, out: &Path, raw: bool) -> Result<u64> {
-	let (artifact, bytes, sha) = describe_blob(client, service, blob, raw)?;
+/// One checkpoint blob onto disk — a service's subtree, or the shape. The
+/// descriptor `branch_checkpoint` returned already carries `bytes` and
+/// `sha256`, so the `branch_blob_open` round trip is only made when a compat
+/// `blobIds` entry left them out. A checkpoint blob IS closed afterwards: it
+/// is pulled exactly once. Returns the artifact id and its size
+fn download_blob_to(client: &Client, label: &str, blob: &Value, out: &Path, raw: bool) -> Result<(String, u64)> {
+	let (artifact, bytes, sha) = describe_blob(client, label, blob, raw)?;
 
 	let payload = transfer::pull(
 		client,
@@ -1524,19 +1654,19 @@ fn download_service_blob(client: &Client, service: &str, blob: &Value, out: &Pat
 
 	fs::write(out, payload?).with_context(|| format!("Failed to write {}", out.to_string()))?;
 
-	Ok(bytes)
+	Ok((artifact, bytes))
 }
 
 /// Accepts either the `{artifactId, bytes, sha256}` descriptor or the compat
 /// `blobIds` string, filling anything a descriptor left out from
 /// `branch_blob_open`
-fn describe_blob(client: &Client, service: &str, blob: &Value, raw: bool) -> Result<(String, u64, String)> {
+fn describe_blob(client: &Client, label: &str, blob: &Value, raw: bool) -> Result<(String, u64, String)> {
 	let artifact = match blob {
 		Value::String(artifact) => artifact.clone(),
 		blob => blob
 			.get("artifactId")
 			.and_then(Value::as_str)
-			.with_context(|| format!("`branch_checkpoint` gave service {service} no artifact id"))?
+			.with_context(|| format!("`branch_checkpoint` gave {label} no artifact id"))?
 			.to_owned(),
 	};
 
