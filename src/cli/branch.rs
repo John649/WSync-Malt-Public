@@ -43,16 +43,16 @@ use sha2::{Digest, Sha256};
 use std::{
 	collections::HashSet,
 	env, fs,
-	io::{BufRead, BufReader, BufWriter, Write},
+	io::{BufReader, BufWriter, Write},
 	path::{Path, PathBuf},
-	process::{self, Command, Stdio},
-	sync::mpsc,
+	process::{self, Child, Command, Stdio},
 	thread,
 	time::{Duration, Instant},
 };
 
 use crate::{
 	cli::client::{print_json, truncate, Client, Target, Targeting},
+	daemon,
 	ext::PathExt,
 	wsync_info, wsync_warn,
 };
@@ -1303,60 +1303,94 @@ fn claim(record: &mut Record, root: &Path, steal: bool) -> Result<()> {
 // Daemon, Studio and plugin
 // ---------------------------------------------------------------------------
 
-/// Starts `wsync daemon start --project <project> --raw` and reads its ready
-/// line, the way the desktop lifecycle manager does. Returns the port the
-/// daemon bound and the child's PID
+/// Starts `wsync daemon start --project <project>` fully detached and waits
+/// for it to answer.
+///
+/// Nothing is piped. A daemon holding this process's stdout is a daemon that
+/// keeps the pipe open after `branch new` returns, so anything reading our
+/// output waits for an EOF that only arrives when the branch is closed. The
+/// readiness signal is therefore the daemon's own runtime record plus a
+/// `GET /hello` on the port it recorded, not a line on a pipe we would have
+/// to hold open to read
 fn spawn_daemon(project: &Path) -> Result<(u16, u32)> {
 	let binary = env::current_exe().context("Failed to locate the running wsync executable")?;
+	let canonical = daemon::canonical_project(project)?;
+	let paths = daemon::runtime_paths(&daemon::state_dir(None)?, &canonical);
 
-	let mut child = Command::new(&binary)
+	// Whatever is recorded now belongs to a previous daemon for this project;
+	// readiness is a record this spawn wrote, never that one
+	let stale = daemon::read_record(&paths.record)
+		.unwrap_or_default()
+		.map(|record| record.boot_id);
+
+	let mut command = Command::new(&binary);
+
+	command
 		.args(["daemon", "start", "--project"])
 		.arg(project)
-		.arg("--raw")
 		.stdin(Stdio::null())
-		.stdout(Stdio::piped())
-		.stderr(Stdio::null())
+		.stdout(Stdio::null())
+		.stderr(Stdio::null());
+
+	detach(&mut command);
+
+	let mut child = command
 		.spawn()
 		.with_context(|| format!("Failed to run {}", binary.to_string()))?;
 
-	let pid = child.id();
-	let stdout = child.stdout.take().context("The daemon child had no stdout")?;
-	let (sender, receiver) = mpsc::channel();
+	let deadline = Instant::now() + DAEMON_READY;
 
-	thread::spawn(move || {
-		let mut line = String::new();
+	loop {
+		if let Ok(Some(record)) = daemon::read_record(&paths.record) {
+			if Some(&record.boot_id) != stale.as_ref() {
+				if let Some(hello) = probe_hello(record.port) {
+					let serves = hello.get("canonicalProject").and_then(Value::as_str) == Some(canonical.as_str());
+					let booted = hello.get("bootId").and_then(Value::as_str) == Some(record.boot_id.as_str());
 
-		sender
-			.send(BufReader::new(stdout).read_line(&mut line).map(|_| line))
-			.ok();
-	});
-
-	let ready = match receiver.recv_timeout(DAEMON_READY) {
-		Ok(Ok(line)) => line,
-		Ok(Err(error)) => {
-			child.kill().ok();
-
-			bail!("Failed to read the branch daemon's ready line: {error}");
+					if serves && booted {
+						return Ok((record.port, record.pid));
+					}
+				}
+			}
 		}
-		Err(_) => {
-			child.kill().ok();
+
+		// A child that has already exited will never record itself
+		if let Ok(Some(status)) = child.try_wait() {
+			bail!(
+				"The branch daemon exited before it started serving ({status}). Its own log has the reason: `{}`",
+				format!("wsync daemon logs --project {}", project.to_string()).bold()
+			);
+		}
+
+		if Instant::now() >= deadline {
+			stop_child(&mut child);
 
 			bail!(
-				"The branch daemon did not report itself within {}s; nothing was left running",
+				"The branch daemon did not start serving within {}s; it was stopped",
 				DAEMON_READY.as_secs()
 			);
 		}
-	};
 
-	let ready: Value = serde_json::from_str(ready.trim())
-		.with_context(|| format!("The branch daemon's ready line is not JSON: {}", ready.trim()))?;
+		thread::sleep(Duration::from_millis(250));
+	}
+}
 
-	let port = ready
-		.get("port")
-		.and_then(Value::as_u64)
-		.context("The branch daemon's ready line carries no port")? as u16;
+/// Cuts a child loose from this process: no inherited console, and its own
+/// process group, so a Ctrl-C aimed at the CLI does not reach it
+#[allow(unused_variables)]
+fn detach(command: &mut Command) {
+	#[cfg(target_os = "windows")]
+	{
+		use std::os::windows::process::CommandExt;
 
-	Ok((port, pid))
+		// DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+		command.creation_flags(0x0000_0008 | 0x0000_0200);
+	}
+}
+
+fn stop_child(child: &mut Child) {
+	child.kill().ok();
+	child.wait().ok();
 }
 
 /// Launches Studio on a place and keeps the PID.
@@ -1371,11 +1405,19 @@ fn launch_studio(place: &Path) -> Result<u32> {
 		.application_path()
 		.to_owned();
 
-	let child = Command::new(&studio)
+	let mut command = Command::new(&studio);
+
+	command
 		.arg(place)
 		.stdin(Stdio::null())
 		.stdout(Stdio::null())
-		.stderr(Stdio::null())
+		.stderr(Stdio::null());
+
+	// Studio outlives this command too, so it gets the same treatment as the
+	// daemon: no inherited handles, its own process group
+	detach(&mut command);
+
+	let child = command
 		.spawn()
 		.with_context(|| format!("Failed to launch Roblox Studio from {}", studio.to_string()))?;
 
@@ -1383,14 +1425,26 @@ fn launch_studio(place: &Path) -> Result<u32> {
 }
 
 fn daemon_answers(port: u16) -> bool {
+	probe_hello(port).is_some()
+}
+
+/// `GET /hello` on a port, as raw JSON. Enough to tell one daemon's identity
+/// from another's without the live-command targeting machinery, which insists
+/// on a project it can already name
+fn probe_hello(port: u16) -> Option<Value> {
 	reqwest::blocking::Client::builder()
 		.no_proxy()
 		.timeout(Duration::from_millis(1500))
 		.redirect(reqwest::redirect::Policy::none())
 		.build()
+		.ok()?
+		.get(format!("http://localhost:{port}/hello"))
+		.send()
+		.ok()?
+		.error_for_status()
+		.ok()?
+		.json()
 		.ok()
-		.and_then(|http| http.get(format!("http://localhost:{port}/hello")).send().ok())
-		.is_some_and(|response| response.status().is_success())
 }
 
 /// Waits for a plugin to connect to a daemon: a `ping` that comes back

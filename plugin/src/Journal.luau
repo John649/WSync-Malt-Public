@@ -167,9 +167,19 @@ local drainScheduled = false
 local observed = 0
 local observing = false
 
+-- Instances whose removal has already been recorded. A destroy reaches the
+-- recorder down two independent paths -- the service's `DescendantRemoving`
+-- and the instance's own `Changed("Parent")` -- and whichever settles second
+-- must not emit a second `remove`.
+local removedOnce: { [Instance]: boolean } = {}
+
 -- Assigned below; declared here because `checkpoint` and `adoptShape` clear the
 -- id maps and must drop the connections that went with them.
 local disconnectInstances: () -> () = function() end
+
+-- Assigned below: handling a `Parent` change needs `settleParent` and the
+-- removal batch, both of which are defined further down.
+local onParentChanged: (Instance) -> () = function() end
 
 type AddedRoot = { instance: Instance, parent: string, name: string, class: string, capturedAt: number }
 
@@ -1082,7 +1092,9 @@ local function drainDirty()
 		end
 
 		for prop in props do
-			if string.sub(prop, 1, 1) == "@" then
+			if prop == "Parent" then
+				onParentChanged(instance)
+			elseif string.sub(prop, 1, 1) == "@" then
 				local name = string.sub(prop, 2)
 
 				local okRead, value = pcall(function()
@@ -1152,7 +1164,7 @@ local function watch(instance: Instance)
 	local list: { RBXScriptConnection } = {}
 
 	if instance:IsA("ValueBase") then
-		for _, prop in { "Name", "Value" } do
+		for _, prop in { "Name", "Value", "Parent" } do
 			pcall(function()
 				table.insert(
 					list,
@@ -1167,6 +1179,15 @@ local function watch(instance: Instance)
 			table.insert(
 				list,
 				instance.Changed:Connect(function(prop: string)
+					-- A reparent INSIDE one service never fires that service's
+					-- DescendantAdded/DescendantRemoving -- the instance never
+					-- stops being a descendant of it -- so this is the ONLY
+					-- signal that sees `ws.A.Parent = ws.B`.
+					if prop == "Parent" then
+						markDirty(instance, "Parent")
+						return
+					end
+
 					if SKIP_PROPERTIES[prop] then
 						return
 					end
@@ -1226,6 +1247,7 @@ disconnectInstances = function()
 	table.clear(dirty)
 	table.clear(dirtyRec)
 	table.clear(removalBatch)
+	table.clear(removedOnce)
 
 	observed = 0
 	drainScheduled = false
@@ -1367,6 +1389,7 @@ local function settleParent(instance: Instance): boolean
 	end
 
 	parentOf[instance] = parentId
+	removedOnce[instance] = nil
 	emit(id, "move", { parent = parentId })
 
 	return true
@@ -1441,6 +1464,10 @@ local function settleRemovals()
 	end
 
 	for _, instance in gone do
+		-- Marked whether or not it got its own event: a descendant folded into
+		-- its ancestor's removal is just as gone, and must not come back
+		-- through the other path.
+		removedOnce[instance] = true
 		removalBatch[instance] = nil
 		unwatch(instance)
 	end
@@ -1501,14 +1528,15 @@ local function onDescendantAdded(instance: Instance, service: Instance)
 	emit(id, "add", { parent = parent, name = instance.Name, class = class, blob = blobId })
 end
 
-local function onDescendantRemoving(instance: Instance)
-	if muted or idOf[instance] == nil then
+--- Put an instance in line to be settled as a removal. Nothing is decided
+--- here: `instance.Parent` is not reliably the old parent at DescendantRemoving
+--- time, so the whole cycle is settled together, once everything that might
+--- cancel a removal has run.
+local function queueRemoval(instance: Instance)
+	if muted or idOf[instance] == nil or removedOnce[instance] then
 		return
 	end
 
-	-- Nothing is decided here. `instance.Parent` is not reliably the old parent
-	-- at this point, so the whole cycle's removals are settled together once
-	-- every DescendantAdded that might cancel one has run.
 	removalBatch[instance] = true
 
 	if removalScheduled then
@@ -1525,6 +1553,27 @@ local function onDescendantRemoving(instance: Instance)
 			Log.debug("Journal: removal settle failed:", err)
 		end
 	end)
+end
+
+local function onDescendantRemoving(instance: Instance)
+	queueRemoval(instance)
+end
+
+--- An instance's own `Parent` changed. This is the only signal that sees a
+--- move within one service, and it also sees a destroy (Parent goes nil)
+--- before the service's DescendantRemoving does -- `queueRemoval` and
+--- `removedOnce` are what keep the two paths from double-counting.
+onParentChanged = function(instance: Instance)
+	if muted or idOf[instance] == nil then
+		return
+	end
+
+	if not inWatchedService(instance) then
+		queueRemoval(instance)
+		return
+	end
+
+	settleParent(instance)
 end
 
 local function startLoop()
