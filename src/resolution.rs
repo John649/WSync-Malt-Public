@@ -575,7 +575,7 @@ fn find_descriptor(class: &str, property: &str) -> Option<&'static PropertyDescr
 			return Some(descriptor);
 		}
 
-		current_class = class.superclass.as_deref()?;
+		current_class = class.superclass?;
 	}
 }
 

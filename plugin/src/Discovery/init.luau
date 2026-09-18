@@ -92,10 +92,13 @@ function Discovery.scan(shouldContinue: (() -> boolean)?): Promise.TypedPromise<
 		-- On a branch clone `game.PlaceId` is the synthetic id Branch.apply
 		-- stamped at boot, and `branch` makes Policy refuse anything below an
 		-- exact match, so the clone never attaches to main's daemon.
+		local identity = Branch.current()
+
 		local place: Policy.PlaceIdentity = {
 			gameId = game.GameId,
 			placeId = game.PlaceId,
-			branch = Branch.isBranch(),
+			branch = identity ~= nil,
+			branchName = if identity ~= nil then identity.name else nil,
 		}
 
 		local best: Match? = nil

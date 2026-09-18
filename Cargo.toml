@@ -25,11 +25,11 @@ path = "src/lib.rs"
 plugin = []
 
 [dependencies]
-rbx_xml = "2.0.1"
-rbx_binary = "2.0.1"
-rbx_dom_weak = "4.1.0"
-rbx_reflection = "6.1.0"
-rbx_reflection_database = "2.0.2"
+rbx_xml = "3.0.0"
+rbx_binary = "3.0.0"
+rbx_dom_weak = "4.2.0"
+rbx_reflection = "7.0.0"
+rbx_reflection_database = "3.0.0"
 
 config-derive = { version = "*", path = "crates/config-derive" }
 json-formatter = { version = "*", path = "crates/json-formatter" }

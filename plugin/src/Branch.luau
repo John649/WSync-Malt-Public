@@ -183,6 +183,11 @@ function Branch.apply(identity: Identity?): Identity?
 		end
 	end
 
+	-- Only when there is a real universe to claim. A clone opened from a local
+	-- `.rbxl` has no universe id and needs none: Discovery matches a branch on
+	-- the synthetic placeId and on the daemon's `branch` field, neither of
+	-- which involves gameId. Calling SetUniverseId(0) would be a write with
+	-- nothing to write.
 	if universeId > 0 then
 		local okUniverse, err = pcall(function()
 			(game :: any):SetUniverseId(universeId)
@@ -201,7 +206,9 @@ function Branch.apply(identity: Identity?): Identity?
 		Log.warn(`Branch '{identity.name}': SetPlaceId failed — {tostring(placeErr)}`)
 	end
 
-	Log.stage(`Branch '{identity.name}': placeId {identity.syntheticPlaceId}, universe {universeId}`)
+	local universe = if universeId > 0 then tostring(universeId) else "unset (local file)"
+
+	Log.stage(`Branch '{identity.name}': placeId {identity.syntheticPlaceId}, universe {universe}`)
 
 	return applied
 end

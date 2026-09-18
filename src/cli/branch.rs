@@ -399,7 +399,7 @@ impl New {
 		}
 
 		let place = root.join(format!("{name}.rbxl"));
-		assemble_place(&services, &name, game_id, &place)?;
+		assemble_place(&services, &name, game_id, &place, self.raw)?;
 
 		// (3) main remembers where this branch forked its journal
 		client
@@ -1595,6 +1595,60 @@ fn pull_blob(client: &Client, artifact: &str, raw: bool) -> Result<Vec<u8>> {
 	)
 }
 
+/// Names the service, the blob, the reader and the real cause — the top-level
+/// error printer shows `Display` only, so anyhow's context chain would
+/// otherwise swallow exactly the part that says what went wrong
+fn undecodable(service: &str, blob: &Path, error: &dyn std::error::Error, raw: bool) -> anyhow::Error {
+	let bytes = fs::metadata(blob).map(|meta| meta.len()).unwrap_or_default();
+	let cause = error_chain(error);
+	let reader = rbx_binary_version();
+
+	if raw {
+		print_json(&json!({
+			"ok": false,
+			"stage": "assemble",
+			"service": service,
+			"blob": blob.to_string(),
+			"bytes": bytes,
+			"rbxBinary": reader,
+			"error": cause,
+			"kept": blob.get_parent().to_string(),
+		}));
+	}
+
+	anyhow::anyhow!(
+		"The {service} blob {} ({bytes} bytes) did not decode with rbx_binary {reader}: {cause}. The downloaded blobs \
+		 are kept in {} for inspection; no clone was assembled, because a place missing a service is not the tree the \
+		 checkpoint numbered",
+		blob.to_string().bold(),
+		blob.get_parent().to_string().bold()
+	)
+}
+
+/// Every layer of an error's `source` chain on one line: a decode failure's
+/// real cause is usually a link or two down
+fn error_chain(error: &dyn std::error::Error) -> String {
+	let mut text = error.to_string();
+	let mut source = error.source();
+
+	while let Some(cause) = source {
+		text.push_str(&format!(": {cause}"));
+		source = cause.source();
+	}
+
+	text
+}
+
+/// The `rbx_binary` this CLI reads and writes places with, taken from the
+/// manifest at compile time so a decode failure names the exact reader
+fn rbx_binary_version() -> &'static str {
+	include_str!("../../Cargo.toml")
+		.lines()
+		.find_map(|line| line.trim().strip_prefix("rbx_binary = "))
+		.map(|version| version.trim().trim_matches('"'))
+		.unwrap_or("unknown")
+}
+
 /// The universe id the clone has to report. A place opened from an `.rbxl`
 /// boots with `game.GameId == 0`, so the id travels on the marker and the
 /// plugin calls `SetUniverseId` with it
@@ -1608,8 +1662,19 @@ fn main_game_id(project: &Path, client: &Client) -> Option<u64> {
 }
 
 /// Assembles the service blobs into one place file: a fresh DataModel, each
-/// blob's roots reparented under its service, plus the branch marker
-fn assemble_place(services: &[(String, PathBuf)], name: &str, game_id: Option<u64>, out: &Path) -> Result<()> {
+/// blob's roots reparented under its service, plus the branch marker.
+///
+/// A service that will not decode fails the whole assembly. There is no
+/// partial clone to fall back to — a place missing a service is not the tree
+/// the checkpoint numbered, so every id in the journal would be pointing at
+/// the wrong instance. The downloaded blobs are left on disk for inspection
+fn assemble_place(
+	services: &[(String, PathBuf)],
+	name: &str,
+	game_id: Option<u64>,
+	out: &Path,
+	raw: bool,
+) -> Result<()> {
 	let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
 	let root = dom.root_ref();
 	let mut storage = None;
@@ -1618,8 +1683,10 @@ fn assemble_place(services: &[(String, PathBuf)], name: &str, game_id: Option<u6
 		let reader = BufReader::new(
 			fs::File::open(blob).with_context(|| format!("Failed to open the {service} blob {}", blob.to_string()))?,
 		);
-		let mut source = rbx_binary::from_reader(reader)
-			.with_context(|| format!("The {service} blob {} is not a readable model", blob.to_string()))?;
+		let mut source = match rbx_binary::from_reader(reader) {
+			Ok(source) => source,
+			Err(error) => return Err(undecodable(service, blob, &error, raw)),
+		};
 
 		let service_ref = dom.insert(root, InstanceBuilder::new(service.as_str()).with_name(service.as_str()));
 

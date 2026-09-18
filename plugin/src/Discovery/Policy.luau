@@ -56,11 +56,16 @@ export type PlaceIdentity = {
 	--- synthetic one derived from the branch name, so only the branch's own
 	--- daemon can claim it.
 	branch: boolean?,
+	--- The branch name, when `branch` is true: a daemon serving this branch
+	--- says so in its hello, which matches even before ids line up.
+	branchName: string?,
 }
 
 export type HelloClaim = {
 	gameId: number?,
 	placeIds: { number }?,
+	--- A branch daemon names the branch it serves (docs/branches.md).
+	branch: string?,
 	[string]: any,
 }
 
@@ -112,21 +117,37 @@ end
 ---
 --- A branch clone is stricter still: nothing below MATCH_EXACT counts
 --- (docs/branches.md — "a clone that finds no daemon claiming its id refuses
---- to connect rather than falling through to main"). The synthetic placeId
---- makes the branch's own daemon rank exact, so this only ever removes the
---- weak and game-level matches — main's daemon among them, which would
---- otherwise sync the clone's edits straight into the real place's worktree.
+--- to connect rather than falling through to main"), and it has one extra way
+--- to reach exact — a daemon that names the branch it serves.
+---
+--- The branch-name rule is not a convenience. A clone opened from a local
+--- `.rbxl` has `GameId == 0`, so there is no universe id for either side to
+--- agree on; ids alone would leave the clone weak against every daemon and
+--- the refusal below would then refuse them all.
 function Policy.rankHello(hello: HelloClaim, place: PlaceIdentity): number
-	if place.branch == true then
-		return if Policy.rankStrict(hello, place) >= Policy.MATCH_EXACT then Policy.MATCH_EXACT else Policy.MATCH_NONE
+	if place.branch ~= true then
+		return Policy.rankStrict(hello, place)
 	end
 
-	return Policy.rankStrict(hello, place)
+	if place.branchName ~= nil and place.branchName ~= "" and hello.branch == place.branchName then
+		return Policy.MATCH_EXACT
+	end
+
+	return if Policy.rankStrict(hello, place) >= Policy.MATCH_EXACT then Policy.MATCH_EXACT else Policy.MATCH_NONE
 end
 
---- The strict-GameId ranking itself, branch rule excluded.
+--- Does this hello explicitly claim `placeId`?
+function Policy.claimsPlace(hello: HelloClaim, placeId: number): boolean
+	local placeIds = hello.placeIds
+
+	return placeIds ~= nil and #placeIds > 0 and table.find(placeIds, placeId) ~= nil
+end
+
+--- The strict-GameId ranking itself, branch rules excluded.
 function Policy.rankStrict(hello: HelloClaim, place: PlaceIdentity): number
 	if place.gameId ~= 0 then
+		-- Published place: unchanged. GameId gates everything, `placeIds`
+		-- refines among the daemons that pass the gate.
 		if hello.gameId ~= place.gameId then
 			return Policy.MATCH_NONE
 		end
@@ -138,13 +159,22 @@ function Policy.rankStrict(hello: HelloClaim, place: PlaceIdentity): number
 		end
 
 		return Policy.MATCH_GAME
-	else
-		if not hello.gameId or hello.gameId == 0 then
-			return Policy.MATCH_WEAK
-		end
-
-		return Policy.MATCH_NONE
 	end
+
+	-- No universe id to match on (an unpublished place, or a branch clone
+	-- opened from a local file). A daemon that claims this exact placeId has
+	-- made the stronger statement, so take it whatever it says about gameId.
+	-- Guarded on a non-zero placeId: `placeIds: [0]` must not exactly match
+	-- every unpublished place in the world.
+	if place.placeId ~= 0 and Policy.claimsPlace(hello, place.placeId) then
+		return Policy.MATCH_EXACT
+	end
+
+	if not hello.gameId or hello.gameId == 0 then
+		return Policy.MATCH_WEAK
+	end
+
+	return Policy.MATCH_NONE
 end
 
 --------------------------------------------------------------------------------
