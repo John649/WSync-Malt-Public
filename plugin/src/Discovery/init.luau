@@ -72,11 +72,14 @@ Discovery.BROKER_PORT_MAX = Broker.PORT_MAX
 --- The ordered probe list for this scan, built from the live Settings values
 --- (Policy owns the ordering and the dedup rules).
 local function candidates(): { Policy.Candidate }
+	local identity = Branch.current()
+
 	return Policy.candidates({
 		host = tostring(Config:get("Host")),
 		port = tonumber(Config:get("Port")) or Config:getDefault("Port"),
 		https = Config:get("Https") == true,
 		autoDiscover = Config:get("AutoDiscover") == true,
+		branchPort = if identity ~= nil then identity.daemonPort else nil,
 	})
 end
 

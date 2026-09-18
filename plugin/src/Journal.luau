@@ -92,9 +92,11 @@ Journal.CONTENT_SERVICES = {
 
 Journal.FLUSH_SECONDS = 2
 Journal.BLOB_REFRESH_SECONDS = 10
-Journal.SWEEP_SECONDS = 30
-Journal.SELECTION_WINDOW_SECONDS = 300
-Journal.SWEEP_MAX_INSTANCES = 256
+-- How many instances the initial observation pass connects before it yields.
+-- Connecting two signals on every instance of a 157k-instance place in one
+-- synchronous go would blow the remote op's timeout and freeze Studio's main
+-- thread; the pass runs detached and `journal_status` reports its progress.
+Journal.OBSERVE_CHUNK = 2000
 -- A pinned blob lives until `branch_blob_close` drops it, or ten minutes,
 -- whichever comes first (the CLI's pull contract).
 Journal.BLOB_TTL_SECONDS = 600
@@ -129,10 +131,25 @@ local history: { Event } = {}
 local marks: { [string]: number } = {}
 
 local connections: { RBXScriptConnection } = {}
-local watched: { [Instance]: boolean } = {}
 local subscribedTags: { [string]: boolean } = {}
-local recent: { [Instance]: number } = {}
-local snapshots: { [Instance]: { [string]: any } } = {}
+local watchedServices: { [Instance]: boolean } = {}
+
+-- Per-instance observation. `instanceConnections` is keyed by instance so the
+-- connections of one that leaves the tree can be dropped without touching
+-- anything else — its id stays, because events already in flight still name
+-- it. `dirty` holds what changed since the last drain: property names, and
+-- attribute names prefixed with `@` (no Roblox property starts with one).
+local instanceConnections: { [Instance]: { RBXScriptConnection } } = {}
+local dirty: { [Instance]: { [string]: boolean } } = {}
+local dirtyRec: { [Instance]: string } = {}
+local pendingRemove: { [Instance]: Instance } = {}
+local drainScheduled = false
+local observed = 0
+local observing = false
+
+-- Assigned below; declared here because `checkpoint` and `adoptShape` clear the
+-- id maps and must drop the connections that went with them.
+local disconnectInstances: () -> () = function() end
 
 type AddedRoot = { instance: Instance, parent: string, name: string, class: string, capturedAt: number }
 
@@ -229,6 +246,8 @@ export type Shape = { v: number, count: number, services: { ShapeService } }
 --- the SAME walk that numbers, so the two can never describe different trees.
 function Journal.checkpoint(services: { Instance }?, withShape: boolean?): { count: number, shape: Shape? }
 	local list = services or Journal.services()
+
+	disconnectInstances()
 
 	table.clear(idOf)
 	table.clear(byId)
@@ -464,6 +483,8 @@ end
 function Journal.adoptShape(shape: Shape, services: { Instance }?): { [string]: any }
 	local list = services or Journal.services()
 
+	disconnectInstances()
+
 	table.clear(idOf)
 	table.clear(byId)
 	table.clear(addedRoots)
@@ -583,30 +604,6 @@ local function decodeValue(encoded: any): (boolean, any)
 	end
 
 	return Dom.EncodedValue.decode(encoded)
-end
-
---- Every non-default, encodable property of an instance, in wire form. Used
---- by the fingerprint sweep to catch sets no signal reported.
-local function snapshotProperties(instance: Instance): { [string]: any }
-	local properties: { [string]: any } = {}
-
-	for prop in Dom.getDefaultProperties(instance.ClassName) do
-		if SKIP_PROPERTIES[prop] then
-			continue
-		end
-
-		if prop == "Source" and instance:IsA("LuaSourceContainer") then
-			continue
-		end
-
-		local encoded = Journal.encodeProperty(instance, prop)
-
-		if encoded ~= nil then
-			properties[prop] = encoded
-		end
-	end
-
-	return properties
 end
 
 --- Structural equality over encoded values (tables of plain JSON scalars).
@@ -863,14 +860,30 @@ local function refreshBlobs()
 
 		root.capturedAt = os.clock()
 
-		if blobId ~= nil then
-			emit(id, "add", {
-				parent = root.parent,
-				name = root.instance.Name,
-				class = root.class,
-				blob = blobId,
-			})
+		if blobId == nil then
+			continue
 		end
+
+		-- A refresh is NOT a second add. While the original is still pending it
+		-- is patched in place (no new seq, no second event); once it has gone
+		-- out, the only way to carry the new bytes is another `add` for the
+		-- same id, and `update` marks it as the blob-only thing it is. The
+		-- first live branch recorded exactly this as a duplicate `new:2`.
+		local existing = pending[coalesceKey(id, "add", {})]
+
+		if existing ~= nil then
+			existing.blob = blobId
+			existing.t = nowMillis()
+			continue
+		end
+
+		emit(id, "add", {
+			parent = root.parent,
+			name = root.instance.Name,
+			class = root.class,
+			blob = blobId,
+			update = true,
+		})
 	end
 end
 
@@ -994,144 +1007,244 @@ local function parentIdOf(instance: Instance): string?
 	return if byId[serviceId] == parent then serviceId else nil
 end
 
-local function onChanged(instance: Instance, prop: string)
-	local id = idOf[instance]
+--------------------------------------------------------------------------------
+-- Observation
+--------------------------------------------------------------------------------
 
-	if id == nil then
-		return
-	end
+--- EVERY registered instance is observed: `Changed` and `AttributeChanged` are
+--- connected the moment it gets an id and dropped when it leaves the tree for
+--- good. The earlier scheme connected only what Studio's Selection touched or
+--- a plugin op wrote through, which made a script driving edits through
+--- `wsync exec` — which is how agents actually edit — almost entirely
+--- invisible: a `SetAttribute`, a rename and a reparent all went unrecorded.
+---
+--- Signals never emit directly. They mark the instance dirty and schedule one
+--- drain per resumption cycle (`task.defer`); the drain reads the CURRENT
+--- value once per property. A property written a thousand times in one frame
+--- therefore costs one read and one event, and an idle journal costs nothing
+--- at all — there is no polling connection to pay for.
 
-	if SKIP_PROPERTIES[prop] then
-		return
-	end
+--- Emit everything marked dirty since the last drain.
+local function drainDirty()
+	drainScheduled = false
 
-	if prop == "Name" then
-		emit(id, "rename", { name = instance.Name })
-		return
-	end
+	local work = dirty
+	dirty = {}
 
-	-- git owns script bodies; the replay never touches them either.
-	if prop == "Source" and instance:IsA("LuaSourceContainer") then
-		return
-	end
+	for instance, props in work do
+		local id = idOf[instance]
 
-	local encoded = Journal.encodeProperty(instance, prop)
-
-	if encoded ~= nil then
-		emit(id, "set", { prop = prop, value = encoded })
-
-		local snapshot = snapshots[instance]
-
-		if snapshot ~= nil then
-			snapshot[prop] = encoded
+		if id == nil then
+			continue
 		end
-	end
-end
 
---- Reconcile an instance against its last snapshot, emitting the sets and the
---- rename that no signal reported. Returns how many events it emitted.
-local function reconcile(instance: Instance): number
-	local id = idOf[instance]
+		local rec = dirtyRec[instance]
+		dirtyRec[instance] = nil
 
-	if id == nil or not instance:IsDescendantOf(game) then
-		return 0
-	end
+		local previous = recording
 
-	local previous = snapshots[instance]
-	local current = snapshotProperties(instance)
+		if rec ~= nil then
+			recording = rec
+		end
 
-	snapshots[instance] = current
+		for prop in props do
+			if string.sub(prop, 1, 1) == "@" then
+				local name = string.sub(prop, 2)
 
-	if previous == nil then
-		return 0
-	end
+				local okRead, value = pcall(function()
+					return instance:GetAttribute(name)
+				end)
 
-	local emitted = 0
-
-	for prop, value in current do
-		if not sameValue(previous[prop], value) then
-			if prop == "Name" then
+				emit(id, "attr", { name = name, value = if okRead then encodeAttribute(value) else nil })
+			elseif prop == "Name" then
 				emit(id, "rename", { name = instance.Name })
 			else
-				emit(id, "set", { prop = prop, value = value })
+				local encoded = Journal.encodeProperty(instance, prop)
+
+				if encoded ~= nil then
+					emit(id, "set", { prop = prop, value = encoded })
+				end
 			end
-
-			emitted += 1
 		end
-	end
 
-	return emitted
+		recording = previous
+	end
 end
 
---- Connect the lazy per-instance signals. Called for anything the user
---- selected in Studio and for anything a plugin op wrote through.
----
---- `Changed` on a `ValueBase` reports the new *value*, not a property name
---- (a long-standing engine quirk), so those get explicit property signals.
-local function watch(instance: Instance)
-	if watched[instance] or idOf[instance] == nil then
+local function scheduleDrain()
+	if drainScheduled then
 		return
 	end
 
-	watched[instance] = true
+	drainScheduled = true
+
+	task.defer(function()
+		local ok, err = pcall(drainDirty)
+
+		if not ok then
+			drainScheduled = false
+			Log.debug("Journal: drain failed:", err)
+		end
+	end)
+end
+
+local function markDirty(instance: Instance, prop: string)
+	if not active or muted or idOf[instance] == nil then
+		return
+	end
+
+	local props = dirty[instance]
+
+	if props == nil then
+		props = {}
+		dirty[instance] = props
+	end
+
+	props[prop] = true
+
+	scheduleDrain()
+end
+
+--- Connect one instance. Idempotent, and cheap enough to call on every add.
+---
+--- `Changed` on a `ValueBase` reports the new VALUE rather than a property
+--- name (a long-standing engine quirk), so those get explicit per-property
+--- signals instead.
+local function watch(instance: Instance)
+	if instanceConnections[instance] ~= nil then
+		return
+	end
+
+	local list: { RBXScriptConnection } = {}
 
 	if instance:IsA("ValueBase") then
 		for _, prop in { "Name", "Value" } do
-			local ok, signal = pcall(function()
-				return instance:GetPropertyChangedSignal(prop)
-			end)
-
-			if ok then
+			pcall(function()
 				table.insert(
-					connections,
-					signal:Connect(function()
-						onChanged(instance, prop)
+					list,
+					instance:GetPropertyChangedSignal(prop):Connect(function()
+						markDirty(instance, prop)
 					end)
 				)
-			end
+			end)
 		end
 	else
-		table.insert(
-			connections,
-			instance.Changed:Connect(function(prop: string)
-				onChanged(instance, prop)
-			end)
-		)
+		pcall(function()
+			table.insert(
+				list,
+				instance.Changed:Connect(function(prop: string)
+					if SKIP_PROPERTIES[prop] then
+						return
+					end
+
+					-- git owns script bodies; the replay never touches them either.
+					if prop == "Source" and instance:IsA("LuaSourceContainer") then
+						return
+					end
+
+					markDirty(instance, prop)
+				end)
+			)
+		end)
 	end
 
-	table.insert(
-		connections,
-		instance.AttributeChanged:Connect(function(name: string)
-			local id = idOf[instance]
+	pcall(function()
+		table.insert(
+			list,
+			instance.AttributeChanged:Connect(function(name: string)
+				markDirty(instance, `@{name}`)
+			end)
+		)
+	end)
 
-			if id ~= nil then
-				emit(id, "attr", { name = name, value = encodeAttribute(instance:GetAttribute(name)) })
-			end
+	instanceConnections[instance] = list
+	observed += 1
+end
+
+--- Drop an instance's connections. The id mapping is deliberately KEPT: events
+--- already in the stream name it, and a merge has to be able to resolve them.
+local function unwatch(instance: Instance)
+	local list = instanceConnections[instance]
+
+	if list == nil then
+		return
+	end
+
+	for _, connection in list do
+		pcall(function()
+			connection:Disconnect()
 		end)
-	)
+	end
+
+	instanceConnections[instance] = nil
+	observed -= 1
+
+	dirty[instance] = nil
+	dirtyRec[instance] = nil
+end
+
+disconnectInstances = function()
+	for instance in instanceConnections do
+		unwatch(instance)
+	end
+
+	table.clear(instanceConnections)
+	table.clear(dirty)
+	table.clear(dirtyRec)
+	table.clear(pendingRemove)
+
+	observed = 0
+	drainScheduled = false
+end
+
+--- Connect everything currently registered, in chunks, off the calling thread.
+--- `journal_status` reports `observing` until it finishes; edits in that window
+--- are the one gap this design has, and it is bounded by the size of the place
+--- rather than by anything the user does.
+local function observeAll()
+	-- Snapshotted first: `watch` yields nothing, but a DescendantAdded landing
+	-- mid-pass would add keys to `idOf` while it was being traversed.
+	local roll: { Instance } = {}
+
+	for instance in idOf do
+		table.insert(roll, instance)
+	end
+
+	observing = true
+
+	task.spawn(function()
+		for index, instance in roll do
+			if not active then
+				break
+			end
+
+			watch(instance)
+
+			if index % Journal.OBSERVE_CHUNK == 0 then
+				task.wait()
+			end
+		end
+
+		observing = false
+
+		Log.stage(`Journal: observing {observed} instances`)
+	end)
 end
 
 --- The write-handler hook (Handlers/Write calls this after every `set`,
---- `attr`, `tag`, `rename` and `move`). Connecting here is what makes the
---- *next* edit of that instance observable; the op's own write is reconciled
---- against the stored snapshot, so only the very first touch of an instance
---- nobody has selected relies on the daemon already knowing what it asked for.
+--- `attr`, `tag`, `rename` and `move`). Observation no longer depends on it —
+--- the instance is already connected — so all it does now is label whatever
+--- that op dirtied with the op's own ChangeHistory name.
 function Journal.touched(instance: Instance?, rec: string?)
 	if not active or instance == nil or idOf[instance] == nil then
 		return
 	end
 
-	local previous = recording
+	watch(instance)
 
 	if rec ~= nil then
-		recording = rec
+		dirtyRec[instance] = rec
 	end
-
-	watch(instance)
-	recent[instance] = os.clock()
-	reconcile(instance)
-
-	recording = previous
 end
 
 --- The recording name stamped on every event until it is cleared (`rec`).
@@ -1185,8 +1298,81 @@ local function subscribeTags()
 	end
 end
 
+--------------------------------------------------------------------------------
+-- Structure
+--------------------------------------------------------------------------------
+
+local function inWatchedService(instance: Instance): boolean
+	for service in watchedServices do
+		if instance:IsDescendantOf(service) then
+			return true
+		end
+	end
+
+	return false
+end
+
+--- The deferred half of a removal. It only runs when no `DescendantAdded`
+--- claimed the instance as a move first, so a reparent can never be recorded
+--- as a delete.
+local function deferredRemove(instance: Instance)
+	local oldParent = pendingRemove[instance]
+
+	if oldParent == nil then
+		return
+	end
+
+	pendingRemove[instance] = nil
+
+	local id = idOf[instance]
+
+	if id == nil then
+		return
+	end
+
+	if inWatchedService(instance) then
+		-- Back in the tree without an add we saw (an undo, say).
+		if instance.Parent ~= oldParent then
+			local parentId = parentIdOf(instance)
+
+			if parentId ~= nil then
+				emit(id, "move", { parent = parentId })
+			end
+		end
+
+		return
+	end
+
+	emit(id, "remove", {})
+	unwatch(instance)
+end
+
 local function onDescendantAdded(instance: Instance, service: Instance)
-	if muted or Journal.isExcluded(instance, service) or idOf[instance] ~= nil then
+	if muted or Journal.isExcluded(instance, service) then
+		return
+	end
+
+	local existing = idOf[instance]
+
+	if existing ~= nil then
+		-- Already registered, so this is the second half of a reparent: the
+		-- `DescendantRemoving` fired against the old parent a moment ago. Settle
+		-- it as a move NOW and cancel the pending remove.
+		local oldParent = pendingRemove[instance]
+		pendingRemove[instance] = nil
+
+		watch(instance)
+
+		-- Descendants of a moved subtree are re-added too, but their own parent
+		-- did not change — only the root's did.
+		if oldParent == nil or instance.Parent ~= oldParent then
+			local parentId = parentIdOf(instance)
+
+			if parentId ~= nil then
+				emit(existing, "move", { parent = parentId })
+			end
+		end
+
 		return
 	end
 
@@ -1200,6 +1386,7 @@ local function onDescendantAdded(instance: Instance, service: Instance)
 
 	local id = `new:{newCounter}`
 	assign(instance, id)
+	watch(instance)
 
 	local class = instance.ClassName
 
@@ -1226,51 +1413,14 @@ local function onDescendantAdded(instance: Instance, service: Instance)
 end
 
 local function onDescendantRemoving(instance: Instance)
-	local id = idOf[instance]
-
-	if muted or id == nil then
+	if muted or idOf[instance] == nil then
 		return
 	end
 
-	-- The signal fires *before* the removal, so the old parent is still here.
-	local oldParent = instance.Parent
+	-- The signal fires BEFORE the removal, so the old parent is still here.
+	pendingRemove[instance] = instance.Parent
 
-	task.defer(function()
-		if instance:IsDescendantOf(game) then
-			local parent = instance.Parent
-
-			if parent ~= oldParent then
-				local parentId = parentIdOf(instance)
-
-				if parentId ~= nil then
-					emit(id, "move", { parent = parentId })
-				end
-			end
-
-			return
-		end
-
-		emit(id, "remove", {})
-	end)
-end
-
-local function sweep()
-	local now = os.clock()
-	local looked = 0
-
-	for instance, at in recent do
-		if now - at > Journal.SELECTION_WINDOW_SECONDS then
-			recent[instance] = nil
-			continue
-		end
-
-		if looked >= Journal.SWEEP_MAX_INSTANCES then
-			break
-		end
-
-		looked += 1
-		reconcile(instance)
-	end
+	task.defer(deferredRemove, instance)
 end
 
 local function startLoop()
@@ -1282,7 +1432,6 @@ local function startLoop()
 
 	task.spawn(function()
 		local lastFlush = os.clock()
-		local lastSweep = os.clock()
 
 		while active do
 			task.wait(1)
@@ -1299,11 +1448,6 @@ local function startLoop()
 
 				pcall(Journal.flush)
 			end
-
-			if now - lastSweep >= Journal.SWEEP_SECONDS then
-				lastSweep = now
-				pcall(sweep)
-			end
 		end
 
 		looping = false
@@ -1318,8 +1462,10 @@ local function disconnectAll()
 	end
 
 	table.clear(connections)
-	table.clear(watched)
 	table.clear(subscribedTags)
+	table.clear(watchedServices)
+
+	disconnectInstances()
 end
 
 --- Start recording against a checkpoint. The tree must already be numbered
@@ -1337,6 +1483,8 @@ function Journal.start(checkpoint: string, services: { Instance }?)
 	local list = services or Journal.services()
 
 	for _, service in list do
+		watchedServices[service] = true
+
 		table.insert(
 			connections,
 			service.DescendantAdded:Connect(function(instance: Instance)
@@ -1347,33 +1495,9 @@ function Journal.start(checkpoint: string, services: { Instance }?)
 		table.insert(connections, service.DescendantRemoving:Connect(onDescendantRemoving))
 	end
 
-	local okSelection, selection = pcall(function()
-		return game:GetService("Selection")
-	end)
-
-	if okSelection then
-		table.insert(
-			connections,
-			(selection :: any).SelectionChanged:Connect(function()
-				local okGet, selected = pcall(function()
-					return (selection :: any):Get()
-				end)
-
-				if not okGet then
-					return
-				end
-
-				for _, instance in selected do
-					watch(instance)
-					recent[instance] = os.clock()
-
-					if snapshots[instance] == nil and idOf[instance] ~= nil then
-						snapshots[instance] = snapshotProperties(instance)
-					end
-				end
-			end)
-		)
-	end
+	-- Everything already numbered gets connected too. Detached and chunked:
+	-- see observeAll.
+	observeAll()
 
 	subscribeTags()
 	startLoop()
@@ -1400,6 +1524,8 @@ function Journal.status(): { [string]: any }
 		checkpoint = checkpointId,
 		count = checkpointCount,
 		pending = pendingCount,
+		observed = observed,
+		observing = observing,
 		flushed = flushedTotal,
 		seq = seq,
 		lastFlushAt = lastFlushAt,
@@ -1623,8 +1749,10 @@ local function applyEvent(
 	local op = event.op
 
 	if op == "add" then
-		-- A blob refresh re-emits an `add` for a root already in the stream
-		-- (see refreshBlobs), so a second one is not a second instance.
+		-- A blob refresh re-sends an `add` for a root already created by this
+		-- replay (see refreshBlobs; `update = true` marks the deliberate ones).
+		-- Either way a second `add` for an id is new bytes for an instance that
+		-- exists, never a second instance.
 		if created[event.id] ~= nil then
 			return true
 		end

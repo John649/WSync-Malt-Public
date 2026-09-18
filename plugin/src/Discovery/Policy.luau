@@ -47,6 +47,12 @@ export type Settings = {
 	port: number,
 	https: boolean?,
 	autoDiscover: boolean,
+	--- A branch clone's own daemon port, taken from the clone's marker. When
+	--- present it is probed FIRST: the branch daemon is the only one that can
+	--- match a clone, so walking the shared scan range to reach it is a dozen
+	--- pointless connection refusals on every boot. Ranking is unchanged — it
+	--- still has to come back MATCH_EXACT.
+	branchPort: number?,
 }
 
 export type PlaceIdentity = {
@@ -83,13 +89,26 @@ end
 --- already falls inside it. `autoDiscover = false` restricts the scan to the
 --- Settings candidate alone.
 function Policy.candidates(settings: Settings): { Candidate }
-	local list: { Candidate } = {
-		{
+	local list: { Candidate } = {}
+	local branchPort = settings.branchPort
+
+	if branchPort ~= nil then
+		table.insert(list, {
+			host = Policy.LOCAL_HOST,
+			port = branchPort,
+			https = false,
+		})
+	end
+
+	local settingsIsBranchPort = branchPort ~= nil and branchPort == settings.port and Policy.isLoopback(settings.host)
+
+	if not settingsIsBranchPort then
+		table.insert(list, {
 			host = settings.host,
 			port = settings.port,
 			https = settings.https == true,
-		},
-	}
+		})
+	end
 
 	if not settings.autoDiscover then
 		return list
@@ -98,7 +117,7 @@ function Policy.candidates(settings: Settings): { Candidate }
 	local coveredPort = if Policy.isLoopback(settings.host) then settings.port else nil
 
 	for port = Policy.PORT_MIN, Policy.PORT_MAX do
-		if port ~= coveredPort then
+		if port ~= coveredPort and port ~= branchPort then
 			table.insert(list, {
 				host = Policy.LOCAL_HOST,
 				port = port,

@@ -24,7 +24,7 @@ mod search;
 mod session;
 mod snapshot;
 mod source;
-pub(crate) mod transfer;
+mod transfer;
 mod transmit;
 mod write;
 

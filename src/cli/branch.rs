@@ -39,6 +39,7 @@ use rbx_dom_weak::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
 	collections::HashSet,
 	env, fs,
@@ -51,10 +52,7 @@ use std::{
 };
 
 use crate::{
-	cli::{
-		client::{print_json, truncate, Client, Target, Targeting},
-		live::transfer,
-	},
+	cli::client::{print_json, truncate, Client, Target, Targeting},
 	ext::PathExt,
 	wsync_info, wsync_warn,
 };
@@ -68,6 +66,15 @@ const MARKER_NAME: &str = "WSyncBranch";
 /// Number attribute on that marker carrying main's universe id, because a
 /// clone opened from an `.rbxl` reports `game.GameId == 0`
 const GAME_ID_ATTRIBUTE: &str = "GameId";
+
+/// Number attribute on the marker naming the branch daemon's port, so the
+/// plugin's discovery tries it before it ranks anything
+const DAEMON_PORT_ATTRIBUTE: &str = "DaemonPort";
+
+/// Read part size for a blob pull: the plugin's `BLOB_READ_MAX_LEN` ceiling,
+/// eight times the chunk the clipboard pump uses. Ten services at 64 KiB a
+/// part was the bulk of a `branch new`
+const BLOB_PART_BYTES: u64 = 512 * 1024;
 
 /// The compact DFS shape of the numbered tree, beside the branch record.
 /// Studio adds instances of its own when it opens a place file, so a clone
@@ -361,6 +368,8 @@ impl New {
 
 		enforce_budget(&main.workspace, self.budget.unwrap_or(DEFAULT_BUDGET), &name)?;
 
+		let raw = self.raw;
+		let mut clock = Timings::new(raw);
 		let clone_dir = root.join("clone");
 		fs::create_dir_all(&clone_dir).with_context(|| format!("Failed to create {}", clone_dir.to_string()))?;
 		exclude_branches_dir(&main.workspace);
@@ -372,12 +381,13 @@ impl New {
 			&main.workspace,
 			&["worktree", "add", &worktree.to_string(), "-b", &git_branch, "HEAD"],
 		)?;
+		clock.mark("worktree", "");
 
 		// (2) the checkpoint and the clone, out of main's Studio
 		let client = Client::connect(&self.targeting)?;
 		let checkpoint = client
 			.request_with_timeout("branch_checkpoint", json!({ "name": name }), HEAVY_TIMEOUT_MS)?
-			.into_value(self.raw)?;
+			.into_value(raw)?;
 
 		let (id, count) = checkpoint_fields(&checkpoint)?;
 		// `blobs` carries `{artifactId, bytes, sha256}` per service, which is
@@ -392,19 +402,50 @@ impl New {
 		// reads the real universe id off the marker instead
 		let game_id = main_game_id(&main.project, &client);
 
+		clock.mark("checkpoint", &format!("{count} instances"));
+
 		// Services are parented in the order this map iterates (lexicographic
 		// by class name). Both plugins number the tree themselves, so the
-		// order only has to be stable — `branch_adopt`'s count check is what
-		// proves the two numberings agree
-		let mut services = Vec::with_capacity(blobs.len());
+		// order only has to be stable — `branch_adopt`'s shape alignment is what
+		// proves the two numberings agree.
+		//
+		// The pulls run at once: the plugin pins each artifact separately and
+		// the daemon serves requests concurrently, so ten services in sequence
+		// was ten times a round trip for no reason
+		let jobs: Vec<(String, Value, PathBuf)> = blobs
+			.iter()
+			.map(|(service, blob)| (service.clone(), blob.clone(), clone_dir.join(format!("{service}.rbxm"))))
+			.collect();
 
-		for (service, blob) in blobs {
-			let file = clone_dir.join(format!("{service}.rbxm"));
+		let pulled: Vec<Result<(String, u64)>> = thread::scope(|scope| {
+			let handles: Vec<_> = jobs
+				.iter()
+				.map(|(service, blob, file)| {
+					let client = &client;
 
-			download_blob_to(&client, service, blob, &file, self.raw)
-				.with_context(|| format!("Failed to download the {service} blob"))?;
+					scope.spawn(move || {
+						pull_checkpoint_blob(client, service, blob, file, raw)
+							.with_context(|| format!("Failed to download the {service} blob"))
+					})
+				})
+				.collect();
 
-			services.push((service.clone(), file));
+			handles
+				.into_iter()
+				.map(|handle| {
+					handle
+						.join()
+						.unwrap_or_else(|_| bail!("a blob download thread panicked"))
+				})
+				.collect()
+		});
+
+		let mut services = Vec::with_capacity(jobs.len());
+		let mut pulled_bytes = 0;
+
+		for ((service, _, file), result) in jobs.iter().zip(pulled) {
+			pulled_bytes += result?.1;
+			services.push((service.clone(), file.clone()));
 		}
 
 		// The shape travels the same way the service blobs do. Without it
@@ -412,20 +453,23 @@ impl New {
 		// guarantee the count will not match
 		let shape_blob = match checkpoint.get("shape").filter(|shape| !shape.is_null()) {
 			Some(shape) => Some(
-				download_blob_to(&client, "shape", shape, &root.join(SHAPE_FILE), self.raw)
+				pull_checkpoint_blob(&client, "shape", shape, &root.join(SHAPE_FILE), raw)
 					.context("Failed to download the checkpoint shape")?
 					.0,
 			),
 			None => None,
 		};
 
-		let place = root.join(format!("{name}.rbxl"));
-		assemble_place(&services, &name, game_id, &place, self.raw)?;
+		clock.mark(
+			"blobs",
+			&format!("{} blobs, {}", services.len(), human_size(pulled_bytes)),
+		);
 
 		// (3) main remembers where this branch forked its journal
 		client
 			.post_endpoint("/journal/mark", &json!({ "checkpoint": id, "branch": name }))?
 			.json("/journal/mark")?;
+		clock.mark("mark", "");
 
 		// (4) the worktree's project file
 		let synthetic = synthetic_place_id(&name);
@@ -434,6 +478,7 @@ impl New {
 
 		// (5) the record, before anything is started: a failed start must
 		// leave a branch that `rm` can find
+		let place = root.join(format!("{name}.rbxl"));
 		let mut record = Record {
 			name: name.clone(),
 			checkpoint: id,
@@ -449,24 +494,38 @@ impl New {
 			studio_pid: None,
 		};
 		record.write(&root)?;
+		clock.mark("project", "");
 
-		// (6) the branch's own daemon
+		// (6) the branch's own daemon. It only needs the worktree, so it starts
+		// before the clone is assembled — and its port goes into the clone's
+		// marker, which is how the branch plugin finds it without ranking
 		let (port, daemon_pid) = spawn_daemon(&project)?;
 		record.daemon_port = Some(port);
 		record.write(&root)?;
+		clock.mark("daemon", &format!("port {port}"));
 
-		// (7) Studio on the clone
+		// (7) the clone, then Studio on it the moment the file is there
+		assemble_place(&services, &name, game_id, Some(port), &place, raw)?;
+		clock.mark("assemble", "");
+
 		let studio_pid = launch_studio(&place)?;
 		record.studio_pid = Some(studio_pid);
 		record.write(&root)?;
+		clock.mark("studio", &format!("PID {studio_pid}"));
 
 		// (8) the branch plugin adopts main's numbering
 		let branch = Client::connect(&record.targeting(&main.project))?;
 		wait_for_plugin(&branch, PLUGIN_WAIT)?;
-		adopt(&branch, &record, &root, self.raw)?;
+		clock.mark("plugin", "");
 
-		if self.raw {
-			print_json(&json!(record));
+		adopt(&branch, &record, &root, raw)?;
+		clock.mark("adopt", "");
+
+		if raw {
+			let mut line = json!(record);
+			line["timings"] = clock.as_json();
+
+			print_json(&line);
 
 			return Ok(());
 		}
@@ -474,8 +533,9 @@ impl New {
 		println!("{}", worktree.to_string());
 
 		wsync_info!(
-			"Branch {} is live: daemon on port {} (PID {}), Studio PID {}, checkpoint {} instances",
+			"Branch {} is live in {:.1}s: daemon on port {} (PID {}), Studio PID {}, checkpoint {} instances",
 			name.bold(),
+			clock.total(),
 			port.to_string().bold(),
 			daemon_pid.to_string().bold(),
 			studio_pid.to_string().bold(),
@@ -964,6 +1024,62 @@ impl Pick {
 		);
 
 		Ok(())
+	}
+}
+
+/// Wall clock per phase of a `branch new`. Each phase prints as it finishes,
+/// dimmed and on stderr so stdout stays the worktree path a caller reads;
+/// `--raw` prints nothing and carries the whole set as `timings`
+struct Timings {
+	raw: bool,
+	started: Instant,
+	phases: Vec<(String, u128)>,
+}
+
+impl Timings {
+	fn new(raw: bool) -> Self {
+		Self {
+			raw,
+			started: Instant::now(),
+			phases: Vec::new(),
+		}
+	}
+
+	fn mark(&mut self, phase: &str, detail: &str) {
+		let elapsed = self.started.elapsed();
+
+		self.started = Instant::now();
+
+		if !self.raw {
+			eprintln!(
+				"{}",
+				format!("  {phase:<11}{:>7.1}s  {detail}", elapsed.as_secs_f64())
+					.trim_end()
+					.dimmed()
+			);
+		}
+
+		self.phases.push((phase.to_owned(), elapsed.as_millis()));
+	}
+
+	fn as_json(&self) -> Value {
+		let mut timings: serde_json::Map<String, Value> = self
+			.phases
+			.iter()
+			.map(|(phase, millis)| (phase.clone(), json!(millis)))
+			.collect();
+
+		timings.insert(
+			"total".to_owned(),
+			json!(self.phases.iter().map(|(_, millis)| millis).sum::<u128>()),
+		);
+
+		Value::Object(timings)
+	}
+
+	/// The sum, for the one human-readable line at the end
+	fn total(&self) -> f64 {
+		self.phases.iter().map(|(_, millis)| *millis as f64).sum::<f64>() / 1000.0
 	}
 }
 
@@ -1757,21 +1873,9 @@ fn print_paths(headline: &str, paths: &[String], raw: bool) {
 /// `sha256`, so the `branch_blob_open` round trip is only made when a compat
 /// `blobIds` entry left them out. A checkpoint blob IS closed afterwards: it
 /// is pulled exactly once. Returns the artifact id and its size
-fn download_blob_to(client: &Client, label: &str, blob: &Value, out: &Path, raw: bool) -> Result<(String, u64)> {
+fn pull_checkpoint_blob(client: &Client, label: &str, blob: &Value, out: &Path, raw: bool) -> Result<(String, u64)> {
 	let (artifact, bytes, sha) = describe_blob(client, label, blob, raw)?;
-
-	let payload = transfer::pull(
-		client,
-		&transfer::Prepared {
-			op: "branch_blob_read",
-			id_key: "artifactId",
-			id: &artifact,
-			bytes,
-			sha256: &sha,
-			label: "branch blob",
-		},
-		raw,
-	);
+	let payload = pull_parts(client, &artifact, bytes, &sha, raw);
 
 	client
 		.request("branch_blob_close", json!({ "artifactId": artifact }))
@@ -1780,6 +1884,93 @@ fn download_blob_to(client: &Client, label: &str, blob: &Value, out: &Path, raw:
 	fs::write(out, payload?).with_context(|| format!("Failed to write {}", out.to_string()))?;
 
 	Ok((artifact, bytes))
+}
+
+/// The pump itself: `branch_blob_read` in 512 KiB parts, checked against the
+/// size and digest the far side declared. A torn, reordered or truncated
+/// transfer is a hard error, never a silently wrong artifact
+fn pull_parts(client: &Client, artifact: &str, bytes: u64, sha: &str, raw: bool) -> Result<Vec<u8>> {
+	let mut payload: Vec<u8> = Vec::with_capacity(bytes as usize);
+
+	while (payload.len() as u64) < bytes {
+		let part = client
+			.request_with_timeout(
+				"branch_blob_read",
+				json!({ "artifactId": artifact, "offset": payload.len() as u64, "maxLen": BLOB_PART_BYTES }),
+				HEAVY_TIMEOUT_MS,
+			)?
+			.into_value(raw)?;
+
+		let total = part
+			.get("totalBytes")
+			.and_then(Value::as_u64)
+			.with_context(|| format!("The plugin answered `branch_blob_read` for {artifact} without `totalBytes`"))?;
+
+		// The size was fixed when the blob was pinned; a part that claims
+		// otherwise means the far side re-captured under the same id
+		if total != bytes {
+			bail!("Blob {artifact} changed size mid-transfer (opened at {bytes} bytes, a part reports {total})");
+		}
+
+		let chunk = base64::engine::general_purpose::STANDARD
+			.decode(part.get("data").and_then(Value::as_str).unwrap_or(""))
+			.with_context(|| {
+				format!("The plugin answered `branch_blob_read` for {artifact} with undecodable base64")
+			})?;
+
+		let eof = part.get("eof").and_then(Value::as_bool) == Some(true);
+
+		if chunk.is_empty() {
+			bail!(
+				"The pull of blob {artifact} stalled: an empty part arrived at {} bytes",
+				payload.len()
+			);
+		}
+
+		if payload.len() as u64 + chunk.len() as u64 > bytes {
+			bail!("The pull of blob {artifact} overran its declared {bytes} bytes");
+		}
+
+		payload.extend_from_slice(&chunk);
+
+		if eof {
+			break;
+		}
+	}
+
+	if payload.len() as u64 != bytes {
+		bail!(
+			"Blob {artifact} ended early: {} of {bytes} bytes arrived",
+			payload.len()
+		);
+	}
+
+	let digest = format!("{:x}", Sha256::digest(&payload));
+
+	if !digest.eq_ignore_ascii_case(sha) {
+		bail!("Blob {artifact} arrived corrupted: SHA-256 {digest} does not match the declared {sha}");
+	}
+
+	Ok(payload)
+}
+
+/// A byte count the way a human reads one
+fn human_size(bytes: u64) -> String {
+	const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+
+	let mut value = bytes as f64;
+	let mut unit = 0;
+
+	while value >= 1024.0 && unit < UNITS.len() - 1 {
+		value /= 1024.0;
+		unit += 1;
+	}
+
+	if unit == 0 {
+		format!("{bytes} B")
+	} else {
+		format!("{value:.1} {}", UNITS[unit])
+	}
 }
 
 /// Accepts either the `{artifactId, bytes, sha256}` descriptor or the compat
@@ -1836,18 +2027,7 @@ fn open_blob(client: &Client, artifact: &str, raw: bool) -> Result<(u64, String)
 fn pull_blob(client: &Client, artifact: &str, raw: bool) -> Result<Vec<u8>> {
 	let (bytes, sha) = open_blob(client, artifact, raw)?;
 
-	transfer::pull(
-		client,
-		&transfer::Prepared {
-			op: "branch_blob_read",
-			id_key: "artifactId",
-			id: artifact,
-			bytes,
-			sha256: &sha,
-			label: "journal blob",
-		},
-		raw,
-	)
+	pull_parts(client, artifact, bytes, &sha, raw)
 }
 
 /// Names the service, the blob, the reader and the real cause — the top-level
@@ -1927,6 +2107,7 @@ fn assemble_place(
 	services: &[(String, PathBuf)],
 	name: &str,
 	game_id: Option<u64>,
+	daemon_port: Option<u16>,
 	out: &Path,
 	raw: bool,
 ) -> Result<()> {
@@ -1965,10 +2146,17 @@ fn assemble_place(
 		.with_name(MARKER_NAME)
 		.with_property("Value", name.to_owned());
 
-	if let Some(game_id) = game_id {
-		let mut attributes = Attributes::new();
+	let mut attributes = Attributes::new();
 
+	if let Some(game_id) = game_id {
 		attributes.insert(GAME_ID_ATTRIBUTE.to_owned(), Variant::Float64(game_id as f64));
+	}
+
+	if let Some(port) = daemon_port {
+		attributes.insert(DAEMON_PORT_ATTRIBUTE.to_owned(), Variant::Float64(f64::from(port)));
+	}
+
+	if attributes.iter().next().is_some() {
 		marker = marker.with_property("Attributes", attributes);
 	}
 
