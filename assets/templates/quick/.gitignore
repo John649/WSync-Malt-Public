@@ -1,5 +1,6 @@
 # WSync
 /sourcemap.json
+/.wsync-branches/
 
 # Wally
 /Packages

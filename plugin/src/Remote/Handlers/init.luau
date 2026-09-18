@@ -11,8 +11,10 @@
 -- session registry; Clipboard serializes/pastes native instance payloads
 -- (Design §5.4; wave-5 pinned contracts); Playtest drives Studio playtests
 -- and their PlayServer/PlayClient runtime agents over PluginConnectionService
--- (playtest.json; wave-6 pinned contracts). Every handler returns a JSON-safe
--- value or raises a RemoteError (Remote/Error.luau).
+-- (playtest.json; wave-6 pinned contracts); Branch carries the branch and
+-- journal ops (docs/branches.md — checkpoint numbering, the append-only
+-- journal and the Studio replay a merge runs on main). Every handler returns a
+-- JSON-safe value or raises a RemoteError (Remote/Error.luau).
 
 local Meta = require(script.Meta)
 local Inspect = require(script.Inspect)
@@ -27,6 +29,7 @@ local Capture = require(script.Capture)
 local Transmit = require(script.Transmit)
 local Clipboard = require(script.Clipboard)
 local Playtest = require(script.Playtest)
+local Branch = require(script.Branch)
 
 export type Handler = (args: { [string]: any }, ctx: any) -> any
 
@@ -47,6 +50,7 @@ for _, family in
 		Transmit.ops,
 		Clipboard.ops,
 		Playtest.ops,
+		Branch.ops,
 	} :: { { [string]: Handler } }
 do
 	for name, handler in family do

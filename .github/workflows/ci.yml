@@ -53,8 +53,24 @@ jobs:
   # Engine (root crate) — Design 15 phases 1-5.
   # --------------------------------------------------------------------------
   rust:
-    name: Engine
-    runs-on: ubuntu-latest
+    # Windows is in the matrix because the engine ships there and the tree has
+    # already grown platform-specific code (path separators in protocol JSON,
+    # process handling, Studio location) that a Linux-only pipeline cannot see.
+    #
+    # It runs fmt, clippy and a build, not the test suite: several integration
+    # tests isolate themselves by overriding $HOME/$USERPROFILE, and the home
+    # directory on Windows comes from a Win32 known-folder call that those
+    # variables do not affect — so the sandboxed config never applies and the
+    # tests would be red for reasons that have nothing to do with the change
+    # under review. TODO: make the sandbox's home override work on Windows
+    # (WSYNC_HOME, or read USERPROFILE first) and drop the matrix condition on
+    # the Test step below.
+    name: Engine (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -75,7 +91,14 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
+        if: matrix.os == 'ubuntu-latest'
         run: cargo test
+
+      # `cargo test` already builds everything on Linux; Windows needs its own
+      # build step because it does not run the suite
+      - name: Build
+        if: matrix.os == 'windows-latest'
+        run: cargo build
 
       # TODO (unlocks the rest of the command-validation contract, Design 10.5):
       #   - name: Build the binary

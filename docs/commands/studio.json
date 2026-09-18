@@ -3,16 +3,18 @@
   "title": "wsync studio",
   "category": "Studio control",
   "description": "Launches Roblox Studio, optionally opening a place/model file, with an option to reuse an already running Studio.",
-  "usage": "wsync studio [<place-path>] [-c|--check]",
+  "usage": "wsync studio [<place-path>] [-c|--check] [--raw]",
   "examples": [
     "wsync studio",
     "wsync studio ./build/game.rbxl",
-    "wsync studio --check"
+    "wsync studio --check",
+    "wsync studio ./build/game.rbxl --raw"
   ],
   "notes": [
     "Controls the local Studio application; no project, daemon or plugin connection is required.",
     "With no path it launches Studio without a place file; a path opens that file.",
     "--check means launch only when Studio is not already running. When Studio is running it reports that fact and exits successfully; when Studio is absent it launches Studio. This is not a read-only process-status query.",
-    "Launching returns before the place has finished loading. The plugin performs its own connection handshake afterwards."
+    "Launching returns before the place has finished loading. The plugin performs its own connection handshake afterwards.",
+    "--raw prints `{\"pid\": <n>}` for a launch, or `{\"ok\": true, \"launched\": false, \"running\": true}` when --check found Studio already running. The pid is the process that was spawned; Studio may re-exec itself, so it identifies the launch, not the window."
   ]
 }

@@ -19,6 +19,28 @@ pub fn get_wsync_dir() -> Result<PathBuf> {
 	Ok(user_dirs.home_dir().join(".wsync"))
 }
 
+/// A workspace-relative path as the protocol spells it: relative to
+/// `workspace_dir` and always forward-slashed.
+///
+/// Every surface that puts a disk path in JSON goes through here — `path`,
+/// `meta` and `where`, the divergence set, the backlog. Windows' native
+/// separator must not reach any of them: the same string is compared against
+/// paths from other machines, fed back to the daemon by clients that built it
+/// on a different platform, and rejected outright by
+/// [`crate::server::backlog::safe_rel_path`], which treats a backslash as the
+/// escape attempt it is on the platforms where it is not a separator.
+/// Windows accepts forward slashes everywhere it accepts a path, so joining
+/// one back onto `workspace_dir` still opens the file it names
+pub fn relative_string(path: &std::path::Path, workspace_dir: &std::path::Path) -> String {
+	let relative = path.strip_prefix(workspace_dir).unwrap_or(path);
+
+	relative
+		.components()
+		.map(|component| component.as_os_str().to_string_lossy())
+		.collect::<Vec<_>>()
+		.join("/")
+}
+
 /// Returns the Git or local username of the current user
 pub fn get_username() -> String {
 	if let Ok(output) = Command::new("git").arg("config").arg("user.name").output() {

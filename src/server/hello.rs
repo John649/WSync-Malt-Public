@@ -23,6 +23,10 @@ pub struct Hello {
 	/// Sync scope (Design §7.0): `"code"` or `"full"`; absent on older
 	/// daemons, which clients read as full
 	scope: &'static str,
+	/// The branch this daemon serves (docs/branches.md), when its project
+	/// file names one; absent on main and on every non-branch project
+	#[serde(skip_serializing_if = "Option::is_none")]
+	branch: Option<String>,
 	game_id: Option<u64>,
 	place_ids: Vec<u64>,
 	boot_id: String,
@@ -38,7 +42,7 @@ pub struct Hello {
 pub async fn main(State(state): State<AppState>) -> Json<Hello> {
 	trace!("Received request: hello");
 
-	let (name, project_path, game_id, place_ids, scope) = {
+	let (name, project_path, game_id, place_ids, scope, branch) = {
 		let project = state.core.project();
 
 		(
@@ -47,6 +51,7 @@ pub async fn main(State(state): State<AppState>) -> Json<Hello> {
 			project.game_id,
 			project.place_ids.clone(),
 			project.scope(),
+			project.branch.clone(),
 		)
 	};
 
@@ -65,6 +70,7 @@ pub async fn main(State(state): State<AppState>) -> Json<Hello> {
 		project: project_path.to_string(),
 		canonical_project,
 		scope: scope.as_str(),
+		branch,
 		game_id,
 		place_ids,
 		boot_id: state.identity.boot_id.clone(),

@@ -40,6 +40,7 @@ local Types = require(WSync.Types)
 local Transport = require(WSync.Transport)
 local Config = require(WSync.Config)
 local Broker = require(WSync.Broker)
+local Branch = require(WSync.Branch)
 local Log = require(WSync.Log)
 local Hex = require(WSync.Transport.Hex)
 local generateRef = require(WSync.Helpers.generateRef)
@@ -88,9 +89,13 @@ function Discovery.scan(shouldContinue: (() -> boolean)?): Promise.TypedPromise<
 	end
 
 	return Promise.new(function(resolve)
+		-- On a branch clone `game.PlaceId` is the synthetic id Branch.apply
+		-- stamped at boot, and `branch` makes Policy refuse anything below an
+		-- exact match, so the clone never attaches to main's daemon.
 		local place: Policy.PlaceIdentity = {
 			gameId = game.GameId,
 			placeId = game.PlaceId,
+			branch = Branch.isBranch(),
 		}
 
 		local best: Match? = nil

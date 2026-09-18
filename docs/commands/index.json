@@ -3,6 +3,7 @@
     "init",
     "plugin",
     "auth",
+    "branch",
     "daemon",
     "commands",
     "context",

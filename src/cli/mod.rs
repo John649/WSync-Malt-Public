@@ -8,6 +8,7 @@ use std::env;
 use crate::util;
 
 mod auth;
+mod branch;
 mod build;
 mod client;
 mod cloud;
@@ -228,6 +229,9 @@ impl Cli {
 			// Project setup
 			Commands::Auth(command) => command.main(),
 
+			// Branches
+			Commands::Branch(command) => command.main(),
+
 			// Live inspection & Studio control additions
 			Commands::Snapshot(command) => command.main(),
 			Commands::Backlog(command) => command.main(),
@@ -319,6 +323,8 @@ pub enum Commands {
 	Refresh(refresh::Refresh),
 
 	Auth(auth::Auth),
+
+	Branch(branch::Branch),
 
 	Snapshot(live::Snapshot),
 	Backlog(live::Backlog),

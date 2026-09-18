@@ -8,17 +8,24 @@ use std::{
 #[cfg(target_os = "windows")]
 use winsafe::{co::SW, EnumWindows};
 
-pub fn launch(path: Option<PathBuf>) -> Result<()> {
+/// Launches Studio and returns the pid of the process that was spawned.
+///
+/// The pid is what a branch records so it can tell "my Studio is gone" from
+/// "some Studio is running" later (docs/branches.md). Studio may re-exec
+/// itself into another process, so the pid is the launcher's, not a handle
+/// on the window that eventually appears — a caller that needs the window
+/// still has to look for it.
+pub fn launch(path: Option<PathBuf>) -> Result<u32> {
 	let studio_path = RobloxStudio::locate()?.application_path().to_owned();
 
-	Command::new(studio_path)
+	let child = Command::new(studio_path)
 		.arg(path.unwrap_or_default())
 		.stdin(Stdio::null())
 		.stdout(Stdio::null())
 		.stderr(Stdio::null())
 		.spawn()?;
 
-	Ok(())
+	Ok(child.id())
 }
 
 #[allow(unused_variables)]

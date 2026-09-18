@@ -523,9 +523,9 @@ impl Meta {
 			SyncbackFilter::default()
 		};
 
-		// WSync's own runtime directories (backups, artifacts, workflows) are
-		// always ignored — their churn must never re-enter the sync pipeline
-		// or leak into snapshots (Design §12)
+		// WSync's own runtime directories (backups, artifacts, workflows,
+		// branches) are always ignored — their churn must never re-enter the
+		// sync pipeline or leak into snapshots (Design §12)
 		let mut ignore_globs = project.ignore_globs.clone();
 
 		for dir in RUNTIME_DIRS {

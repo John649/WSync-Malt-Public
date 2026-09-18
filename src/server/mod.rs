@@ -31,11 +31,13 @@ pub mod divergence;
 mod exec;
 mod hello;
 mod home;
+pub mod journal;
 pub mod lifecycle;
 mod msgpack;
 mod open;
 pub mod operation;
 pub mod ops;
+mod pause;
 mod read;
 pub mod request;
 pub mod resolve;
@@ -142,6 +144,7 @@ pub struct AppState {
 	divergence: Arc<divergence::Divergence>,
 	backlog: Arc<backlog::BacklogStore>,
 	audit: Arc<audit::WritesLog>,
+	journal: Arc<journal::JournalStore>,
 }
 
 pub struct Server {
@@ -244,13 +247,18 @@ impl Server {
 			// A pending disk review (Design §7.0) persists across restarts
 			backlog: Arc::new(backlog::BacklogStore::load(&workspace_dir)),
 			audit: Arc::new(audit::WritesLog::new(&self.resolve_state_dir())),
+			// Branch journals live in the workspace, not the state dir: a
+			// branch is fully described by its clone plus its journal, and
+			// both have to survive being copied with the project
+			journal: Arc::new(journal::JournalStore::new(&workspace_dir)),
 		};
 
 		// A clash is never a question. The engine still parks — that is where
-		// both sides are captured — but the park is resolved toward Studio
-		// immediately, and the disk side goes to the backlog so the edit that
-		// lost is recoverable for a day instead of being dropped or waiting on
-		// a decision nobody planned to make.
+		// both sides are captured — but the park is resolved immediately, in
+		// the direction `initialSync` names: toward Studio by default, with
+		// the disk side going to the backlog so the edit that lost is
+		// recoverable for a day instead of being dropped or waiting on a
+		// decision nobody planned to make.
 		{
 			let resolver = state.clone();
 			// The engine notifies from the processor thread, which is not a
@@ -262,7 +270,7 @@ impl Server {
 				let state = resolver.clone();
 				let parked = parked.clone();
 
-				runtime.spawn(async move { resolve::auto_keep_studio(&state, parked).await });
+				runtime.spawn(async move { resolve::auto_resolve(&state, parked).await });
 			}));
 		}
 
@@ -318,6 +326,27 @@ impl Server {
 				"/choice/selection",
 				post(divergence::choice_selection).fallback(Self::default_redirect),
 			)
+			.route(
+				"/journal",
+				get(journal::read)
+					.post(journal::append)
+					.fallback(Self::default_redirect),
+			)
+			.route(
+				"/journal/append",
+				post(journal::append).fallback(Self::default_redirect),
+			)
+			.route("/journal/mark", post(journal::mark).fallback(Self::default_redirect))
+			.route("/journal/marks", get(journal::marks).fallback(Self::default_redirect))
+			.route(
+				"/journal/blob/:blob_id",
+				get(journal::get_blob)
+					.post(journal::put_blob)
+					.fallback(Self::default_redirect),
+			)
+			.route("/sync", get(pause::status).fallback(Self::default_redirect))
+			.route("/sync/pause", post(pause::pause).fallback(Self::default_redirect))
+			.route("/sync/resume", post(pause::resume).fallback(Self::default_redirect))
 			.route("/backlog", get(backlog::status).fallback(Self::default_redirect))
 			.route(
 				"/backlog/restore",

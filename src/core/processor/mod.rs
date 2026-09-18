@@ -7,7 +7,10 @@ use serde::Deserialize;
 use std::{
 	collections::HashMap,
 	path::Path,
-	sync::{Arc, Mutex},
+	sync::{
+		atomic::{AtomicBool, Ordering},
+		Arc, Mutex,
+	},
 	thread::Builder,
 };
 
@@ -74,6 +77,7 @@ impl Processor {
 		vfs: Arc<Vfs>,
 		project: Arc<Mutex<Project>>,
 		conflicts: Arc<ConflictEngine>,
+		sync_paused: Arc<AtomicBool>,
 	) -> Self {
 		let handler = Arc::new(Handler {
 			queue,
@@ -81,6 +85,7 @@ impl Processor {
 			vfs: vfs.clone(),
 			project,
 			conflicts,
+			sync_paused,
 		});
 
 		let handler = handler.clone();
@@ -133,6 +138,7 @@ struct Handler {
 	vfs: Arc<Vfs>,
 	project: Arc<Mutex<Project>>,
 	conflicts: Arc<ConflictEngine>,
+	sync_paused: Arc<AtomicBool>,
 }
 
 impl Handler {
@@ -141,6 +147,16 @@ impl Handler {
 		profiling::start_frame!();
 
 		trace!("Received VFS event: {event:?}");
+
+		// A paused daemon reads nothing and pushes nothing: the disk is being
+		// moved under it on purpose (`branch finish` fast-forwards main's
+		// checkout while main's Studio takes the replay), and re-snapshotting
+		// half a checkout would race that replay for the same instances.
+		// `POST /sync/resume` re-derives the tree from disk afterwards
+		if self.sync_paused.load(Ordering::SeqCst) {
+			trace!("Processing of {:?} aborted: sync is paused", event.path());
+			return;
+		}
 
 		let engine_on = Config::new().conflict_engine;
 

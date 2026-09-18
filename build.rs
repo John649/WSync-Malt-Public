@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::{
 	env, fs,
 	fs::File,
-	path::PathBuf,
+	path::{Path, PathBuf},
 	process::{Command, Stdio},
 };
 
@@ -43,10 +43,88 @@ fn stamp_build_identity(manifest_dir: &str) {
 
 	// Re-stamp when the checked-out commit moves; dirtiness inherently lags
 	// until the next rebuild, which is acceptable for a diagnostic surface
-	let git_head = PathBuf::from(manifest_dir).join(".git").join("HEAD");
+	let Some(gitdir) = resolve_gitdir(manifest_dir) else {
+		return;
+	};
 
-	if git_head.exists() {
-		println!("cargo:rerun-if-changed={}", git_head.display());
+	let head = gitdir.join("HEAD");
+
+	if !head.exists() {
+		return;
+	}
+
+	println!("cargo:rerun-if-changed={}", head.display());
+
+	// `HEAD` on a branch is one line naming a ref, and that file is what
+	// actually moves when a commit lands — watching `HEAD` alone means the
+	// stamp only refreshes on a checkout. In a worktree the ref lives in the
+	// *common* directory, not beside this worktree's HEAD
+	let Ok(contents) = fs::read_to_string(&head) else {
+		return;
+	};
+
+	let Some(reference) = contents.trim().strip_prefix("ref:") else {
+		// Detached HEAD: the hash is in HEAD itself, already watched above
+		return;
+	};
+
+	let reference = reference.trim();
+	let common = common_dir(&gitdir);
+
+	// A packed ref has no file to watch; `packed-refs` is the next best
+	// trigger and covers a freshly cloned or gc'd repository
+	for candidate in [common.join(reference), common.join("packed-refs")] {
+		if candidate.exists() {
+			println!("cargo:rerun-if-changed={}", candidate.display());
+			break;
+		}
+	}
+}
+
+/// The real git directory for `manifest_dir`. In a normal checkout that is
+/// `.git/`; in a worktree (and in a submodule) `.git` is a *file* holding a
+/// `gitdir: <path>` line pointing at
+/// `<common>/worktrees/<name>`, and everything this build script reads —
+/// `HEAD` above all — lives there instead
+fn resolve_gitdir(manifest_dir: &str) -> Option<PathBuf> {
+	let dot_git = PathBuf::from(manifest_dir).join(".git");
+
+	if dot_git.is_dir() {
+		return Some(dot_git);
+	}
+
+	if !dot_git.is_file() {
+		return None;
+	}
+
+	let pointer = fs::read_to_string(&dot_git).ok()?;
+	let target = pointer.lines().find_map(|line| line.trim().strip_prefix("gitdir:"))?;
+	let target = PathBuf::from(target.trim());
+
+	// The pointer is allowed to be relative to the directory holding `.git`
+	let target = if target.is_absolute() {
+		target
+	} else {
+		PathBuf::from(manifest_dir).join(target)
+	};
+
+	target.is_dir().then_some(target)
+}
+
+/// Where shared refs live for a git directory: a worktree's gitdir carries a
+/// `commondir` file pointing back at the main repository's `.git`, and
+/// `refs/heads/...` is only ever resolvable there
+fn common_dir(gitdir: &Path) -> PathBuf {
+	let Ok(contents) = fs::read_to_string(gitdir.join("commondir")) else {
+		return gitdir.to_owned();
+	};
+
+	let common = PathBuf::from(contents.trim());
+
+	if common.is_absolute() {
+		common
+	} else {
+		gitdir.join(common)
 	}
 }
 

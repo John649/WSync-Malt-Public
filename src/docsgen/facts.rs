@@ -378,7 +378,9 @@ pub enum Safety {
 }
 
 /// Commands whose category does not imply their tier
-const SAFETY_EXCEPTIONS: [(&str, Safety); 7] = [
+const SAFETY_EXCEPTIONS: [(&str, Safety); 8] = [
+	// Launches Studios and daemons, and merges a branch into the live place
+	("branch", Safety::Mutating),
 	// Reads Studio, writes only WSync's own private clipboard
 	("copy", Safety::Mutating),
 	// Renders into a file the caller names; changes nothing in Studio

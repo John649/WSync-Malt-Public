@@ -52,6 +52,10 @@ export type Settings = {
 export type PlaceIdentity = {
 	gameId: number,
 	placeId: number,
+	--- This Studio is a branch clone (docs/branches.md). Its `placeId` is the
+	--- synthetic one derived from the branch name, so only the branch's own
+	--- daemon can claim it.
+	branch: boolean?,
 }
 
 export type HelloClaim = {
@@ -105,7 +109,23 @@ end
 --- for a published place only daemons claiming our GameId qualify — a
 --- claimless daemon never matches — with `placeIds` refining among them; an
 --- unpublished place takes the first claimless daemon.
+---
+--- A branch clone is stricter still: nothing below MATCH_EXACT counts
+--- (docs/branches.md — "a clone that finds no daemon claiming its id refuses
+--- to connect rather than falling through to main"). The synthetic placeId
+--- makes the branch's own daemon rank exact, so this only ever removes the
+--- weak and game-level matches — main's daemon among them, which would
+--- otherwise sync the clone's edits straight into the real place's worktree.
 function Policy.rankHello(hello: HelloClaim, place: PlaceIdentity): number
+	if place.branch == true then
+		return if Policy.rankStrict(hello, place) >= Policy.MATCH_EXACT then Policy.MATCH_EXACT else Policy.MATCH_NONE
+	end
+
+	return Policy.rankStrict(hello, place)
+end
+
+--- The strict-GameId ranking itself, branch rule excluded.
+function Policy.rankStrict(hello: HelloClaim, place: PlaceIdentity): number
 	if place.gameId ~= 0 then
 		if hello.gameId ~= place.gameId then
 			return Policy.MATCH_NONE

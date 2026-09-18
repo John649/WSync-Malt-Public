@@ -40,10 +40,18 @@ end
 
 local Config = require(script.Config)
 local Log = require(script.Log)
+local Branch = require(script.Branch)
 local App = require(script.App)
 
 Config.load()
 Log.__setLevel(Config:get("LogLevel"))
+
+-- A branch clone claims its synthetic placeId before anything can scan for a
+-- daemon (docs/branches.md - "Discovery"): Discovery ranks daemons by the
+-- place's own ids, so the stamp has to land before App boots. On main this
+-- finds no marker and does nothing.
+Branch.apply(Branch.detect(game))
+
 App.new()
 
 Config:onChanged("LogLevel", function(level)

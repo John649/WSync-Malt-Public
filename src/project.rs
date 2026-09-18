@@ -79,6 +79,41 @@ impl Scope {
 	}
 }
 
+/// What a connect does when the two sides diverge (docs/branches.md).
+/// **Studio** — the default when the project file carries no `initialSync`
+/// field — is today's Studio-first behaviour: Studio wins and the disk side
+/// goes to the backlog. **Disk** replays the disk state into Studio instead,
+/// which is what a branch worktree needs so that reconnecting never deletes
+/// the branch's work. **Refuse** moves nothing and answers 409 naming the
+/// divergent paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InitialSync {
+	#[default]
+	Studio,
+	Disk,
+	Refuse,
+}
+
+impl InitialSync {
+	/// `"disk"` and `"refuse"` opt out; anything else (including absence) is
+	/// the Studio-first default
+	pub fn parse(value: Option<&str>) -> Self {
+		match value {
+			Some("disk") => Self::Disk,
+			Some("refuse") => Self::Refuse,
+			_ => Self::Studio,
+		}
+	}
+
+	pub fn as_str(&self) -> &'static str {
+		match self {
+			Self::Studio => "studio",
+			Self::Disk => "disk",
+			Self::Refuse => "refuse",
+		}
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ProjectPath {
@@ -159,6 +194,18 @@ pub struct Project {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub scope: Option<String>,
 
+	/// Divergence policy on connect (docs/branches.md): `"studio"` (the
+	/// default when absent), `"disk"` or `"refuse"`. Read through
+	/// [`Project::initial_sync`], never directly
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub initial_sync: Option<String>,
+
+	/// The branch this project serves, when it is a branch worktree
+	/// (docs/branches.md). Reported by `/hello` so the plugin and the CLI can
+	/// tell a branch daemon from main's
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub branch: Option<String>,
+
 	#[serde(alias = "globIgnorePaths", default, skip_serializing_if = "Vec::is_empty")]
 	pub ignore_globs: Vec<Glob>,
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -223,6 +270,12 @@ impl Project {
 	/// file explicitly opts into `"scope": "full"`
 	pub fn scope(&self) -> Scope {
 		Scope::parse(self.scope.as_deref())
+	}
+
+	/// The project's divergence policy on connect (docs/branches.md):
+	/// Studio-first unless the project file opts into `"disk"` or `"refuse"`
+	pub fn initial_sync(&self) -> InitialSync {
+		InitialSync::parse(self.initial_sync.as_deref())
 	}
 
 	pub fn is_ts(&self) -> bool {

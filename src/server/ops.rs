@@ -133,14 +133,7 @@ fn source_paths(tree: &Tree, id: Ref, workspace_dir: &Path) -> Vec<String> {
 
 	entries
 		.iter()
-		.map(|entry| {
-			let path = entry.path();
-
-			path.strip_prefix(workspace_dir)
-				.unwrap_or(path)
-				.to_string_lossy()
-				.into_owned()
-		})
+		.map(|entry| crate::util::relative_string(entry.path(), workspace_dir))
 		.collect()
 }
 

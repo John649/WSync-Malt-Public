@@ -42,7 +42,7 @@ use crate::{
 		Core,
 	},
 	lock,
-	project::Scope,
+	project::{InitialSync, Scope},
 	server::{self, backlog, bulk, ws::frames::codes, ws::frames::Event, AppState},
 	util,
 };
@@ -271,8 +271,102 @@ pub async fn compare(State(state): State<AppState>, body: Bytes) -> Response {
 
 	match ingest_chunk(&state, &request, entries, scope) {
 		Ingested::Done(response) => response,
-		Ingested::StudioFirst { items, accepted, next } => studio_first_commit(&state, items, accepted, next).await,
+		// Which side wins a divergent connect is the project's to declare
+		// (docs/branches.md). Studio-first is the default and the only
+		// behaviour a project that says nothing ever sees; a branch worktree
+		// asks for `disk` so that reconnecting replays its work into Studio
+		// instead of deleting it
+		Ingested::StudioFirst { items, accepted, next } => {
+			// Read before the match: the project guard must not be alive
+			// across the Studio-first apply's awaits
+			let initial_sync = state.core.project().initial_sync();
+
+			match initial_sync {
+				InitialSync::Studio => studio_first_commit(&state, items, accepted, next).await,
+				InitialSync::Disk => disk_first_commit(&state, items, accepted, next),
+				InitialSync::Refuse => refuse_commit(&items),
+			}
+		}
 	}
+}
+
+/// How many divergent paths a `refuse` answer names. The list is a diagnosis,
+/// not the set — a project that refuses wants to see what disagreed, and a
+/// thousand lines of it helps nobody
+const REFUSE_PATHS_MAX: usize = 50;
+
+/// `initialSync: "refuse"` — answer 409 naming the divergent paths and move
+/// nothing. The frozen set is dropped with the response: nothing was applied,
+/// no baseline stamped, no backlog entry written, so the next `/compare`
+/// starts from the same disagreement
+fn refuse_commit(items: &[Item]) -> Response {
+	let paths: Vec<String> = items
+		.iter()
+		.take(REFUSE_PATHS_MAX)
+		.map(|item| item.path.clone().unwrap_or_else(|| item.instance_path.clone()))
+		.collect();
+
+	info!(
+		"Refusing a divergent connect ({} entr(ies)): initialSync is \"refuse\", nothing was moved",
+		items.len()
+	);
+
+	(
+		StatusCode::CONFLICT,
+		Json(json!({
+			"ok": false,
+			"error": "divergent",
+			"total": items.len(),
+			"paths": paths,
+		})),
+	)
+		.into_response()
+}
+
+/// `initialSync: "disk"` — the disk-wins path `POST /choice` runs for
+/// `choice: "disk"`, without the prompt that normally precedes it. The frozen
+/// entries are replayed over the live sync channel inside one plugin
+/// transaction so the pull is a single Studio undo; with no plugin connected
+/// they are queued for whichever transport arrives
+fn disk_first_commit(state: &AppState, items: Vec<Item>, accepted: u64, next: u64) -> Response {
+	let transfer_id = Uuid::new_v4().to_string();
+	let changes = build_disk_apply(&state.core, &items);
+
+	info!(
+		"Disk-first apply {transfer_id}: {} addition(s), {} update(s), {} removal(s)",
+		changes.additions.len(),
+		changes.updates.len(),
+		changes.removals.len()
+	);
+
+	let replayed = if state.ws.plugin_frames().is_ok() {
+		bulk::replay_disk_bracketed(state, &transfer_id, changes)
+	} else {
+		state
+			.core
+			.queue()
+			.push(server::SyncChanges(changes), None)
+			.map_err(|err| format!("Failed to queue sync frames: {err}"))
+	};
+
+	if let Err(err) = replayed {
+		return error(StatusCode::INTERNAL_SERVER_ERROR, &err);
+	}
+
+	// Disk is now what both sides hold, so the baselines stamp exactly as
+	// they do after a Studio-first apply
+	seed_all_baselines(&state.core);
+
+	Json(json!({
+		"ok": true,
+		"acceptedChunk": accepted,
+		"nextChunk": next,
+		"committed": true,
+		"applied": true,
+		"direction": "disk",
+		"transferId": transfer_id,
+	}))
+	.into_response()
 }
 
 /// Runs the chunk-receipt state machine under the divergence lock and, on the

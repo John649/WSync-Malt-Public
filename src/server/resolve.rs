@@ -19,6 +19,7 @@ use crate::{
 		snapshot::{AddedSnapshot, UpdatedSnapshot},
 		Core,
 	},
+	project::InitialSync,
 	server::{self, AppState},
 };
 
@@ -338,6 +339,50 @@ fn stamp_from_tree(core: &Core, id: rbx_dom_weak::types::Ref) {
 /// Failures are logged and the conflict is left parked. That is the honest
 /// outcome: a park nobody can see is better than reporting a resolution that
 /// did not happen, and the next connect is Studio-first anyway.
+/// The mid-session notifier (Design §6.3): a clash parked by the conflict
+/// engine is resolved without asking, in the direction the project declared
+/// through `initialSync` (docs/branches.md).
+///
+/// `studio` (the default) keeps Studio and backlogs the disk side; `disk`
+/// keeps the disk bytes and pushes them into Studio, which is what a branch
+/// worktree needs; `refuse` leaves the clash parked for `GET /resolve` and
+/// says so in the log, because a project that asked not to be resolved
+/// automatically has not asked to be told twice either
+pub async fn auto_resolve(state: &AppState, parked: Parked) {
+	// Read before the match: the project guard must not be alive across the
+	// Studio-first resolution's awaits
+	let initial_sync = state.core.project().initial_sync();
+
+	match initial_sync {
+		InitialSync::Studio => auto_keep_studio(state, parked).await,
+		InitialSync::Disk => auto_keep_disk(state, parked),
+		InitialSync::Refuse => info!(
+			"Conflict {} on {} left parked: initialSync is \"refuse\", so nothing resolves automatically",
+			parked.id, parked.info.instance_path
+		),
+	}
+}
+
+/// `initialSync: "disk"`: the disk bytes win and Studio converges onto them.
+/// Nothing is backlogged — the side that loses here is Studio's, and Studio
+/// keeps its own undo history of the push
+fn auto_keep_disk(state: &AppState, parked: Parked) {
+	match keep_local(&state.core, &parked) {
+		Ok(()) => {
+			state.core.conflicts().take(&parked.id);
+
+			info!(
+				"Conflict {} on {} resolved toward disk (initialSync: \"disk\")",
+				parked.id, parked.info.instance_path
+			);
+		}
+		Err((_, message)) => warn!(
+			"Could not resolve conflict {} toward disk ({message}); leaving it parked",
+			parked.id
+		),
+	}
+}
+
 pub async fn auto_keep_studio(state: &AppState, parked: Parked) {
 	// Backlog before resolving: once Studio's version lands the disk bytes are
 	// gone, and this is the copy the user gets to drag back

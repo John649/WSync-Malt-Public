@@ -1,0 +1,18 @@
+{
+  "name": "sourcemap",
+  "title": "wsync sourcemap",
+  "category": "Build & sourcemap",
+  "description": "Writes a JSON sourcemap of the project tree, optionally regenerating it every time a file changes.",
+  "usage": "wsync sourcemap [<project>] [<session>] [--output <path>] [--watch] [--non-scripts]",
+  "examples": [
+    "wsync sourcemap --project . --output sourcemap.json",
+    "wsync sourcemap . --watch",
+    "wsync sourcemap --project . --non-scripts --output build/sourcemap.json"
+  ],
+  "notes": [
+    "The project is taken from the positional argument or from --project; the two are mutually exclusive. It defaults to the current directory.",
+    "Without --output the sourcemap is written to sourcemap.json beside the project file. A directory or extension-less path is completed to sourcemap.json inside it when smart paths are enabled.",
+    "--watch keeps the process running and rewrites the sourcemap on every change; --async (-A) detaches that watcher into a background child.",
+    "--non-scripts includes instances that carry no script source, which the default output omits."
+  ]
+}

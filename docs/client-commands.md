@@ -2,7 +2,7 @@
 
 # wsync command reference
 
-68 commands in 15 categories. Every entry is generated from one JSON file
+69 commands in 15 categories. Every entry is generated from one JSON file
 under `docs/commands/`; edit the JSON and re-run `node scripts/build-command-docs.mjs`.
 
 `wsync commands [name] [--compact]` serves this same registry from the binary, and the desktop
@@ -10,7 +10,7 @@ Docs view renders it from `docs/client-commands.generated.json`.
 
 ## Contents
 
-- [Project setup](#project-setup) (3) — `init`, `plugin`, `auth`
+- [Project setup](#project-setup) (4) — `init`, `plugin`, `auth`, `branch`
 - [Daemon](#daemon) (3) — `daemon`, `serve`, `stop`
 - [Command registry](#command-registry) (3) — `commands`, `context`, `plan`
 - [Agent runtime](#agent-runtime) (4) — `capabilities`, `capture`, `playtest`, `run`
@@ -119,6 +119,51 @@ wsync auth clear --raw
 - `auth set` requires exactly one of `--from-stdin`, `--file`, or `--from-env`; the credential itself is never accepted in argv and is never logged.
 - Secrets resolve to the OS keychain first. The CLI fallback store uses a private per-user data directory with mode 0600 on Unix; it is filesystem-permission protected, not an OS keychain.
 - `upload` and `monetization` discover this store before falling back to `--api-key-env` and then to the `ROBLOX_API_KEY`, `CLOUD_API_KEY`, and `ROBLOX_OPEN_CLOUD_API_KEY` environment variables.
+
+---
+
+### `wsync branch`
+
+Creates, lists, reopens, closes and merges branches: a git worktree, its own daemon, a Studio on an immutable clone of the place, and the journal of what that Studio changed.
+
+**Usage**
+
+```sh
+wsync branch <new|ls|up|rm|finish|pick> [<name>] [--project <path>] [options]
+```
+
+**Subcommands**
+
+- `new` — safety `controls-local-service`, requires `project`, `daemon`, `studio-plugin`, `studio-application`, `git`
+- `ls` — safety `read-only`, requires `project`, `git`
+- `up` — safety `controls-local-service`, requires `project`, `studio-application`, `git`
+- `rm` — safety `controls-local-service`, requires `project`, `git`
+- `finish` — safety `mutates-studio`, requires `project`, `daemon`, `studio-plugin`, `git`
+- `pick` — safety `writes-local-files`, requires `project`
+
+**Examples**
+
+```sh
+wsync branch new reward-rooms --project .
+wsync branch ls --project . --raw
+wsync branch up reward-rooms --project .
+wsync branch finish reward-rooms --project .
+wsync branch pick reward-rooms 2 theirs --project .
+wsync branch rm reward-rooms --purge --project .
+```
+
+**Notes**
+
+- A branch is four things: the git worktree .wsync-branches/<name>/tree on branch wsync/<name>, a daemon started on that worktree, a Studio opened on the immutable clone .wsync-branches/<name>/<name>.rbxl, and the journal that clone's plugin pushes to its daemon. The record .wsync-branches/<name>/branch.json describes all four.
+- New takes the checkpoint from main's Studio, downloads one blob per service, assembles the clone with a ServerStorage/WSyncBranch marker, writes the worktree's project file with initialSync disk and a synthetic placeId derived from the name, starts the branch daemon, launches Studio, and has the branch plugin adopt main's numbering. A count that does not match the checkpoint is refused instead of adopted.
+- The clone is immutable and the journal is the state, so up reopens the clone, adopts the numbering again and replays the branch's own journal into its own Studio. Nothing is rewritten on autosave.
+- Finish commits the worktree, runs git merge --no-ff --no-commit in the main checkout, flushes the branch journal, pauses main's sync, and replays the events into main's Studio. Git conflicts and replay conflicts both stop the merge and exit 3; replay conflicts are parked in .wsync-branches/<name>/conflicts.json.
+- Pick writes .wsync-branches/<name>/decisions.json; ours keeps main's value, theirs takes the branch's. Run branch finish again to apply the rest.
+- The merge commit is scoped to git diff --name-only HEAD...MERGE_HEAD plus the conflicted paths. The branch directory is never added, and the main checkout's sync is resumed whether the replay succeeded or failed.
+- Rm stops the Studio and the daemon and keeps the worktree, the clone and the journal. --purge also removes the worktree, deletes the branch wsync/<name> and the directory, and refuses a dirty worktree unless --force.
+- One owner per branch is recorded in branch.json. A branch whose owner process is gone is adopted by the next command; a branch whose owner is still running is refused unless --steal. At most three branch Studios are live at once (--budget overrides), because past Roblox's window cap a launch succeeds into a windowless stub; a refusal names branch rm.
+- Every subcommand runs from the main checkout. Running inside a branch worktree is refused: a branch of a branch has no checkpoint to fork from.
+- Scripts are not in the journal. WSync writes every script to disk as it changes, so a branch's script work is its worktree and finish merges it with git; the Studio replay skips file-backed script sources.
 
 ---
 
@@ -1311,7 +1356,7 @@ Launches Roblox Studio, optionally opening a place/model file, with an option to
 **Usage**
 
 ```sh
-wsync studio [<place-path>] [-c|--check]
+wsync studio [<place-path>] [-c|--check] [--raw]
 ```
 
 **Examples**
@@ -1320,6 +1365,7 @@ wsync studio [<place-path>] [-c|--check]
 wsync studio
 wsync studio ./build/game.rbxl
 wsync studio --check
+wsync studio ./build/game.rbxl --raw
 ```
 
 **Notes**
@@ -1328,6 +1374,7 @@ wsync studio --check
 - With no path it launches Studio without a place file; a path opens that file.
 - --check means launch only when Studio is not already running. When Studio is running it reports that fact and exits successfully; when Studio is absent it launches Studio. This is not a read-only process-status query.
 - Launching returns before the place has finished loading. The plugin performs its own connection handshake afterwards.
+- --raw prints `{"pid": <n>}` for a launch, or `{"ok": true, "launched": false, "running": true}` when --check found Studio already running. The pid is the process that was spawned; Studio may re-exec itself, so it identifies the launch, not the window.
 
 ---
 
@@ -1873,30 +1920,28 @@ wsync build --project . --plugin --xml
 
 ### `wsync sourcemap`
 
-Writes a Rojo-style sourcemap of the project tree for luau-lsp and other editor tooling.
+Writes a JSON sourcemap of the project tree, optionally regenerating it every time a file changes.
 
 **Usage**
 
 ```sh
-wsync sourcemap [<project> [<session>] | --project <path>] [-o|--output <file>] [-w|--watch] [--non-scripts] [-A|--async]
+wsync sourcemap [<project>] [<session>] [--output <path>] [--watch] [--non-scripts]
 ```
 
 **Examples**
 
 ```sh
-wsync sourcemap --project .
 wsync sourcemap --project . --output sourcemap.json
-wsync sourcemap --project . --watch --non-scripts
+wsync sourcemap . --watch
+wsync sourcemap --project . --non-scripts --output build/sourcemap.json
 ```
 
 **Notes**
 
-- Requires a project. It serializes the filesystem projection without a daemon or Studio plugin connection.
-- Without --output, the sourcemap JSON is printed to stdout. Use --output sourcemap.json to create the file consumed by editor tooling.
-- Only script-backed instances and their ancestors are emitted by default. --non-scripts includes non-script instances.
-- --watch regenerates on each tree change, printing another JSON value to stdout or rewriting --output. It stays in the foreground unless --async or the run_async configuration is enabled.
-- --project is the named alternative to the first positional project path. To supply a legacy session identifier, use the positional form: wsync sourcemap <project> <session> --watch. Do not provide both project forms.
-- wsync repair sourcemap is the maintenance path to rebuild a missing or stale sourcemap once.
+- The project is taken from the positional argument or from --project; the two are mutually exclusive. It defaults to the current directory.
+- Without --output the sourcemap is written to sourcemap.json beside the project file. A directory or extension-less path is completed to sourcemap.json inside it when smart paths are enabled.
+- --watch keeps the process running and rewrites the sourcemap on every change; --async (-A) detaches that watcher into a background child.
+- --non-scripts includes instances that carry no script source, which the default output omits.
 
 ---
 

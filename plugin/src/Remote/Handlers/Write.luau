@@ -29,6 +29,8 @@ local CollectionService = game:GetService("CollectionService")
 local WSync = script:FindFirstAncestor("WSync")
 
 local Log = require(WSync.Log)
+local Branch = require(WSync.Branch)
+local Journal = require(WSync.Journal)
 
 local Error = require(script.Parent.Parent.Error)
 local Codec = require(script.Parent.Parent.Codec)
@@ -199,6 +201,7 @@ function Write.ops.set(args: Args, ctx)
 	local path = (Paths.pathOf(instance))
 
 	History.opWaypoint("set", path)
+	Journal.touched(instance, `WSync: set "{path}"`)
 	ctx.audit(WriteRules.shapeAudit("set", path, { class = instance.ClassName, prop = prop }))
 
 	local response: { [string]: any } = {
@@ -276,6 +279,7 @@ function Write.ops.set_batch(args: Args, ctx)
 			local decoded = Codec.decode(write.value)
 
 			applyProperty(instance, write.prop, decoded)
+			Journal.touched(instance, "WSync: set_batch")
 
 			if firstAppliedPath == nil then
 				firstAppliedPath = (Paths.pathOf(instance))
@@ -509,6 +513,7 @@ function Write.ops.mv(args: Args, ctx)
 	local resultPath = (Paths.pathOf(instance))
 
 	History.opWaypoint("mv", fromPath)
+	Journal.touched(instance, `WSync: mv "{fromPath}"`)
 	ctx.audit(WriteRules.shapeAudit("mv", fromPath, { class = instance.ClassName, to = resultPath }))
 
 	local response: { [string]: any } = {
@@ -574,6 +579,7 @@ function Write.ops.set_attr(args: Args, ctx)
 	local path = (Paths.pathOf(instance))
 
 	History.opWaypoint("set_attr", path)
+	Journal.touched(instance, `WSync: set_attr "{path}"`)
 	ctx.audit(WriteRules.shapeAudit("set_attr", path, { class = instance.ClassName, prop = name }))
 
 	return { path = path, name = name }
@@ -603,6 +609,7 @@ function Write.ops.rm_attr(args: Args, ctx)
 	local path = (Paths.pathOf(instance))
 
 	History.opWaypoint("rm_attr", path)
+	Journal.touched(instance, `WSync: rm_attr "{path}"`)
 	ctx.audit(WriteRules.shapeAudit("rm_attr", path, { class = instance.ClassName, prop = name }))
 
 	return { path = path, name = name, cleared = true }
@@ -687,6 +694,7 @@ function Write.ops.add_tag(args: Args, ctx)
 	end
 
 	History.opWaypoint("add_tag", path)
+	Journal.touched(instance, `WSync: add_tag "{path}"`)
 	ctx.audit(WriteRules.shapeAudit("add_tag", path, { class = instance.ClassName, prop = tag }))
 
 	return { path = path, tag = tag, added = true }
@@ -716,6 +724,7 @@ function Write.ops.rm_tag(args: Args, ctx)
 	local path = (Paths.pathOf(instance))
 
 	History.opWaypoint("rm_tag", path)
+	Journal.touched(instance, `WSync: rm_tag "{path}"`)
 	ctx.audit(WriteRules.shapeAudit("rm_tag", path, { class = instance.ClassName, prop = tag }))
 
 	return { path = path, tag = tag, removed = true }
@@ -898,6 +907,13 @@ end
 --- Save() can take seconds, which would blow the 5 s remote-op timeout, so
 --- it runs detached and any failure surfaces in the Studio output.
 function Write.ops.save(_args: Args, ctx)
+	-- A branch Studio is open on a *clone*; saving it would write the clone
+	-- over the real place file (docs/branches.md). `wsync branch finish` is
+	-- the only way a branch's work reaches main.
+	if Branch.isBranch() then
+		error(Error.new(Error.PERMISSION_REQUIRED, Branch.SAVE_REFUSAL), 0)
+	end
+
 	local okLookup, saveFn = pcall(function()
 		return (game :: any).Save
 	end)

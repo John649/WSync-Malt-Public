@@ -92,6 +92,9 @@ fn analyzer_stub(sandbox: &CliSandbox, name: &str, stderr: &str, exit: i32) -> (
 	(stub, argv_file, sourcemap_copy)
 }
 
+/// The argv the stub recorded (unix only — every caller is gated the same
+/// way the stub itself is)
+#[cfg(unix)]
 fn read_argv(argv_file: &PathBuf) -> Vec<String> {
 	fs::read_to_string(argv_file)
 		.unwrap_or_else(|_| panic!("the stub never recorded argv at {}", argv_file.display()))

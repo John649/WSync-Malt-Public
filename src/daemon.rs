@@ -338,7 +338,6 @@ pub fn watchdog_should_terminate(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use std::path::Path;
 
 	fn record(boot_id: &str) -> RuntimeRecord {
 		RuntimeRecord {
@@ -443,8 +442,15 @@ mod tests {
 
 	#[test]
 	fn state_dir_prefers_explicit_over_environment() {
-		let explicit = state_dir(Some(Path::new("/tmp/explicit-state"))).unwrap();
-		assert_eq!(explicit, PathBuf::from("/tmp/explicit-state"));
+		// The path has to come from the platform: `/tmp/...` is *relative* on
+		// Windows (no drive), so `resolve` correctly completes it against the
+		// current drive and the returned path is not the one passed in
+		let dir = tempfile::tempdir().unwrap();
+		let wanted = dir.path().join("explicit-state");
+
+		let explicit = state_dir(Some(&wanted)).unwrap();
+
+		assert_eq!(explicit, wanted);
 	}
 
 	#[test]

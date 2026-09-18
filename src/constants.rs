@@ -115,7 +115,19 @@ pub const SELECTION_BODY_MAX_BYTES: usize = 64 * 1024;
 /// Runtime directories WSync creates inside a served workspace. They are part
 /// of the default ignore set (Design §12: gitignored runtime dirs) so their
 /// churn never re-enters the sync pipeline
-pub const RUNTIME_DIRS: [&str; 3] = [".wsync-backups", ".wsync-artifacts", ".wsync-workflows"];
+pub const RUNTIME_DIRS: [&str; 4] = [
+	".wsync-backups",
+	".wsync-artifacts",
+	".wsync-workflows",
+	".wsync-branches",
+];
+
+/// The per-workspace branch root (docs/branches.md): worktrees, clones and
+/// journals live here. It is a runtime directory for the same reason the
+/// others are — a branch worktree is a whole second checkout of the project,
+/// and the sync engine walking into it would project every branch's files
+/// back into main's Studio
+pub const BRANCHES_DIR: &str = ".wsync-branches";
 
 /// The per-project backup root for fenced Keep-Studio applies (Design §7.4-A)
 pub const BACKUPS_DIR: &str = ".wsync-backups";

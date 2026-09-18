@@ -1,8 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
+use serde_json::json;
 use std::path::PathBuf;
 
-use crate::{config::Config, ext::PathExt, studio, wsync_info};
+use crate::{cli::client::print_json, config::Config, ext::PathExt, studio, wsync_info};
 
 /// Launch a new Roblox Studio instance
 #[derive(Parser)]
@@ -14,16 +15,27 @@ pub struct Studio {
 	/// Check if Roblox Studio is already running
 	#[arg(short, long)]
 	check: bool,
+
+	/// Print machine-readable JSON
+	#[arg(long)]
+	raw: bool,
 }
 
 impl Studio {
 	pub fn main(mut self) -> Result<()> {
 		if self.check && studio::is_running(None)? {
-			wsync_info!("Roblox Studio is already running!");
+			if self.raw {
+				print_json(&json!({ "ok": true, "launched": false, "running": true }));
+			} else {
+				wsync_info!("Roblox Studio is already running!");
+			}
+
 			return Ok(());
 		}
 
-		wsync_info!("Launching Roblox Studio..");
+		if !self.raw {
+			wsync_info!("Launching Roblox Studio..");
+		}
 
 		if let Some(path) = self.path.as_ref() {
 			if Config::new().smart_paths && !path.exists() {
@@ -38,7 +50,11 @@ impl Studio {
 			}
 		}
 
-		studio::launch(self.path)?;
+		let pid = studio::launch(self.path)?;
+
+		if self.raw {
+			print_json(&json!({ "pid": pid }));
+		}
 
 		Ok(())
 	}

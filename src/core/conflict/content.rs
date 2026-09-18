@@ -175,14 +175,9 @@ pub fn relative_path(tree: &Tree, id: Ref, workspace_dir: &Path) -> Option<Strin
 	let mut entries = meta.source.relevant().clone();
 	entries.sort_by_key(SourceEntry::index);
 
-	entries.first().map(|entry| {
-		let path = entry.path();
-
-		path.strip_prefix(workspace_dir)
-			.unwrap_or(path)
-			.to_string_lossy()
-			.into_owned()
-	})
+	entries
+		.first()
+		.map(|entry| crate::util::relative_string(entry.path(), workspace_dir))
 }
 
 /// Captures one instance (no children) from the tree

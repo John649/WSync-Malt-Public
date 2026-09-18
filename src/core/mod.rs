@@ -7,7 +7,10 @@ use std::{
 	fs::File,
 	io::BufWriter,
 	path::{Path, PathBuf},
-	sync::{Arc, Mutex, MutexGuard},
+	sync::{
+		atomic::{AtomicBool, Ordering},
+		Arc, Mutex, MutexGuard,
+	},
 };
 
 use self::{
@@ -17,7 +20,9 @@ use self::{
 	queue::Queue,
 	tree::Tree,
 };
-use crate::{core::snapshot::Snapshot, lock, middleware::new_snapshot, project::Project, stats, util, vfs::Vfs};
+use crate::{
+	core::snapshot::Snapshot, lock, middleware::new_snapshot, project::Project, server, stats, util, vfs::Vfs,
+};
 
 pub mod changes;
 pub mod conflict;
@@ -35,6 +40,9 @@ pub struct Core {
 	processor: Arc<Processor>,
 	conflicts: Arc<ConflictEngine>,
 	vfs: Arc<Vfs>,
+	/// While set, disk changes are read but never pushed to Studio
+	/// (`POST /sync/pause`, docs/branches.md)
+	sync_paused: Arc<AtomicBool>,
 }
 
 impl Core {
@@ -66,12 +74,14 @@ impl Core {
 
 		let project = Arc::new(Mutex::new(project));
 		let conflicts = Arc::new(ConflictEngine::new());
+		let sync_paused = Arc::new(AtomicBool::new(false));
 		let processor = Arc::new(Processor::new(
 			queue.clone(),
 			tree.clone(),
 			vfs.clone(),
 			project.clone(),
 			conflicts.clone(),
+			sync_paused.clone(),
 		));
 
 		trace!("Core initialized successfully!");
@@ -83,6 +93,7 @@ impl Core {
 			processor,
 			conflicts,
 			vfs,
+			sync_paused,
 		})
 	}
 
@@ -123,6 +134,48 @@ impl Core {
 	/// uses (Design §7.4-A)
 	pub fn vfs(&self) -> Arc<Vfs> {
 		self.vfs.clone()
+	}
+
+	/// Whether disk → Studio pushes are currently held (`POST /sync/pause`)
+	pub fn is_sync_paused(&self) -> bool {
+		self.sync_paused.load(Ordering::SeqCst)
+	}
+
+	/// Holds or releases disk → Studio pushes, returning whether this call
+	/// changed anything. Pausing is what `branch finish` does to main's
+	/// daemon while it fast-forwards main's checkout: the files move on disk
+	/// without the watcher racing the Studio replay for the same instances
+	pub fn set_sync_paused(&self, paused: bool) -> bool {
+		self.sync_paused.swap(paused, Ordering::SeqCst) != paused
+	}
+
+	/// Re-reads the whole workspace into the tree and queues whatever no
+	/// longer matches for Studio, returning the number of changes queued.
+	///
+	/// This is the other half of a pause: events that arrived while paused
+	/// were dropped rather than buffered, so the tree is re-derived from what
+	/// is on disk now instead of from a replay nobody kept
+	pub fn rescan(&self) -> usize {
+		let mut tree = lock!(self.tree);
+		let root = tree.root_ref();
+
+		let Some(changes) = processor::read::process_changes(root, &mut tree, &self.vfs) else {
+			return 0;
+		};
+
+		let total = changes.total();
+
+		if total == 0 {
+			return 0;
+		}
+
+		if let Err(err) = self.queue.push(server::SyncChanges(changes), None) {
+			log::error!("Failed to queue the rescan changes: {err}");
+
+			return 0;
+		}
+
+		total
 	}
 
 	/// Create snapshot of the tree or a subtree

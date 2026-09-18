@@ -13,6 +13,7 @@ local Watcher = require(WSync.Watcher)
 local Executor = require(WSync.Executor)
 local SemVer = require(WSync.SemVer)
 local SyncScope = require(WSync.SyncScope)
+local Journal = require(WSync.Journal)
 local manifest = require(WSync.manifest)
 local equals = require(WSync.Helpers.equals)
 local Http = require(WSync.Transport.Http)
@@ -136,6 +137,11 @@ function Core:run(): Promise.Promise
 		self.transport = transport
 		self.processor = Processor.new(self.tree, transport)
 
+		-- The journal pushes its batches to the daemon discovery actually
+		-- resolved (`POST /journal/append`), not to the Settings address
+		-- (docs/branches.md — "Journal").
+		Journal.setEndpoint(self.host, self.port, Config:get("Https") == true)
+
 		transport:onStatus(function(status)
 			-- Lazy disk-review re-check (Design §7.0): a review resolved in
 			-- the app while the socket was down must still clear the
@@ -254,6 +260,11 @@ function Core:stop()
 
 	self.watcher:stop()
 	Bulk.detach()
+
+	-- The journal keeps recording across a disconnect (a branch's work is not
+	-- lost because its daemon went away), but it has nowhere to push until a
+	-- transport resolves again.
+	Journal.setEndpoint(nil, nil)
 
 	-- Back to the full-scope default so nothing scope-dependent leaks past
 	-- this session (Design §7.0); after the watcher stops, so no late event

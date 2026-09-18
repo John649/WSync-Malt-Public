@@ -1,6 +1,9 @@
 .DS_Store
 target/
 sourcemap.json
+# ...except the command registry's own entry for `wsync sourcemap`, which the
+# blanket rule above silently swallowed (docs/commands/index.json lists it)
+!/docs/commands/sourcemap.json
 *.rbxm
 *.rbxmx
 *.rbxl

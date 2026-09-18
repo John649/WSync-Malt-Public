@@ -1,0 +1,84 @@
+{
+  "name": "branch",
+  "title": "wsync branch",
+  "category": "Project setup",
+  "description": "Creates, lists, reopens, closes and merges branches: a git worktree, its own daemon, a Studio on an immutable clone of the place, and the journal of what that Studio changed.",
+  "subcommands": [
+    "new",
+    "ls",
+    "up",
+    "rm",
+    "finish",
+    "pick"
+  ],
+  "subcommandMetadata": {
+    "new": {
+      "safety": "controls-local-service",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin",
+        "studio-application",
+        "git"
+      ]
+    },
+    "ls": {
+      "safety": "read-only",
+      "requires": [
+        "project",
+        "git"
+      ]
+    },
+    "up": {
+      "safety": "controls-local-service",
+      "requires": [
+        "project",
+        "studio-application",
+        "git"
+      ]
+    },
+    "rm": {
+      "safety": "controls-local-service",
+      "requires": [
+        "project",
+        "git"
+      ]
+    },
+    "finish": {
+      "safety": "mutates-studio",
+      "requires": [
+        "project",
+        "daemon",
+        "studio-plugin",
+        "git"
+      ]
+    },
+    "pick": {
+      "safety": "writes-local-files",
+      "requires": [
+        "project"
+      ]
+    }
+  },
+  "usage": "wsync branch <new|ls|up|rm|finish|pick> [<name>] [--project <path>] [options]",
+  "examples": [
+    "wsync branch new reward-rooms --project .",
+    "wsync branch ls --project . --raw",
+    "wsync branch up reward-rooms --project .",
+    "wsync branch finish reward-rooms --project .",
+    "wsync branch pick reward-rooms 2 theirs --project .",
+    "wsync branch rm reward-rooms --purge --project ."
+  ],
+  "notes": [
+    "A branch is four things: the git worktree .wsync-branches/<name>/tree on branch wsync/<name>, a daemon started on that worktree, a Studio opened on the immutable clone .wsync-branches/<name>/<name>.rbxl, and the journal that clone's plugin pushes to its daemon. The record .wsync-branches/<name>/branch.json describes all four.",
+    "New takes the checkpoint from main's Studio, downloads one blob per service, assembles the clone with a ServerStorage/WSyncBranch marker, writes the worktree's project file with initialSync disk and a synthetic placeId derived from the name, starts the branch daemon, launches Studio, and has the branch plugin adopt main's numbering. A count that does not match the checkpoint is refused instead of adopted.",
+    "The clone is immutable and the journal is the state, so up reopens the clone, adopts the numbering again and replays the branch's own journal into its own Studio. Nothing is rewritten on autosave.",
+    "Finish commits the worktree, runs git merge --no-ff --no-commit in the main checkout, flushes the branch journal, pauses main's sync, and replays the events into main's Studio. Git conflicts and replay conflicts both stop the merge and exit 3; replay conflicts are parked in .wsync-branches/<name>/conflicts.json.",
+    "Pick writes .wsync-branches/<name>/decisions.json; ours keeps main's value, theirs takes the branch's. Run branch finish again to apply the rest.",
+    "The merge commit is scoped to git diff --name-only HEAD...MERGE_HEAD plus the conflicted paths. The branch directory is never added, and the main checkout's sync is resumed whether the replay succeeded or failed.",
+    "Rm stops the Studio and the daemon and keeps the worktree, the clone and the journal. --purge also removes the worktree, deletes the branch wsync/<name> and the directory, and refuses a dirty worktree unless --force.",
+    "One owner per branch is recorded in branch.json. A branch whose owner process is gone is adopted by the next command; a branch whose owner is still running is refused unless --steal. At most three branch Studios are live at once (--budget overrides), because past Roblox's window cap a launch succeeds into a windowless stub; a refusal names branch rm.",
+    "Every subcommand runs from the main checkout. Running inside a branch worktree is refused: a branch of a branch has no checkpoint to fork from.",
+    "Scripts are not in the journal. WSync writes every script to disk as it changes, so a branch's script work is its worktree and finish merges it with git; the Studio replay skips file-backed script sources."
+  ]
+}
