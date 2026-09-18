@@ -770,11 +770,30 @@ impl Finish {
 			false
 		};
 
-		// (2) the file merge, in the main checkout. Main is reliably dirty on
-		// the agent docs the daemon regenerates on every plugin connect, and the
-		// branch committed its own regenerated copies — so git refuses the merge
-		// before it starts unless that overlap is committed first
-		let (parked, left_dirty) = commit_blocking_work(&main.workspace, &record.git_branch, &record.name)?;
+		// (2) the file merge, in the main checkout.
+		//
+		// Main's project file is never main's business to merge: the branch
+		// rewrote its own copy in `new` and committed it, so the merge would
+		// otherwise hand main the branch's name, `branch` and synthetic placeId
+		let project_file = repo_relative(&main.workspace, &main.project);
+
+		// A `finish` that parked conflicts left the merge in progress on purpose,
+		// so a rerun after `branch pick` resumes it rather than starting another.
+		// The parking commit is skipped too: its pathspec is precisely what git
+		// rejects as a partial commit while `MERGE_HEAD` is set
+		let resuming = merge_in_progress(&main.workspace)
+			|| root.join("conflicts.json").exists()
+			|| root.join("decisions.json").exists();
+
+		let (parked, left_dirty) = if resuming {
+			(Vec::new(), 0)
+		} else {
+			// Main is reliably dirty on the agent docs the daemon regenerates on
+			// every plugin connect, and the branch committed its own regenerated
+			// copies — so git refuses the merge before it starts unless that
+			// overlap is committed first
+			commit_blocking_work(&main.workspace, &record.git_branch, &record.name, &project_file)?
+		};
 
 		if !parked.is_empty() && !self.raw {
 			wsync_info!(
@@ -789,17 +808,24 @@ impl Finish {
 			);
 		}
 
-		let merge = git_try(
-			&main.workspace,
-			&["merge", "--no-ff", "--no-commit", &record.git_branch],
-		)?;
+		let refusal = if resuming {
+			None
+		} else {
+			let merge = git_try(
+				&main.workspace,
+				&["merge", "--no-ff", "--no-commit", &record.git_branch],
+			)?;
 
-		let unmerged = git_out(&main.workspace, &["diff", "--name-only", "--diff-filter=U"])
-			.unwrap_or_default()
-			.lines()
-			.map(str::to_owned)
-			.filter(|line| !line.is_empty())
-			.collect::<Vec<_>>();
+			(!merge.0).then(|| {
+				if merge.2.trim().is_empty() {
+					merge.1.trim().to_owned()
+				} else {
+					merge.2.trim().to_owned()
+				}
+			})
+		};
+
+		let unmerged = unmerged_paths(&main.workspace);
 
 		if !unmerged.is_empty() {
 			print_paths(
@@ -812,15 +838,30 @@ impl Finish {
 
 		// A refusal with nothing left unmerged is git declining to start —
 		// its own message is the diagnosis, so it is printed verbatim
-		if !merge.0 {
-			let message = if merge.2.trim().is_empty() {
-				merge.1.trim()
-			} else {
-				merge.2.trim()
-			};
-
-			print_merge_refusal(&record.name, &record.git_branch, message, self.raw);
+		if let Some(message) = refusal {
+			print_merge_refusal(&record.name, &record.git_branch, &message, self.raw);
 			process::exit(CONFLICT_EXIT);
+		}
+
+		// `HEAD` is still main's pre-merge tip until the commit below — a merge
+		// left in progress by an earlier run included — so main's own project
+		// file comes back from there, into both the index and the working tree,
+		// over whatever the branch brought in.
+		//
+		// A failure here is reported rather than fatal. `merge --no-commit`
+		// has already staged the whole merge, so bailing now would leave main
+		// mid-merge with a half-finished branch behind it — worse than a project
+		// file the user can check
+		let restored = git_try(&main.workspace, &["checkout", "HEAD", "--", &project_file])?;
+
+		if !restored.0 {
+			wsync_warn!(
+				"Could not restore main's own {} from HEAD ({}) — check it before the next `{}`, because the merge may \
+				 have given main the branch's name, `branch` and synthetic placeId",
+				project_file.bold(),
+				restored.2.trim(),
+				"wsync branch new".bold()
+			);
 		}
 
 		// (3) the instance replay, into main's Studio
@@ -877,8 +918,10 @@ impl Finish {
 			process::exit(CONFLICT_EXIT);
 		}
 
-		// (4) the merge commit, scoped to what the merge actually touched —
-		// never `git add -A`, which would sweep the branch directory in
+		// (4) the merge commit. The staging is scoped to what the merge actually
+		// touched — never `git add -A`, which would sweep the branch directory in
+		// — while the commit itself is whole, because git rejects a pathspec
+		// while `MERGE_HEAD` is set
 		let mut paths = git_out(&main.workspace, &["diff", "--name-only", "HEAD...MERGE_HEAD"])
 			.unwrap_or_default()
 			.lines()
@@ -890,18 +933,42 @@ impl Finish {
 		paths.sort();
 		paths.dedup();
 
+		// Already staged from `HEAD` above; re-adding it would put the branch's
+		// copy straight back
+		paths.retain(|path| path != &project_file);
+
 		if !paths.is_empty() {
 			let mut args = vec!["add", "--"];
 			args.extend(paths.iter().map(String::as_str));
 			git_out(&main.workspace, &args)?;
 		}
 
-		git_out(
-			&main.workspace,
-			&["commit", "-m", &format!("Merge branch '{}'", record.git_branch)],
-		)?;
+		// An earlier run (or a hand) may have committed this merge already:
+		// nothing staged and no `MERGE_HEAD` is a finished merge, not a failure
+		let pending =
+			merge_in_progress(&main.workspace) || git_out(&main.workspace, &["diff", "--cached", "--quiet"]).is_err();
+
+		if pending {
+			git_out(
+				&main.workspace,
+				&["commit", "-m", &format!("Merge branch '{}'", record.git_branch)],
+			)?;
+		} else if !self.raw {
+			wsync_info!("main's merge commit was already in place, so nothing further was committed");
+		}
 
 		resume(&client);
+
+		// The replay lives in main's Studio and nowhere else: a place opened
+		// from a file is saved by nobody, so the merged instances would be gone
+		// the next time that Studio is relaunched
+		let (saved, save_reason) = save_main(&client, self.raw);
+
+		// The parked conflicts and the decisions belonged to this merge: a
+		// finished branch must not still look like one mid-conflict, or the
+		// next `finish` would take the resume path with nothing to resume
+		fs::remove_file(root.join("conflicts.json")).ok();
+		fs::remove_file(root.join("decisions.json")).ok();
 
 		// (5) the branch is done
 		close(&mut record, &root, &main.project)?;
@@ -916,8 +983,13 @@ impl Finish {
 				"name": record.name,
 				"committed": committed,
 				"files": paths,
+				"resumed": resuming,
+				"mergeCommitted": pending,
 				"parked": parked,
 				"leftDirty": left_dirty,
+				"projectRestored": project_file,
+				"saved": saved,
+				"saveReason": save_reason,
 				"applied": replayed.get("applied").cloned().unwrap_or(Value::Null),
 				"skipped": replayed.get("skipped").cloned().unwrap_or(Value::Null),
 				"purged": self.purge,
@@ -927,7 +999,7 @@ impl Finish {
 		}
 
 		wsync_info!(
-			"Merged {} into main: {} file(s) by git, {} event(s) replayed into main's Studio",
+			"Merged {} into main: {} file(s) by git, {} event(s) replayed into main's Studio, {}",
 			record.name.bold(),
 			paths.len().to_string().bold(),
 			replayed
@@ -935,7 +1007,12 @@ impl Finish {
 				.and_then(Value::as_u64)
 				.unwrap_or(0)
 				.to_string()
-				.bold()
+				.bold(),
+			if saved {
+				"place saved".to_owned()
+			} else {
+				format!("{} — save it in Studio", "NOT saved".bold())
+			}
 		);
 
 		Ok(())
@@ -1712,6 +1789,37 @@ fn conflicts_of(replayed: &Value) -> Vec<Value> {
 		.unwrap_or_default()
 }
 
+/// Asks main's Studio to save the place it just replayed into. A place
+/// opened from a file has no other copy, so a merge nobody saves is a merge
+/// that disappears on the next relaunch.
+///
+/// A refusal is a warning, never a failure: by this point the merge commit is
+/// in and the instances are live. The plugin refuses on a branch clone, and
+/// answers `PLUGIN_ERROR` where `DataModel.Save()` does not exist — a cloud or
+/// Team Create place, which Studio saves through its own publish path
+fn save_main(client: &Client, raw: bool) -> (bool, String) {
+	let (reason, detail) = match client.request("save", json!({})) {
+		Ok(envelope) if envelope.ok => return (true, String::new()),
+		Ok(envelope) => (
+			format!("{} [{}]", envelope.error_message(), envelope.error_code()),
+			"A cloud or Team Create place is saved by Studio itself, not through the plugin",
+		),
+		Err(error) => (
+			error.to_string(),
+			"The merge is already committed and live in Studio; only the save did not happen",
+		),
+	};
+
+	if !raw {
+		wsync_warn!(
+			"Main's Studio did not save the replayed merge: {reason}. {detail} — save the place there, or the \
+			 replayed instances are lost when that Studio is relaunched"
+		);
+	}
+
+	(false, reason)
+}
+
 /// `POST /sync/resume` — best effort, because it runs on the failure path
 /// too and a paused daemon is worse than a noisy one
 fn resume(client: &Client) {
@@ -1753,17 +1861,19 @@ fn print_conflicts(name: &str, conflicts: &[Value], path: &Path, raw: bool) {
 }
 
 /// Commits exactly the files main has changed that the branch also touched,
+/// except `exclude` — main's project file, which the merge is not allowed to
+/// carry over and so is never worth committing on main's behalf.
 /// so `git merge` stops refusing. The daemon regenerates the agent docs on
 /// every plugin connect, which leaves main permanently dirty on files a
 /// branch commits too; that overlap is the whole problem and the only thing
 /// committed here. Never `git add -A` — unrelated work in main stays exactly
 /// where it was. Returns what was committed and how many changed files were
 /// left alone
-fn commit_blocking_work(workspace: &Path, git_branch: &str, name: &str) -> Result<(Vec<String>, usize)> {
+fn commit_blocking_work(workspace: &Path, git_branch: &str, name: &str, exclude: &str) -> Result<(Vec<String>, usize)> {
 	let touched: HashSet<String> = git_out(workspace, &["diff", "--name-only", &format!("HEAD...{git_branch}")])
 		.unwrap_or_default()
 		.lines()
-		.filter(|line| !line.is_empty())
+		.filter(|line| !line.is_empty() && *line != exclude)
 		.map(str::to_owned)
 		.collect();
 
@@ -1793,6 +1903,25 @@ fn commit_blocking_work(workspace: &Path, git_branch: &str, name: &str) -> Resul
 	git_out(workspace, &commit)?;
 
 	Ok((blocking, left_alone))
+}
+
+/// Is a merge in progress here? `MERGE_HEAD` exists only between a
+/// `merge --no-commit` and the commit that finishes it, which is exactly the
+/// window a `finish` that parked conflicts leaves main sitting in
+fn merge_in_progress(workspace: &Path) -> bool {
+	git_out(workspace, &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"])
+		.map(|head| !head.trim().is_empty())
+		.unwrap_or(false)
+}
+
+/// The paths git left with conflict markers
+fn unmerged_paths(workspace: &Path) -> Vec<String> {
+	git_out(workspace, &["diff", "--name-only", "--diff-filter=U"])
+		.unwrap_or_default()
+		.lines()
+		.filter(|line| !line.is_empty())
+		.map(str::to_owned)
+		.collect()
 }
 
 /// Every path `git status` reports as changed or untracked, renames counted
@@ -2185,7 +2314,7 @@ fn write_branch_project(main: &Path, out: &Path, name: &str, synthetic: u64) -> 
 
 	let renamed = format!(
 		"{} ({name})",
-		fields.get("name").and_then(Value::as_str).unwrap_or("wsync")
+		strip_branch_suffix(fields.get("name").and_then(Value::as_str).unwrap_or("wsync"))
 	);
 
 	fields.insert("name".to_owned(), json!(renamed));
@@ -2203,6 +2332,34 @@ fn write_branch_project(main: &Path, out: &Path, name: &str, synthetic: u64) -> 
 	}
 
 	fs::write(out, format!("{project:#}\n")).with_context(|| format!("Failed to write {}", out.to_string()))
+}
+
+/// `wsync-lab (alpha) (gamma)` → `wsync-lab`. A branch's project file carries
+/// main's name plus ` (<branch>)`; if one of those ever reaches main — the
+/// merge used to carry it — the next branch must not compound it. A project
+/// genuinely named `Game (v2)` pays for that, which is the cheaper mistake
+fn strip_branch_suffix(name: &str) -> &str {
+	let mut base = name.trim();
+
+	while base.ends_with(')') {
+		match base.rfind(" (") {
+			Some(cut) => base = base[..cut].trim_end(),
+			None => break,
+		}
+	}
+
+	if base.is_empty() {
+		name.trim()
+	} else {
+		base
+	}
+}
+
+/// A path as git names it: relative to the checkout, forward slashes
+fn repo_relative(workspace: &Path, path: &Path) -> String {
+	path.strip_prefix(workspace)
+		.map(|relative| relative.to_string().replace('\\', "/"))
+		.unwrap_or_else(|_| path.get_name().to_owned())
 }
 
 /// FNV-1a over the UTF-8 name, masked to 53 bits — the same arithmetic the

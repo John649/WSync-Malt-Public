@@ -117,6 +117,15 @@ local checkpointCount = 0
 
 local idOf: { [Instance]: string } = {}
 local byId: { [string]: Instance } = {}
+
+-- The parent id we last recorded for each instance. This is the ONLY thing a
+-- move is decided against, because `instance.Parent` cannot be trusted to still
+-- hold the old parent while `DescendantRemoving` runs: the engine may have
+-- already completed the assignment, in which case "old" and "new" compare equal
+-- and a reparent within one service vanishes without a trace. It also survives
+-- the instance leaving the tree, which is what lets a mass removal work out
+-- which of its ids were descendants of another.
+local parentOf: { [Instance]: string } = {}
 local newCounter = 0
 
 local seq = 0
@@ -130,6 +139,16 @@ local pendingCount = 0
 local history: { Event } = {}
 local marks: { [string]: number } = {}
 
+-- What a replay has already done, per checkpoint, ACROSS CALLS. `branch
+-- finish` is not a single shot: a run that reports conflicts is followed by
+-- `branch pick` and another run carrying the decisions, and the second run
+-- ships the same journal. Without a ledger it re-applies every event that did
+-- not conflict the first time, which is how main ended up with a second
+-- GammaPart. Parked conflicts are deliberately NOT recorded here, so they are
+-- the only thing a rerun reconsiders.
+local replayApplied: { [string]: { [number]: boolean } } = {}
+local replayCreated: { [string]: { [string]: Instance } } = {}
+
 local connections: { RBXScriptConnection } = {}
 local subscribedTags: { [string]: boolean } = {}
 local watchedServices: { [Instance]: boolean } = {}
@@ -142,7 +161,8 @@ local watchedServices: { [Instance]: boolean } = {}
 local instanceConnections: { [Instance]: { RBXScriptConnection } } = {}
 local dirty: { [Instance]: { [string]: boolean } } = {}
 local dirtyRec: { [Instance]: string } = {}
-local pendingRemove: { [Instance]: Instance } = {}
+local removalBatch: { [Instance]: boolean } = {}
+local removalScheduled = false
 local drainScheduled = false
 local observed = 0
 local observing = false
@@ -158,6 +178,10 @@ local blobs = Transfers.newOutStore({ ttl = Journal.BLOB_TTL_SECONDS, dropOnEof 
 
 local endpoint: { host: string, port: string, https: boolean }? = nil
 local recording: string? = nil
+
+-- What has been recorded since the recorder started, by op. Purely for
+-- `journal_status`: a live branch can be checked without reading the journal.
+local counts: { [string]: number } = {}
 
 local flushedTotal = 0
 local lastFlushAt = 0
@@ -219,9 +243,31 @@ local function serviceIdOf(service: Instance): string
 	return `svc:{service.Name}`
 end
 
+--- The id an event should name as this instance's parent: the parent's own
+--- id, or `svc:<Name>` when the parent is one of the eleven content services
+--- (they are not numbered, but a top-level add still needs a parent to name).
+local function parentIdOf(instance: Instance): string?
+	local parent = instance.Parent
+
+	if parent == nil then
+		return nil
+	end
+
+	local id = idOf[parent]
+
+	if id ~= nil then
+		return id
+	end
+
+	local serviceId = serviceIdOf(parent)
+
+	return if byId[serviceId] == parent then serviceId else nil
+end
+
 local function assign(instance: Instance, id: string)
 	idOf[instance] = id
 	byId[id] = instance
+	parentOf[instance] = parentIdOf(instance)
 end
 
 --- The compact tree shape a branch aligns against (SHAPE_VERSION 1):
@@ -251,7 +297,10 @@ function Journal.checkpoint(services: { Instance }?, withShape: boolean?): { cou
 
 	table.clear(idOf)
 	table.clear(byId)
+	table.clear(parentOf)
 	table.clear(addedRoots)
+	table.clear(replayApplied)
+	table.clear(replayCreated)
 
 	newCounter = 0
 
@@ -487,7 +536,10 @@ function Journal.adoptShape(shape: Shape, services: { Instance }?): { [string]: 
 
 	table.clear(idOf)
 	table.clear(byId)
+	table.clear(parentOf)
 	table.clear(addedRoots)
+	table.clear(replayApplied)
+	table.clear(replayCreated)
 
 	newCounter = 0
 
@@ -547,6 +599,7 @@ function Journal.adoptShape(shape: Shape, services: { Instance }?): { [string]: 
 	if not ok then
 		table.clear(idOf)
 		table.clear(byId)
+		table.clear(parentOf)
 
 		newCounter = 0
 		result.unmatchedServices = starved
@@ -716,6 +769,8 @@ local function emit(id: string, op: string, fields: Event?)
 	end
 
 	table.insert(history, event)
+
+	counts[op] = (counts[op] or 0) + 1
 
 	if op == "remove" then
 		-- Added then removed before a flush: nothing about this id survives.
@@ -986,27 +1041,6 @@ end
 -- Listeners
 --------------------------------------------------------------------------------
 
---- The id an event should name as this instance's parent: the parent's own
---- id, or `svc:<Name>` when the parent is one of the eleven content services
---- (they are not numbered, but a top-level add still needs a parent to name).
-local function parentIdOf(instance: Instance): string?
-	local parent = instance.Parent
-
-	if parent == nil then
-		return nil
-	end
-
-	local id = idOf[parent]
-
-	if id ~= nil then
-		return id
-	end
-
-	local serviceId = serviceIdOf(parent)
-
-	return if byId[serviceId] == parent then serviceId else nil
-end
-
 --------------------------------------------------------------------------------
 -- Observation
 --------------------------------------------------------------------------------
@@ -1191,10 +1225,11 @@ disconnectInstances = function()
 	table.clear(instanceConnections)
 	table.clear(dirty)
 	table.clear(dirtyRec)
-	table.clear(pendingRemove)
+	table.clear(removalBatch)
 
 	observed = 0
 	drainScheduled = false
+	removalScheduled = false
 end
 
 --- Connect everything currently registered, in chunks, off the calling thread.
@@ -1312,39 +1347,103 @@ local function inWatchedService(instance: Instance): boolean
 	return false
 end
 
---- The deferred half of a removal. It only runs when no `DescendantAdded`
---- claimed the instance as a move first, so a reparent can never be recorded
---- as a delete.
-local function deferredRemove(instance: Instance)
-	local oldParent = pendingRemove[instance]
-
-	if oldParent == nil then
-		return
-	end
-
-	pendingRemove[instance] = nil
-
+--- Emit a `move` when this instance's parent is not the one last recorded for
+--- it, and remember the new one. Comparing ids rather than Instances is what
+--- makes this independent of WHEN the engine completes a Parent assignment
+--- relative to its own signals, and it also drops the ride-along: every
+--- descendant of a moved subtree is re-added too, but only the root's parent
+--- actually changed.
+local function settleParent(instance: Instance): boolean
 	local id = idOf[instance]
 
 	if id == nil then
-		return
+		return false
 	end
 
-	if inWatchedService(instance) then
-		-- Back in the tree without an add we saw (an undo, say).
-		if instance.Parent ~= oldParent then
-			local parentId = parentIdOf(instance)
+	local parentId = parentIdOf(instance)
 
-			if parentId ~= nil then
-				emit(id, "move", { parent = parentId })
-			end
+	if parentId == nil or parentId == parentOf[instance] then
+		return false
+	end
+
+	parentOf[instance] = parentId
+	emit(id, "move", { parent = parentId })
+
+	return true
+end
+
+--- Is any ancestor of this instance also in this batch? Walked through
+--- `parentOf`, because a destroyed instance no longer has a `Parent` to walk.
+local function ancestorIsRemoved(instance: Instance): boolean
+	local parentId = parentOf[instance]
+	local guard = 0
+
+	while parentId ~= nil and guard < 4096 do
+		if string.sub(parentId, 1, 4) == "svc:" then
+			return false
 		end
 
-		return
+		local parent = byId[parentId]
+
+		if parent == nil then
+			return false
+		end
+
+		if removalBatch[parent] then
+			return true
+		end
+
+		parentId = parentOf[parent]
+		guard += 1
 	end
 
-	emit(id, "remove", {})
-	unwatch(instance)
+	return false
+end
+
+--- Settle one cycle's worth of removals together. Destroying a Model with 181
+--- descendants fires 182 `DescendantRemoving`s; only the root is worth
+--- recording, because a replay that destroys the root takes the subtree with
+--- it and already treats a missing instance as gone. Doing this per batch
+--- rather than per instance is also what lets a reparent cancel itself: the
+--- `DescendantAdded` runs before this does.
+local function settleRemovals()
+	removalScheduled = false
+
+	local batch = removalBatch
+	removalBatch = {}
+
+	local gone: { Instance } = {}
+
+	for instance in batch do
+		if idOf[instance] == nil then
+			continue
+		end
+
+		if inWatchedService(instance) then
+			-- Still in the tree: this was a move, not a removal. Usually the
+			-- DescendantAdded already settled it, in which case this is a no-op.
+			settleParent(instance)
+			continue
+		end
+
+		table.insert(gone, instance)
+	end
+
+	-- `ancestorIsRemoved` reads the batch, so it has to see all of it.
+	for _, instance in gone do
+		removalBatch[instance] = true
+	end
+
+	for _, instance in gone do
+		if not ancestorIsRemoved(instance) then
+			emit(idOf[instance] :: string, "remove", {})
+		end
+	end
+
+	for _, instance in gone do
+		removalBatch[instance] = nil
+		unwatch(instance)
+	end
 end
 
 local function onDescendantAdded(instance: Instance, service: Instance)
@@ -1355,23 +1454,13 @@ local function onDescendantAdded(instance: Instance, service: Instance)
 	local existing = idOf[instance]
 
 	if existing ~= nil then
-		-- Already registered, so this is the second half of a reparent: the
-		-- `DescendantRemoving` fired against the old parent a moment ago. Settle
-		-- it as a move NOW and cancel the pending remove.
-		local oldParent = pendingRemove[instance]
-		pendingRemove[instance] = nil
+		-- Already registered, so this is the second half of a reparent — which
+		-- may be within one service or across two. Cancel the pending removal
+		-- and settle the parent now, whichever it was.
+		removalBatch[instance] = nil
 
 		watch(instance)
-
-		-- Descendants of a moved subtree are re-added too, but their own parent
-		-- did not change — only the root's did.
-		if oldParent == nil or instance.Parent ~= oldParent then
-			local parentId = parentIdOf(instance)
-
-			if parentId ~= nil then
-				emit(existing, "move", { parent = parentId })
-			end
-		end
+		settleParent(instance)
 
 		return
 	end
@@ -1417,10 +1506,25 @@ local function onDescendantRemoving(instance: Instance)
 		return
 	end
 
-	-- The signal fires BEFORE the removal, so the old parent is still here.
-	pendingRemove[instance] = instance.Parent
+	-- Nothing is decided here. `instance.Parent` is not reliably the old parent
+	-- at this point, so the whole cycle's removals are settled together once
+	-- every DescendantAdded that might cancel one has run.
+	removalBatch[instance] = true
 
-	task.defer(deferredRemove, instance)
+	if removalScheduled then
+		return
+	end
+
+	removalScheduled = true
+
+	task.defer(function()
+		local ok, err = pcall(settleRemovals)
+
+		if not ok then
+			removalScheduled = false
+			Log.debug("Journal: removal settle failed:", err)
+		end
+	end)
 end
 
 local function startLoop()
@@ -1526,6 +1630,13 @@ function Journal.status(): { [string]: any }
 		pending = pendingCount,
 		observed = observed,
 		observing = observing,
+		adds = counts.add or 0,
+		removes = counts.remove or 0,
+		moves = counts.move or 0,
+		renames = counts.rename or 0,
+		sets = counts.set or 0,
+		attrs = counts.attr or 0,
+		tags = counts.tag or 0,
 		flushed = flushedTotal,
 		seq = seq,
 		lastFlushAt = lastFlushAt,
@@ -1749,10 +1860,10 @@ local function applyEvent(
 	local op = event.op
 
 	if op == "add" then
-		-- A blob refresh re-sends an `add` for a root already created by this
-		-- replay (see refreshBlobs; `update = true` marks the deliberate ones).
-		-- Either way a second `add` for an id is new bytes for an instance that
-		-- exists, never a second instance.
+		-- An `add` for an id that already maps to an instance this replay
+		-- created is NEVER a second instance: it is either a blob refresh
+		-- (`update = true` marks the deliberate ones) or the same journal being
+		-- replayed a second time after a `pick`.
 		if created[event.id] ~= nil then
 			return true
 		end
@@ -1819,9 +1930,15 @@ local function applyEvent(
 			return false
 		end
 
-		return (pcall(function()
+		local moved = pcall(function()
 			instance.Parent = parent
-		end))
+		end)
+
+		if moved then
+			parentOf[instance] = event.parent
+		end
+
+		return moved
 	elseif op == "rename" then
 		return (pcall(function()
 			instance.Name = event.name
@@ -1884,7 +2001,10 @@ export type Conflict = {
 ---   * a move on both sides to different parents — conflict.
 ---
 --- Conflicts are skipped and returned. A second call carrying
---- `decisions = {[n] = "ours" | "theirs"}` applies the chosen side.
+--- `decisions = {[n] = "ours" | "theirs"}` applies the chosen side — and ONLY
+--- that side: a replay is idempotent per checkpoint, so the second run reruns
+--- nothing the first one already did. It reports what it re-recognised as
+--- `alreadyApplied`.
 ---
 --- `own` is the other mode: `branch up` rebuilding a branch clone from the
 --- branch's OWN journal. There is no second journal to conflict with, so
@@ -1903,11 +2023,28 @@ function Journal.replay(
 	local touches = if reconstructing then {} :: { [string]: Touch } else touchesSince(checkpoint)
 	local blobsIn = blobData or {}
 	local chosen = decisions or {}
-	local created: { [string]: Instance } = {}
+
+	-- Both ledgers persist across calls for this checkpoint (see their
+	-- declarations): `created` so a `new:` id keeps meaning the instance the
+	-- first run made, `done` so nothing is applied twice.
+	local created = replayCreated[checkpoint]
+
+	if created == nil then
+		created = {}
+		replayCreated[checkpoint] = created
+	end
+
+	local done = replayApplied[checkpoint]
+
+	if done == nil then
+		done = {}
+		replayApplied[checkpoint] = done
+	end
 
 	local conflicts: { Conflict } = {}
 	local applied = 0
 	local skipped = 0
+	local alreadyApplied = 0
 
 	local label = if reconstructing then "branch restore" else "branch replay"
 
@@ -1928,6 +2065,22 @@ function Journal.replay(
 			local instance = created[event.id] or byId[event.id]
 			local touch = touches[event.id]
 			local decision = chosen[tostring(n)] or chosen[n]
+
+			-- The branch's own sequence number is the stable identity of an
+			-- event across reruns; the array index is only a fallback, kept
+			-- negative so it can never collide with a real seq.
+			local stamp = if type(event.seq) == "number" then event.seq else -n
+
+			if done[stamp] then
+				alreadyApplied += 1
+				continue
+			end
+
+			if event.op == "add" and created[event.id] ~= nil then
+				done[stamp] = true
+				alreadyApplied += 1
+				continue
+			end
 
 			local kind: string? = nil
 
@@ -1956,11 +2109,15 @@ function Journal.replay(
 			end
 
 			if decision == "ours" and not reconstructing then
+				-- A decision is a resolution: the event is settled, so a later
+				-- run must not park it as a conflict all over again.
+				done[stamp] = true
 				skipped += 1
 				continue
 			end
 
 			if applyEvent(event, instance, blobsIn, created) then
+				done[stamp] = true
 				applied += 1
 			else
 				skipped += 1
@@ -1983,6 +2140,7 @@ function Journal.replay(
 	return {
 		applied = applied,
 		skipped = skipped,
+		alreadyApplied = alreadyApplied,
 		conflicts = conflicts,
 		own = reconstructing,
 		stopped = if ok then nil else tostring(caught),

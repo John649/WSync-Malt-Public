@@ -506,7 +506,8 @@ function BranchOps.ops.journal_replay(args: Args, ctx)
 
 	Log.stage(
 		`Journal {if own then "restore" else "replay"} {checkpoint}: {result.applied} applied, `
-			.. `{result.skipped} skipped, {#result.conflicts} conflicts`
+			.. `{result.alreadyApplied} already applied, {result.skipped} skipped, `
+			.. `{#result.conflicts} conflicts`
 	)
 
 	return result
