@@ -40,6 +40,7 @@ use rbx_dom_weak::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+	collections::HashSet,
 	env, fs,
 	io::{BufRead, BufReader, BufWriter, Write},
 	path::{Path, PathBuf},
@@ -709,7 +710,25 @@ impl Finish {
 			false
 		};
 
-		// (2) the file merge, in the main checkout
+		// (2) the file merge, in the main checkout. Main is reliably dirty on
+		// the agent docs the daemon regenerates on every plugin connect, and the
+		// branch committed its own regenerated copies — so git refuses the merge
+		// before it starts unless that overlap is committed first
+		let (parked, left_dirty) = commit_blocking_work(&main.workspace, &record.git_branch, &record.name)?;
+
+		if !parked.is_empty() && !self.raw {
+			wsync_info!(
+				"Committed {} file(s) of main's own work that `{}` also touches{}",
+				parked.len().to_string().bold(),
+				record.git_branch.bold(),
+				if left_dirty > 0 {
+					format!("; {left_dirty} other changed file(s) left alone")
+				} else {
+					String::new()
+				}
+			);
+		}
+
 		let merge = git_try(
 			&main.workspace,
 			&["merge", "--no-ff", "--no-commit", &record.git_branch],
@@ -731,12 +750,17 @@ impl Finish {
 			process::exit(CONFLICT_EXIT);
 		}
 
-		if !merge.0 && !merge.2.trim().is_empty() {
-			bail!(
-				"`git merge {}` failed in the main checkout: {}",
-				record.git_branch,
+		// A refusal with nothing left unmerged is git declining to start —
+		// its own message is the diagnosis, so it is printed verbatim
+		if !merge.0 {
+			let message = if merge.2.trim().is_empty() {
+				merge.1.trim()
+			} else {
 				merge.2.trim()
-			);
+			};
+
+			print_merge_refusal(&record.name, &record.git_branch, message, self.raw);
+			process::exit(CONFLICT_EXIT);
 		}
 
 		// (3) the instance replay, into main's Studio
@@ -832,6 +856,8 @@ impl Finish {
 				"name": record.name,
 				"committed": committed,
 				"files": paths,
+				"parked": parked,
+				"leftDirty": left_dirty,
 				"applied": replayed.get("applied").cloned().unwrap_or(Value::Null),
 				"skipped": replayed.get("skipped").cloned().unwrap_or(Value::Null),
 				"purged": self.purge,
@@ -1228,6 +1254,7 @@ fn adopt(client: &Client, record: &Record, root: &Path, raw: bool) -> Result<()>
 
 	let count = adopted.get("count").and_then(Value::as_u64).unwrap_or_default();
 	let matched = adopted.get("matched").cloned().unwrap_or(Value::Null);
+	let shape_count = adopted.get("shapeCount").cloned().unwrap_or(Value::Null);
 	let extras = adopted.get("extras").cloned().unwrap_or(Value::Null);
 	let missing = adopted.get("missing").cloned().unwrap_or(Value::Null);
 
@@ -1241,19 +1268,21 @@ fn adopt(client: &Client, record: &Record, root: &Path, raw: bool) -> Result<()>
 			"expected": record.count,
 			"shapeBlob": record.shape_blob,
 			"matched": matched,
+			"shapeCount": shape_count,
 			"extras": extras,
 			"missing": missing,
 		}));
 	}
 
 	bail!(
-		"Branch `{}` refused to adopt checkpoint {}: it numbered {count} instances against main's {}, matched {}, \
-		 extras {}, missing {}{}. Nothing was adopted — a numbering the two Studios do not share is a journal whose \
+		"Branch `{}` refused to adopt checkpoint {}: it numbered {count} instances against main's {}, matched {} of \
+		 {}, extras {}, missing {}{}. Nothing was adopted — a numbering the two Studios do not share is a journal whose \
 		 ids mean different instances on each side. Rebuild the branch (`{}`)",
 		record.name,
 		record.checkpoint,
 		record.count,
 		render_side(&matched),
+		render_side(&shape_count),
 		render_side(&extras),
 		render_side(&missing),
 		if record.shape_blob.is_none() {
@@ -1602,6 +1631,102 @@ fn print_conflicts(name: &str, conflicts: &[Value], path: &Path, raw: bool) {
 		conflicts.len(),
 		path.to_string().bold(),
 		format!("wsync branch pick {name} <n> ours|theirs").bold(),
+		format!("wsync branch finish {name}").bold()
+	);
+	std::io::stdout().flush().ok();
+}
+
+/// Commits exactly the files main has changed that the branch also touched,
+/// so `git merge` stops refusing. The daemon regenerates the agent docs on
+/// every plugin connect, which leaves main permanently dirty on files a
+/// branch commits too; that overlap is the whole problem and the only thing
+/// committed here. Never `git add -A` — unrelated work in main stays exactly
+/// where it was. Returns what was committed and how many changed files were
+/// left alone
+fn commit_blocking_work(workspace: &Path, git_branch: &str, name: &str) -> Result<(Vec<String>, usize)> {
+	let touched: HashSet<String> = git_out(workspace, &["diff", "--name-only", &format!("HEAD...{git_branch}")])
+		.unwrap_or_default()
+		.lines()
+		.filter(|line| !line.is_empty())
+		.map(str::to_owned)
+		.collect();
+
+	let dirty = dirty_paths(workspace)?;
+	let blocking: Vec<String> = dirty
+		.iter()
+		.filter(|path| touched.contains(path.as_str()))
+		.cloned()
+		.collect();
+
+	let left_alone = dirty.len() - blocking.len();
+
+	if blocking.is_empty() {
+		return Ok((blocking, left_alone));
+	}
+
+	let mut staged = vec!["add", "--"];
+	staged.extend(blocking.iter().map(String::as_str));
+	git_out(workspace, &staged)?;
+
+	// The pathspec keeps anything the user had staged already out of this
+	// commit; `add` above is only there so an untracked path has something to
+	// commit from
+	let message = format!("wsync: main work in progress before merging {name}");
+	let mut commit = vec!["commit", "-m", &message, "--"];
+	commit.extend(blocking.iter().map(String::as_str));
+	git_out(workspace, &commit)?;
+
+	Ok((blocking, left_alone))
+}
+
+/// Every path `git status` reports as changed or untracked, renames counted
+/// under their new name
+fn dirty_paths(workspace: &Path) -> Result<Vec<String>> {
+	let status = git_out(
+		workspace,
+		&[
+			"-c",
+			"core.quotepath=false",
+			"status",
+			"--porcelain",
+			"--untracked-files=all",
+		],
+	)?;
+
+	let mut paths: Vec<String> = status
+		.lines()
+		.filter(|line| line.len() > 3)
+		.map(|line| {
+			let path = &line[3..];
+
+			// `R  old -> new`: the new name is the one a merge collides with
+			path.rsplit(" -> ").next().unwrap_or(path).trim_matches('"').to_owned()
+		})
+		.collect();
+
+	paths.sort();
+	paths.dedup();
+
+	Ok(paths)
+}
+
+/// git declined to start the merge. Whatever it said is the diagnosis — the
+/// files it names are the ones to deal with — so it goes out verbatim
+fn print_merge_refusal(name: &str, git_branch: &str, message: &str, raw: bool) {
+	if raw {
+		print_json(
+			&json!({ "ok": false, "stage": "merge", "branch": name, "gitBranch": git_branch, "error": message }),
+		);
+
+		return;
+	}
+
+	println!("{message}");
+	println!();
+	wsync_warn!(
+		"git refused to merge {} into main. Deal with what it names above, then run `{}` again — nothing was merged \
+		 and the branch is untouched",
+		git_branch.bold(),
 		format!("wsync branch finish {name}").bold()
 	);
 	std::io::stdout().flush().ok();
