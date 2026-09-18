@@ -319,7 +319,10 @@ function Protocol.applyReceipt(upload: Upload, receipt: any): Verdict
 	--     `resolver` ruling for who runs the decision UX.
 	local reviewId = if type(receipt.reviewId) == "string" and receipt.reviewId ~= "" then receipt.reviewId else nil
 
-	if receipt.applied == true or reviewId ~= nil then
+	-- `keep` (a branch clone): the daemon applied nothing on purpose and
+	-- reports `direction = "keep"`; that is a terminal success, not a
+	-- decision. Seen live: the first clone under `keep` was disconnected here.
+	if receipt.applied == true or reviewId ~= nil or receipt.direction == "keep" then
 		upload.done = true
 		upload.nextIndex += 1
 
