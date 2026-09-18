@@ -35,7 +35,15 @@ pub fn read_project(path: &Path, parent_context: Option<&Context>, vfs: &Vfs) ->
 		}
 	}
 
-	let mut snapshot = new_snapshot_node(&project.name, path, project.node, NodePath::new(), &meta.context, vfs)?;
+	let mut snapshot = new_snapshot_node(
+		&project.name,
+		path,
+		project.node,
+		NodePath::new(),
+		false,
+		&meta.context,
+		vfs,
+	)?;
 
 	snapshot.meta.source.add_project(path);
 
@@ -48,6 +56,7 @@ pub fn new_snapshot_node(
 	path: &Path,
 	node: ProjectNode,
 	node_path: NodePath,
+	under_datamodel: bool,
 	context: &Context,
 	vfs: &Vfs,
 ) -> Result<Snapshot> {
@@ -57,7 +66,11 @@ pub fn new_snapshot_node(
 
 	let class = if let Some(class_name) = &node.class_name {
 		class_name.to_owned()
-	} else if util::is_service(name) {
+	} else if under_datamodel && util::is_service(name) {
+		// A service class is inferred from the name only directly under the
+		// DataModel. Seen live: a plugin's `Packages` node became the
+		// `Packages` service once the reflection database knew that class,
+		// and Studio refused to deserialize a service inside a plugin.
 		name.to_owned()
 	} else {
 		String::from("Folder")
@@ -159,7 +172,7 @@ pub fn new_snapshot_node(
 
 	for (node_name, node) in node.tree {
 		let node_path = node_path.join(&node_name);
-		let child = new_snapshot_node(&node_name, path, node, node_path, context, vfs)?;
+		let child = new_snapshot_node(&node_name, path, node, node_path, class == "DataModel", context, vfs)?;
 
 		snapshot.add_child(child);
 	}

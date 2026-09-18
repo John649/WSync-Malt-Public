@@ -344,10 +344,10 @@ fn stamp_from_tree(core: &Core, id: rbx_dom_weak::types::Ref) {
 /// through `initialSync` (docs/branches.md).
 ///
 /// `studio` (the default) keeps Studio and backlogs the disk side; `disk`
-/// keeps the disk bytes and pushes them into Studio, which is what a branch
-/// worktree needs; `refuse` leaves the clash parked for `GET /resolve` and
-/// says so in the log, because a project that asked not to be resolved
-/// automatically has not asked to be told twice either
+/// keeps the disk bytes and pushes them into Studio; `keep` and `refuse`
+/// leave the clash parked for `GET /resolve` and say so in the log, because a
+/// project that asked not to be resolved automatically has not asked to be
+/// told twice either
 pub async fn auto_resolve(state: &AppState, parked: Parked) {
 	// Read before the match: the project guard must not be alive across the
 	// Studio-first resolution's awaits
@@ -356,9 +356,15 @@ pub async fn auto_resolve(state: &AppState, parked: Parked) {
 	match initial_sync {
 		InitialSync::Studio => auto_keep_studio(state, parked).await,
 		InitialSync::Disk => auto_keep_disk(state, parked),
-		InitialSync::Refuse => info!(
-			"Conflict {} on {} left parked: initialSync is \"refuse\", so nothing resolves automatically",
-			parked.id, parked.info.instance_path
+		// `keep` and `refuse` both decline to pick a side automatically: one
+		// because the two sides were never meant to converge on connect, the
+		// other because the project asked to be told instead. Either way the
+		// clash stays parked for `GET /resolve`
+		InitialSync::Keep | InitialSync::Refuse => info!(
+			"Conflict {} on {} left parked: initialSync is {:?}, so nothing resolves automatically",
+			parked.id,
+			parked.info.instance_path,
+			initial_sync.as_str()
 		),
 	}
 }

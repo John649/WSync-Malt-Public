@@ -80,26 +80,38 @@ impl Scope {
 }
 
 /// What a connect does when the two sides diverge (docs/branches.md).
+///
 /// **Studio** — the default when the project file carries no `initialSync`
 /// field — is today's Studio-first behaviour: Studio wins and the disk side
-/// goes to the backlog. **Disk** replays the disk state into Studio instead,
-/// which is what a branch worktree needs so that reconnecting never deletes
-/// the branch's work. **Refuse** moves nothing and answers 409 naming the
-/// divergent paths.
+/// goes to the backlog. **Disk** replays the disk state into Studio instead.
+/// **Keep** applies nothing in either direction and simply starts syncing
+/// from where both sides already are. **Refuse** also moves nothing, but
+/// answers 409 naming the divergent paths instead of proceeding.
+///
+/// A branch clone wants `keep`, not `disk`. Code scope counts `Folder` as
+/// syncable, and a place has thousands of folders that exist only in the
+/// place file — no directory on disk stands behind them. To a disk-wins
+/// commit every one of those is "Studio-only", which means "delete it", and
+/// the first branch clone to connect lost 63,000 instances under
+/// `ReplicatedStorage` that way. A clone is a *copy of what Studio already
+/// has*; there is nothing for a connect to reconcile, so it reconciles
+/// nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InitialSync {
 	#[default]
 	Studio,
 	Disk,
+	Keep,
 	Refuse,
 }
 
 impl InitialSync {
-	/// `"disk"` and `"refuse"` opt out; anything else (including absence) is
-	/// the Studio-first default
+	/// `"disk"`, `"keep"` and `"refuse"` opt out; anything else (including
+	/// absence) is the Studio-first default
 	pub fn parse(value: Option<&str>) -> Self {
 		match value {
 			Some("disk") => Self::Disk,
+			Some("keep") => Self::Keep,
 			Some("refuse") => Self::Refuse,
 			_ => Self::Studio,
 		}
@@ -109,6 +121,7 @@ impl InitialSync {
 		match self {
 			Self::Studio => "studio",
 			Self::Disk => "disk",
+			Self::Keep => "keep",
 			Self::Refuse => "refuse",
 		}
 	}
@@ -195,7 +208,7 @@ pub struct Project {
 	pub scope: Option<String>,
 
 	/// Divergence policy on connect (docs/branches.md): `"studio"` (the
-	/// default when absent), `"disk"` or `"refuse"`. Read through
+	/// default when absent), `"disk"`, `"keep"` or `"refuse"`. Read through
 	/// [`Project::initial_sync`], never directly
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub initial_sync: Option<String>,

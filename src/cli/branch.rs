@@ -1746,7 +1746,10 @@ fn write_branch_project(main: &Path, out: &Path, name: &str, synthetic: u64) -> 
 	);
 
 	fields.insert("name".to_owned(), json!(renamed));
-	fields.insert("initialSync".to_owned(), json!("disk"));
+	// `keep`, not `disk`: the clone is a copy of what Studio already holds, so
+	// a connect has nothing to reconcile. Disk-wins reads every place-only
+	// Folder as Studio-only and deletes it (docs/branches.md)
+	fields.insert("initialSync".to_owned(), json!("keep"));
 	fields.insert("branch".to_owned(), json!(name));
 	fields.insert("placeIds".to_owned(), json!([synthetic]));
 	// The legacy spelling would otherwise sit beside the new one and win

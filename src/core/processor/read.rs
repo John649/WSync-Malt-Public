@@ -38,7 +38,18 @@ pub fn process_changes(id: Ref, tree: &mut Tree, vfs: &Vfs) -> Option<Changes> {
 			if node_path.is_root() {
 				process_path(path)?
 			} else {
-				match new_snapshot_node(name, path, *node.clone(), node_path.clone(), &meta.context, vfs) {
+				// A project node one level below the root sits under the DataModel in a
+				// place project, which is the only level a service class is inferred at.
+				let under_datamodel = node_path.parent().is_root();
+				match new_snapshot_node(
+					name,
+					path,
+					*node.clone(),
+					node_path.clone(),
+					under_datamodel,
+					&meta.context,
+					vfs,
+				) {
 					Ok(snapshot) => Some(snapshot),
 					Err(err) => {
 						error!("Failed to process changes: {err}, source: {source:?}");

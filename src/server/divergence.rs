@@ -284,10 +284,48 @@ pub async fn compare(State(state): State<AppState>, body: Bytes) -> Response {
 			match initial_sync {
 				InitialSync::Studio => studio_first_commit(&state, items, accepted, next).await,
 				InitialSync::Disk => disk_first_commit(&state, items, accepted, next),
+				InitialSync::Keep => keep_commit(&state, &items, accepted, next),
 				InitialSync::Refuse => refuse_commit(&items),
 			}
 		}
 	}
+}
+
+/// `initialSync: "keep"` — apply nothing, in either direction, and start
+/// syncing from where both sides already are.
+///
+/// This is what a branch clone connects with. The clone *is* Studio's
+/// content, copied a moment ago, so there is nothing for a connect to
+/// reconcile — but the comparison still comes back non-empty, because code
+/// scope counts `Folder` as syncable and a place is full of folders that only
+/// ever existed in the place file. A disk-wins commit reads every one of
+/// those as Studio-only and removes it; that is how the first clone lost
+/// 63,000 instances under `ReplicatedStorage`. Nothing is written, nothing is
+/// removed, and nothing is backlogged, because nothing lost.
+///
+/// The baselines are seeded all the same. A baseline is what the conflict
+/// engine compares the *next* change against, so seeding it here is what lets
+/// live sync proceed normally from the current tree: without it every
+/// instance in the reported set would look like it had changed behind the
+/// engine's back the first time either side touched it
+fn keep_commit(state: &AppState, items: &[Item], accepted: u64, next: u64) -> Response {
+	info!(
+		"Keeping both sides as they are: {} divergent entr(ies) reported, nothing applied",
+		items.len()
+	);
+
+	seed_all_baselines(&state.core);
+
+	Json(json!({
+		"ok": true,
+		"acceptedChunk": accepted,
+		"nextChunk": next,
+		"committed": true,
+		"applied": false,
+		"direction": "keep",
+		"entries": items.len(),
+	}))
+	.into_response()
 }
 
 /// How many divergent paths a `refuse` answer names. The list is a diagnosis,

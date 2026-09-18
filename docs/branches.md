@@ -37,7 +37,7 @@ wsync branch finish <name>     git merge, Studio replay into main, close
    path that already exists), assembled into `<name>.rbxl` beside the worktree
    with rbx_binary. Studio migrates a place as it opens, so the checkpoint is
    taken from the branch Studio after it loads, never from this file.
-3. Write the branch's project file: main's tree, `initialSync: "disk"`, and
+3. Write the branch's project file: main's tree, `initialSync: "keep"`, and
    `placeIds: [<synthetic id>]` (see Discovery).
 4. Start a daemon on the worktree (`wsync daemon start --project`), launch
    Studio on the clone, keep the pid.
@@ -63,12 +63,38 @@ only instance the plugin adds to a place and it is excluded from the journal.
 
 wsync's connect rule is Studio-first: disk-only files are swept into a
 24-hour backlog. That rule deletes a branch's work the second time it connects.
-Branch project files carry `initialSync: "disk"`, a new project field with three
+Branch project files carry `initialSync: "keep"`, a new project field with four
 values:
 
 - `studio` (default, unchanged): today's behaviour.
 - `disk`: the existing disk-wins path that full-scope projects already offer.
+- `keep`: apply nothing in either direction; start syncing from where both
+  sides already are.
 - `refuse`: answer 409 naming the divergent paths; nothing moves.
+
+A branch clone takes `keep`, and the reason is worth stating plainly, because
+`disk` looks like the obvious answer and is not.
+
+Code scope counts `Folder` as syncable. A place is full of folders that exist
+only in the place file — no directory on disk has ever stood behind them — and
+the divergence comparison reports every one of them as Studio-only. To a
+Studio-first commit that means "write them out"; to a disk-wins commit it means
+"delete them". The first clone to connect with `disk` lost 63,000 instances
+under `ReplicatedStorage` in one pass.
+
+Neither direction is right here, because the question is wrong. A clone is a
+copy of what Studio already holds, taken seconds earlier. The two sides are not
+diverged; they are the same tree seen through a projection that only covers
+part of it. So the connect reconciles nothing: it writes nothing, removes
+nothing, backlogs nothing, and answers
+`{ok: true, applied: false, direction: "keep", entries: n}`.
+
+It does seed the conflict baselines from the current tree, which is the one
+thing it must do. A baseline is what the engine compares the *next* change
+against; without one, the first edit to any instance in the reported set would
+look like a change nobody made, and the branch would open on a wall of
+manufactured conflicts. Mid-session, `keep` declines to pick a side the same
+way `refuse` does: the clash stays parked for `wsync resolve`.
 
 ## Journal
 
