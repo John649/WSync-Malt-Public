@@ -21,6 +21,8 @@ local Util = require(WSync.Util)
 local Log = require(WSync.Log)
 local Core = require(WSync.Core)
 local Discovery = require(WSync.Discovery)
+local Broker = require(WSync.Broker)
+local Place = require(WSync.Place)
 local Policy = require(WSync.Discovery.Policy)
 local describeChanges = require(Helpers.describeChanges)
 
@@ -90,6 +92,17 @@ function App.new()
 	-- The passive disk-review line on the Connected page (Design §7.0, code
 	-- scope): the indicator string, or nil when nothing awaits review
 	self.diskReview = Value(nil)
+	-- Attach (docs/places.md): the "this is temporary" line on the Connected
+	-- page, or nil for an ordinary project connection
+	self.attachNote = Value(nil)
+	-- One automatic attach per place per Studio session. An attach that ends
+	-- (the daemon died, the user disconnected) leaves the card in the
+	-- ordinary no-daemon states rather than asking for another one; Retry is
+	-- what clears this, because Retry is the user asking
+	self.attachTried = false
+	-- `{key, port}` from a daemon that names a `placeKey`, waiting for the
+	-- connect to succeed before it is written into the place
+	self.pendingPlaceKey = nil
 	-- The connection state machine driving the Not Connected status card
 	-- (Design §9.2 as amended; pure transitions in Discovery.Policy)
 	self.flow = Value(Policy.initialState())
@@ -359,6 +372,8 @@ function App:dispatch(event)
 		self:__runCreate(state)
 	elseif effect == "wait" then
 		self:__runWait(state)
+	elseif effect == "attach" then
+		self:__runAttach(state)
 	end
 end
 
@@ -383,7 +398,7 @@ function App:flowAction()
 
 	if name == "idle" then
 		self:dispatch({ kind = "start" })
-	elseif name == "scanning" or name == "waiting-daemon" then
+	elseif name == "scanning" or name == "waiting-daemon" or name == "attaching" then
 		self:dispatch({ kind = "cancel" })
 	elseif name == "found" then
 		-- A connect is already underway; tear it down (disconnect resets the
@@ -394,6 +409,12 @@ function App:flowAction()
 	elseif name == "create-confirm" then
 		self:dispatch({ kind = "confirm" })
 	elseif name == "no-broker" or name == "error" then
+		-- Retry is the user asking again, which is the one thing that puts an
+		-- automatic attach back on the table — and drops the port the last
+		-- one handed us, so a dead scratch daemon is not probed forever
+		self.attachTried = false
+		Discovery.setSessionPort(nil)
+
 		self:dispatch({ kind = "retry" })
 	end
 end
@@ -429,6 +450,12 @@ function App:__runScan(state)
 					.. ` on {match.host}:{match.port}`
 			)
 
+			-- A daemon that names a `placeKey` is how this place will be found
+			-- next time, and one that says it is ephemeral is a temporary
+			-- attach the Connected page has to be honest about
+			self:__rememberPlace(match.hello.placeKey, match.port)
+			self.attachNote:set(Policy.temporaryNote(match.hello))
+
 			self:dispatch({
 				kind = "scan-found",
 				generation = generation,
@@ -453,12 +480,123 @@ function App:__runScan(state)
 				"Connect: discovery found no matching daemon (project broker present"
 					.. if known then ", knows this game)" else ")"
 			)
-			self:dispatch({ kind = "scan-none-broker", generation = generation, broker = broker, known = known })
+
+			if self:__mayAttach(broker) then
+				-- No click: opening the place is the whole gesture
+				-- (docs/places.md). One attempt per place per session, so a
+				-- refusal or a daemon that dies cannot become a loop.
+				self.attachTried = true
+
+				self:dispatch({ kind = "scan-none-attach", generation = generation, broker = broker, known = known })
+			else
+				self:dispatch({ kind = "scan-none-broker", generation = generation, broker = broker, known = known })
+			end
 		else
 			Log.stage("Connect: discovery found no matching daemon and no project broker")
 			self:dispatch({ kind = "scan-none-no-broker", generation = generation })
 		end
 	end)
+end
+
+--- Whether this window may be handed a throwaway daemon without being asked.
+---
+--- Three gates: the desktop app has to advertise the route at all, a branch
+--- clone is never attached (its marker rules are the whole point of a clone —
+--- docs/branches.md), and it happens at most once per place per Studio
+--- session, which is what keeps a refusal or a short-lived daemon from
+--- becoming a scan/attach loop.
+function App:__mayAttach(broker): boolean
+	if self.attachTried or not Broker.supportsAttach(broker.hello) then
+		return false
+	end
+
+	return Discovery.identity().branch ~= true
+end
+
+--- Ask the desktop app for a throwaway daemon for this place, then connect to
+--- the port it answers with (docs/places.md — "Attach from Studio"). A
+--- refusal is not an error: the card falls back to the ordinary no-daemon
+--- offer, which is exactly what it would have shown without the attach.
+function App:__runAttach(state)
+	local generation = state.generation
+	local broker = state.broker
+
+	local function continuing()
+		local flow = peek(self.flow)
+		return flow.generation == generation and flow.name == "attaching"
+	end
+
+	task.spawn(function()
+		local result = Discovery.attachPlace(broker):expect()
+
+		if not continuing() then
+			return
+		end
+
+		local attached = result and result.attached
+
+		if attached == nil then
+			Log.stage(`Attach: {(result and result.message) or "the WSync app refused"}`)
+			self:dispatch({ kind = "attach-none", generation = generation })
+
+			return
+		end
+
+		-- Trusted for this session only, and never written into the place: the
+		-- scratch daemon claims no ids, so the port IS the identity, and it
+		-- must not outlive the window that asked for it (Policy.rankHello).
+		Discovery.setSessionPort(attached.port)
+		self.attachNote:set(Policy.temporaryNote({ ephemeral = true }))
+		self:__rememberPlace(attached.placeKey, attached.port)
+
+		Log.stage(`Connect: attached temporarily on port {attached.port}`)
+
+		self:dispatch({
+			kind = "attach-ok",
+			generation = generation,
+			host = Policy.LOCAL_HOST,
+			port = attached.port,
+			project = attached.key or attached.project,
+		})
+	end)
+end
+
+--- Note the `placeKey` a daemon claims, to be written into the place once the
+--- connection actually succeeds. Nothing is touched here: a key from a daemon
+--- we never managed to talk to is not something to remember.
+function App:__rememberPlace(key, port)
+	if type(key) ~= "string" or key == "" then
+		return
+	end
+
+	self.pendingPlaceKey = { key = key, port = port }
+end
+
+--- Write the place marker, once, after a connect to a project that names a
+--- `placeKey` (docs/places.md — "Unpublished places"). The plugin is the only
+--- side that can: the engine never touches Studio and the desktop app never
+--- touches a place. It lands in the `.rbxl` on the user's next save, and from
+--- then on this place finds that project by name rather than by an id it does
+--- not have.
+function App:__writePlaceMarker()
+	local pending = self.pendingPlaceKey
+
+	self.pendingPlaceKey = nil
+
+	if pending == nil or Discovery.identity().branch == true then
+		return
+	end
+
+	if Place.key() == pending.key then
+		-- Already marked, but the port may have moved
+		Place.remember(pending.key, pending.port)
+
+		return
+	end
+
+	if Place.remember(pending.key, pending.port) then
+		Log.info(`Place key '{pending.key}' remembered in {Place.MARKER_NAME}; save the place to keep it`)
+	end
 end
 
 --- Hand the resolved address to Core — discovery is over at this point and
@@ -615,6 +753,8 @@ function App:__connectTo(host: string, port: number, generation: number)
 		loading = false
 		project:set(projectDetails)
 
+		self:__writePlaceMarker()
+
 		self.lastSync:set(os.time())
 
 		self.lastSyncKind:set(Config:get("InitialSyncPriority"))
@@ -727,6 +867,13 @@ function App:disconnect(cancel: boolean?)
 	self.connectGeneration += 1
 	self.transportStatus:set(nil)
 	self.diskReview:set(nil)
+	self.attachNote:set(nil)
+	self.pendingPlaceKey = nil
+
+	-- The attach port deliberately survives a disconnect: a reconnect probes
+	-- it first and reattaches to the daemon still serving this window. When
+	-- that daemon is gone the scan finds nothing, the card returns to the
+	-- discovery states, and only Retry asks for a new attach.
 
 	-- Drop whatever the connection flow was doing (stale scans and waits
 	-- abort through the generation bump)

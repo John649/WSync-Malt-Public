@@ -4,12 +4,19 @@
 //! **only while a Projects folder is authorized in Settings**. It answers two
 //! routes and nothing else:
 //!
-//! * `GET  /hello`          → `{broker, projectInit, version}` — how the
+//! * `GET  /hello`          → `{broker, projectInit, attach, version}` — how the
 //!   plugin's port scan tells a broker from a daemon (Design 3.2).
 //! * `POST /projects/init`  → `{ok, slug, status}` — the "Create Project" click.
 //!   The hello also carries `games`, the GameIds of registered projects, so
 //!   the plugin can offer "Serve Project" instead of a create for a game the
 //!   app already has.
+//! * `POST /places/attach`  → `{ok, port, project, ephemeral}` — **Attach**
+//!   (docs/places.md). No click: when discovery finds no daemon for the open
+//!   place and this broker is reachable, the plugin asks for a throwaway
+//!   daemon and connects to the port it answers with. Nothing is registered,
+//!   nothing is kept, and the whole thing disappears with the Studio window.
+//!   Switched off from Settings, the route answers `{disabled: true}` and the
+//!   plugin falls back to the ordinary no-daemon card.
 //!
 //! It is written directly over `tokio::net` in the style of `loopback.rs`, for
 //! the same reasons that module gives: the requirement is two routes and a
@@ -70,8 +77,10 @@
 use std::{
     collections::{HashMap, VecDeque},
     fs,
+    future::Future,
     net::Ipv4Addr,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -162,6 +171,44 @@ const MAX_REMOTE_NAME_LENGTH: usize = 200;
 
 const REQUEST_ID_MIN: usize = 8;
 const REQUEST_ID_MAX: usize = 128;
+
+/// Where attach projects live inside the authorized folder: one directory,
+/// holding one throwaway project per attached place. The engine knows the
+/// same name (`src/cli/places.rs`'s `SCRATCH_DIR`), which is what lets it
+/// recognize — and so delete — what this route creates.
+pub(crate) const SCRATCH_DIR: &str = "_places";
+
+/// The prefix every attach key for an *unpublished* place carries. A place
+/// with an id is named by it; a place without one is named by the key minted
+/// here, and the prefix is what keeps the engine's delete rule as narrow for
+/// a key as it is for an id.
+pub(crate) const UNPUBLISHED_PREFIX: &str = "unpublished-";
+
+/// Hex characters of the plugin's `sessionId` that ride in a minted key. Long
+/// enough that two windows on two copies of the same unnamed baseplate do not
+/// collide, short enough to stay a readable directory name.
+pub(crate) const KEY_SUFFIX_LENGTH: usize = 8;
+
+/// Slug characters a minted key may carry. Shorter than a project slug on
+/// purpose: the key becomes a directory name *and* travels in the place's
+/// marker, and `unpublished-` plus the session suffix is already 21
+/// characters of it.
+const KEY_SLUG_LENGTH: usize = 32;
+
+/// `attach:<key>` — the project id an attached daemon is held under in the
+/// daemon registry. It is deliberately not a project id the Projects view
+/// could ever mint: nothing about an attach reaches `state.json`.
+const ATTACH_PROJECT_PREFIX: &str = "attach:";
+
+/// How long the engine gets to write an attach project file. It creates a
+/// directory and writes one small JSON document; a process that has not
+/// finished by now is not going to.
+const ATTACH_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// `state.json`'s switch for the whole flow (Settings → "Attach to any open
+/// place automatically"). Absent means on: the feature is the default, and a
+/// state file written before it existed must not read as "off".
+const AUTO_ATTACH_KEY: &str = "autoAttach";
 
 /// Names Windows cannot host as a directory, whatever the filesystem says.
 const RESERVED_NAMES: &[&str] = &[
@@ -300,6 +347,50 @@ impl BrokerEvents for AppHandle {
     }
 }
 
+/// How the broker reaches the daemon lifecycle for an attach.
+///
+/// Separate from [`BrokerEvents`] because it is the one thing the broker has
+/// to *wait* for: the route's whole answer is the port, so a fire-and-forget
+/// serve would have nothing to reply with. A trait for the same reason the
+/// events are one — the attach path is worth testing without a Tauri runtime.
+pub(crate) trait AttachHost: Send + Sync + 'static {
+    /// Start (or reuse) the scratch daemon for `project_path`, held under
+    /// `project_id`, and resolve its port. The daemon is started
+    /// `--ephemeral`: it stops itself once Studio goes away and deletes the
+    /// project directory on the way out.
+    fn start(
+        &self,
+        project_id: String,
+        project_path: String,
+    ) -> Pin<Box<dyn Future<Output = Result<u16, String>> + Send>>;
+}
+
+impl AttachHost for AppHandle {
+    fn start(
+        &self,
+        project_id: String,
+        project_path: String,
+    ) -> Pin<Box<dyn Future<Output = Result<u16, String>> + Send>> {
+        let handle = self.clone();
+
+        Box::pin(async move {
+            let Some(state) = handle.try_state::<crate::AppState>() else {
+                return Err("the app is shutting down".to_string());
+            };
+            let data_dir = state.paths.data_dir.clone();
+            // The same spawn contract `daemon_start` uses — owner token, ready
+            // line, supervisor, heartbeat — plus the one flag that makes this
+            // daemon throwaway.
+            state
+                .daemons
+                .start_with(&project_id, &project_path, &data_dir, None, &["--ephemeral"])
+                .await
+                .map(|session| session.port)
+                .map_err(|error| error.message)
+        })
+    }
+}
+
 // ------------------------------------------------------------------ broker --
 
 struct Running {
@@ -343,6 +434,14 @@ pub(crate) struct Broker {
     /// Serializes slug resolution → creation → merge. Two clicks in two open
     /// places must not both decide the name `my-game` is free.
     create_lock: Mutex<()>,
+    /// Serializes the attach path the same way, and separately: an attach and
+    /// a create write into different subtrees of the same root, and neither
+    /// should queue behind the other's games-API timeout.
+    attach_lock: Mutex<()>,
+    /// How an attach starts its daemon. Installed once, after `AppState`
+    /// exists; absent in a test that does not exercise the route, which then
+    /// answers that attach is unavailable rather than panicking.
+    attach_host: std::sync::Mutex<Option<Arc<dyn AttachHost>>>,
     ledger: Mutex<VecDeque<LedgerEntry>>,
     /// Design 7.0's experience names, one answer per GameId for the broker's
     /// lifetime — *including* the misses, so a machine with no network pays the
@@ -367,10 +466,24 @@ impl Broker {
             running: Mutex::new(None),
             off_detail: std::sync::Mutex::new(no_root_detail().to_string()),
             create_lock: Mutex::new(()),
+            attach_lock: Mutex::new(()),
+            attach_host: std::sync::Mutex::new(None),
             ledger: Mutex::new(VecDeque::new()),
             game_names: Mutex::new(HashMap::new()),
             games_base: std::sync::Mutex::new(games_api_base()),
         })
+    }
+
+    /// Install the daemon lifecycle the attach route starts its scratch
+    /// daemons through. Called once at startup, from `lib.rs`.
+    pub(crate) fn set_attach_host(&self, host: Arc<dyn AttachHost>) {
+        if let Ok(mut current) = self.attach_host.lock() {
+            *current = Some(host);
+        }
+    }
+
+    fn attach_host(&self) -> Option<Arc<dyn AttachHost>> {
+        self.attach_host.lock().ok().and_then(|host| host.clone())
     }
 
     // ---------------------------------------------------------- lifecycle --
@@ -491,11 +604,15 @@ impl Broker {
                 HttpReply::json(200, hello_document(&games))
             }
             ("POST", "/projects/init") => self.init(request, root).await,
+            ("POST", "/places/attach") => self.attach(request, root).await,
             ("POST", "/hello") => HttpReply::error(405, "/hello is a GET"),
             ("GET", "/projects/init") => HttpReply::error(405, "/projects/init is a POST"),
+            ("GET", "/places/attach") => HttpReply::error(405, "/places/attach is a POST"),
             (_, path) => HttpReply::error(
                 404,
-                format!("{path} is not a broker route (try GET /hello, POST /projects/init)"),
+                format!(
+                    "{path} is not a broker route (try GET /hello, POST /projects/init, POST /places/attach)"
+                ),
             ),
         }
     }
@@ -627,6 +744,10 @@ impl Broker {
             game_id: request.game_id,
             place_ids: request.place_ids(),
             group_id: request.group_id(),
+            // Carried, not minted: a place that already reached a scratch
+            // daemon by key keeps that key, so the marker it carries now
+            // points at the permanent project instead (docs/places.md).
+            place_key: request.usable_place_key(),
         };
         if let Err(error) = templates::write_scaffold(&directory, &facts) {
             // A half-written project is worse than none.
@@ -662,6 +783,105 @@ impl Broker {
         self.events.serve(&project_id, &project_path);
 
         Ok(outcome)
+    }
+
+
+    // -------------------------------------------------------------- attach --
+
+    /// `POST /places/attach` (docs/places.md — "Attach from Studio").
+    ///
+    /// Creates a throwaway project for the open place under
+    /// `<root>/_places/<key>/`, starts an `--ephemeral` daemon on it, and
+    /// answers with the port. Nothing is written to `state.json`, nothing
+    /// appears in the Projects view, and the daemon deletes the directory
+    /// when Studio goes away.
+    ///
+    /// The project *file* is written by the engine (`wsync open
+    /// --attach-only`) rather than here: a scratch project's shape — code
+    /// scope, `initialSync: "keep"`, the mapped service directories, the
+    /// `placeKey` — is the engine's contract with itself, and a second
+    /// implementation of it in this crate would be a second thing to keep
+    /// right.
+    async fn attach(&self, request: RawRequest, root: &Path) -> HttpReply {
+        let parsed = match parse_attach(&request.body) {
+            Ok(parsed) => parsed,
+            Err(reply) => return reply,
+        };
+
+        if !auto_attach_enabled(&self.read_registry().await) {
+            // Not an error: the user turned it off, and the plugin's answer
+            // to that is to show the ordinary no-daemon card.
+            return HttpReply::json(
+                200,
+                json!({
+                    "ok": false,
+                    "disabled": true,
+                    "error": "automatic attach is switched off in WSync Settings",
+                }),
+            );
+        }
+
+        match self.attach_place(&parsed, root).await {
+            Ok(attached) => HttpReply::json(
+                200,
+                json!({
+                    "ok": true,
+                    "port": attached.port,
+                    "project": attached.project,
+                    "name": attached.name,
+                    "key": attached.key,
+                    "placeKey": attached.place_key,
+                    "ephemeral": true,
+                }),
+            ),
+            Err(error) => HttpReply::error(error.status, error.message),
+        }
+    }
+
+    async fn attach_place(&self, request: &AttachRequest, root: &Path) -> Result<Attached, InitError> {
+        let Some(host) = self.attach_host() else {
+            return Err(InitError::new(
+                503,
+                "this WSync build cannot start an attach daemon",
+            ));
+        };
+
+        let (key, place_key) = attach_key(request.place_id, request.name.as_deref(), &request.session_id);
+
+        // One attach at a time: two windows opening two unnamed baseplates at
+        // once must not race on the same `_places` directory.
+        let _attach = self.attach_lock.lock().await;
+
+        let directory = root.join(SCRATCH_DIR).join(&key);
+
+        fs::create_dir_all(&directory).map_err(|error| {
+            InitError::new(500, format!("could not create the attach folder: {error}"))
+        })?;
+
+        // The same guard the create path uses, for the same reason: whatever
+        // that path resolves to has to still be inside the authorized folder.
+        verify_inside(&root.join(SCRATCH_DIR), &directory)?;
+
+        let written = write_attach_project(
+            &directory,
+            request.place_id,
+            request.game_id,
+            place_key.as_deref(),
+        )
+        .await?;
+
+        let port = host
+            .start(format!("{ATTACH_PROJECT_PREFIX}{key}"), written.project.clone())
+            .await
+            .map_err(|error| InitError::new(500, format!("the attach daemon did not start: {error}")))?;
+
+        Ok(Attached {
+            port,
+            project: written.project,
+            name: written.name,
+            key,
+            place_key,
+        })
     }
 
     // ------------------------------------------------------------ registry --
@@ -829,6 +1049,10 @@ fn hello_document(games: &[u64]) -> Value {
     json!({
         "broker": true,
         "projectInit": true,
+        // `POST /places/attach` exists on this build. The plugin gates the
+        // automatic attach on it, so an older app never takes a 404 round
+        // trip on every place it opens.
+        "attach": true,
         "version": env!("CARGO_PKG_VERSION"),
         "games": games,
     })
@@ -907,6 +1131,11 @@ struct InitRequest {
     creator_type: Option<String>,
     #[serde(default)]
     creator_id: Option<u64>,
+    /// The `placeKey` the open place already carries on its `WSyncPlace`
+    /// marker (docs/places.md). The plugin sends it so the new project claims
+    /// the same key the place is already routed by.
+    #[serde(default)]
+    place_key: Option<String>,
 }
 
 impl InitRequest {
@@ -921,6 +1150,15 @@ impl InitRequest {
         self.place_name
             .as_deref()
             .is_some_and(|name| !name.trim().is_empty())
+    }
+
+    /// The marker's `placeKey`, when the plugin sent a usable one.
+    fn usable_place_key(&self) -> Option<String> {
+        self.place_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
     }
 
     /// Design 4.3's `groupId`: creator context, and only when Studio said the
@@ -997,6 +1235,255 @@ fn parse_init(body: &[u8]) -> Result<InitRequest, HttpReply> {
         request_id: id.to_ascii_lowercase(),
         ..request
     })
+}
+
+
+// ------------------------------------------------------------- the attach --
+
+/// What Studio sends to `/places/attach`. `placeId` and `gameId` are `0` for
+/// an unpublished place, which is the whole point of the route: a place with
+/// no ids still has to be reachable.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AttachRequest {
+    #[serde(default)]
+    place_id: u64,
+    #[serde(default)]
+    game_id: u64,
+    /// What the place calls itself, for the key and the folder name. Only a
+    /// name; never a path.
+    #[serde(default)]
+    name: Option<String>,
+    /// One Studio window's identity, minted by the plugin at boot. It is what
+    /// keeps two windows on two copies of the same unnamed baseplate apart.
+    session_id: String,
+}
+
+/// One attached place, as the route answers for it.
+#[derive(Debug)]
+struct Attached {
+    port: u16,
+    project: String,
+    name: String,
+    key: String,
+    place_key: Option<String>,
+}
+
+/// What `wsync open --attach-only` reported.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AttachProject {
+    project: String,
+    name: String,
+}
+
+/// Strict parse, the same shape as `/projects/init`: a JSON object, no
+/// path-shaped fields, a bounded hex session id.
+fn parse_attach(body: &[u8]) -> Result<AttachRequest, HttpReply> {
+    if body.is_empty() {
+        return Err(HttpReply::error(400, "the request had no body"));
+    }
+
+    let raw: Value = serde_json::from_slice(body)
+        .map_err(|error| HttpReply::error(400, format!("the body is not JSON: {error}")))?;
+    let Value::Object(fields) = &raw else {
+        return Err(HttpReply::error(400, "the body must be a JSON object"));
+    };
+
+    // Design 11 applies here exactly as it does to a create: an attach folder
+    // is derived, never chosen by the client.
+    if let Some(offender) = fields
+        .keys()
+        .find(|key| FORBIDDEN_FIELDS.contains(&key.to_ascii_lowercase().as_str()))
+    {
+        return Err(HttpReply::error(
+            400,
+            format!(
+                "{offender:?} is not accepted: WSync derives the folder itself and never takes a path from Studio"
+            ),
+        ));
+    }
+
+    let request: AttachRequest = serde_json::from_value(raw)
+        .map_err(|error| HttpReply::error(400, format!("the body is not an attach request: {error}")))?;
+
+    let session = request.session_id.trim();
+    if session.len() < KEY_SUFFIX_LENGTH
+        || session.len() > REQUEST_ID_MAX
+        || !session.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(HttpReply::error(
+            400,
+            format!("sessionId must be {KEY_SUFFIX_LENGTH}-{REQUEST_ID_MAX} hex characters"),
+        ));
+    }
+
+    Ok(AttachRequest {
+        session_id: session.to_ascii_lowercase(),
+        ..request
+    })
+}
+
+/// The name an attached place is addressed by, and the `placeKey` that goes
+/// into its project file.
+///
+/// A **published** place already has the one name both sides share - its
+/// place id - so the folder is that id and no key is minted: routing stays
+/// id-based, exactly as `wsync open <placeId>` leaves it.
+///
+/// An **unpublished** place has no id to share, so one is made: the place's
+/// own name, slugged, plus eight hex characters of this Studio session. The
+/// session half is what keeps two windows on two copies of the same unnamed
+/// baseplate from claiming one folder, and it is stable for as long as the
+/// window lives, so the same window re-attaching lands on the same project.
+/// The folder is that key under an `unpublished-` prefix, which is how the
+/// engine's delete rule tells a minted name from a place id.
+pub(crate) fn attach_key(
+    place_id: u64,
+    name: Option<&str>,
+    session_id: &str,
+) -> (String, Option<String>) {
+    if place_id != 0 {
+        return (place_id.to_string(), None);
+    }
+
+    let suffix: String = session_id
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .map(|character| character.to_ascii_lowercase())
+        .take(KEY_SUFFIX_LENGTH)
+        .collect();
+    let place_key = format!("{}-{suffix}", attach_slug(name));
+
+    (format!("{UNPUBLISHED_PREFIX}{place_key}"), Some(place_key))
+}
+
+/// The slug half of a minted key. `derive_slug`'s own fallback names the
+/// universe, and an unpublished place has none, so the `place-0` it would
+/// produce is shortened back to `place`.
+fn attach_slug(name: Option<&str>) -> String {
+    let slug = derive_slug(name, 0);
+
+    if slug == "place-0" {
+        return String::from("place");
+    }
+
+    let mut slug: String = slug.chars().take(KEY_SLUG_LENGTH).collect();
+
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+
+    if slug.is_empty() {
+        String::from("place")
+    } else {
+        slug
+    }
+}
+
+/// Whether the automatic attach is switched on. Absent means on: the feature
+/// is the default, and a state file written before the switch existed must
+/// not read as "off".
+fn auto_attach_enabled(document: &Map<String, Value>) -> bool {
+    document
+        .get(AUTO_ATTACH_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+/// Write the attach project by running the engine's own `wsync open
+/// --attach-only`, which is the single implementation of what a scratch
+/// project looks like.
+async fn write_attach_project(
+    directory: &Path,
+    place_id: u64,
+    game_id: u64,
+    place_key: Option<&str>,
+) -> Result<AttachProject, InitError> {
+    let binary =
+        crate::daemon::resolve_binary().map_err(|error| InitError::new(500, error.message))?;
+
+    let mut command = tokio::process::Command::new(&binary);
+    command
+        .arg("open")
+        .arg("--attach-only")
+        .arg("--into")
+        .arg(directory);
+
+    if place_id != 0 {
+        command.arg(place_id.to_string());
+    }
+    if game_id != 0 {
+        command.arg("--universe").arg(game_id.to_string());
+    }
+    if let Some(place_key) = place_key {
+        command.arg("--place-key").arg(place_key);
+    }
+
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let output = match time::timeout(ATTACH_WRITE_TIMEOUT, command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            return Err(InitError::new(
+                500,
+                format!("could not run {}: {error}", binary.display()),
+            ))
+        }
+        Err(_elapsed) => {
+            return Err(InitError::new(
+                504,
+                format!(
+                    "writing the attach project took longer than {}s",
+                    ATTACH_WRITE_TIMEOUT.as_secs()
+                ),
+            ))
+        }
+    };
+
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let detail = detail.trim();
+
+        return Err(InitError::new(
+            500,
+            format!(
+                "the attach project could not be written{}",
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", truncate(detail, 300))
+                }
+            ),
+        ));
+    }
+
+    attach_project_from(&output.stdout)
+        .ok_or_else(|| InitError::new(500, "the attach project was written but not reported"))
+}
+
+/// The engine prints one JSON document; logs, when there are any, go to
+/// stderr. Reading the last `{`-shaped line rather than the whole stream
+/// keeps a stray banner from being a failure.
+fn attach_project_from(stdout: &[u8]) -> Option<AttachProject> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('{'))
+        .next_back()
+        .and_then(|line| serde_json::from_str(line).ok())
+}
+
+fn truncate(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+
+    text.chars().take(limit).collect::<String>() + "..."
 }
 
 // -------------------------------------------------------------- the name --
@@ -1196,7 +1683,7 @@ fn choose_directory(root: &Path, base: &str) -> Result<(String, PathBuf), InitEr
 /// A name that is one path component and nothing else.
 fn is_single_component(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= MAX_SLUG_LENGTH + 4
+        && name.len() <= MAX_SLUG_LENGTH + UNPUBLISHED_PREFIX.len() + KEY_SUFFIX_LENGTH + 4
         && name != "."
         && name != ".."
         && name
@@ -2470,6 +2957,254 @@ mod tests {
     }
 
     // --- lifecycle ----------------------------------------------------------
+
+
+    // ---------------------------------------------------------- attach --
+
+    #[test]
+    fn a_published_place_attaches_under_its_own_id_and_mints_no_key() {
+        let (key, place_key) = attach_key(88120033, Some("Dungeon Demo"), "ab12cd34ef56");
+
+        assert_eq!(key, "88120033");
+        assert_eq!(place_key, None);
+    }
+
+    #[test]
+    fn an_unpublished_place_gets_a_key_from_its_name_and_this_session() {
+        let (key, place_key) = attach_key(0, Some("My Level!"), "AB12CD34EF56");
+
+        assert_eq!(place_key.as_deref(), Some("my-level-ab12cd34"));
+        assert_eq!(key, "unpublished-my-level-ab12cd34");
+
+        // Same window, same key: re-attaching lands on the same project.
+        assert_eq!(attach_key(0, Some("My Level!"), "AB12CD34EF56"), (key, place_key));
+    }
+
+    #[test]
+    fn two_windows_on_the_same_unnamed_place_do_not_share_a_key() {
+        let (first, _) = attach_key(0, Some("Baseplate"), "11111111");
+        let (second, _) = attach_key(0, Some("Baseplate"), "22222222");
+
+        assert_ne!(first, second);
+        assert!(first.starts_with("unpublished-baseplate-"));
+    }
+
+    #[test]
+    fn a_nameless_place_still_gets_a_usable_key() {
+        let (key, place_key) = attach_key(0, None, "deadbeef00");
+
+        assert_eq!(place_key.as_deref(), Some("place-deadbeef"));
+        assert_eq!(key, "unpublished-place-deadbeef");
+
+        // ...and a title with nothing ASCII in it reads the same way, rather
+        // than becoming a directory name whose bytes depend on the filesystem.
+        let (_, cyrillic) = attach_key(0, Some("Уровень"), "deadbeef00");
+        assert_eq!(cyrillic.as_deref(), Some("place-deadbeef"));
+    }
+
+    #[test]
+    fn every_minted_key_is_one_safe_path_component() {
+        for name in ["My Level!", "a/b\\c", "..", "con", "", "x".repeat(200).as_str()] {
+            let (key, _) = attach_key(0, Some(name), "ab12cd34");
+
+            assert!(key.starts_with(UNPUBLISHED_PREFIX), "{key:?}");
+            assert!(key.len() <= 64, "{key:?} is {} characters", key.len());
+            assert!(!key.ends_with('-'), "{key:?}");
+            assert!(is_single_component(&key), "{key:?} from {name:?}");
+            assert!(
+                key.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "{key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_attach_request_needs_a_hex_session_and_never_takes_a_path() {
+        let ok = parse_attach(
+            br#"{"placeId":0,"gameId":0,"name":"My Level","sessionId":"AB12CD34"}"#,
+        )
+        .expect("a well-formed request");
+        assert_eq!(ok.session_id, "ab12cd34");
+        assert_eq!(ok.place_id, 0);
+        assert_eq!(ok.name.as_deref(), Some("My Level"));
+
+        // A published place sends its ids and no name at all.
+        assert!(parse_attach(br#"{"placeId":7,"gameId":9,"sessionId":"ab12cd34"}"#).is_ok());
+
+        for (body, expected) in [
+            (&br#"{"sessionId":"nothex!!"}"#[..], "hex"),
+            (&br#"{"sessionId":"ab12"}"#[..], "hex"),
+            (&br#"{"placeId":0}"#[..], "attach request"),
+            (&br#"[]"#[..], "JSON object"),
+            (&br#""#[..], "no body"),
+            (
+                &br#"{"sessionId":"ab12cd34","path":"C:\\x"}"#[..],
+                "never takes a path",
+            ),
+        ] {
+            let reply = parse_attach(body).expect_err("should be refused");
+            let text = String::from_utf8_lossy(&reply.encode()).to_string();
+            assert!(text.contains(expected), "{expected} not in {text}");
+        }
+    }
+
+    #[test]
+    fn attach_is_on_unless_the_state_file_says_otherwise() {
+        let on: Map<String, Value> = serde_json::from_str("{}").unwrap();
+        assert!(auto_attach_enabled(&on));
+
+        let explicit: Map<String, Value> = serde_json::from_str(r#"{"autoAttach":true}"#).unwrap();
+        assert!(auto_attach_enabled(&explicit));
+
+        let off: Map<String, Value> = serde_json::from_str(r#"{"autoAttach":false}"#).unwrap();
+        assert!(!auto_attach_enabled(&off));
+    }
+
+    #[test]
+    fn the_engines_attach_report_is_read_off_its_last_json_line() {
+        let stdout = b"some banner\n{\"ok\":true,\"project\":\"C:/p/default.project.json\",\"name\":\"k\"}\n";
+        let parsed = attach_project_from(stdout).expect("the report");
+
+        assert_eq!(parsed.project, "C:/p/default.project.json");
+        assert_eq!(parsed.name, "k");
+        assert!(attach_project_from(b"not json").is_none());
+    }
+
+    /// An attach host that answers a fixed port without starting anything.
+    struct FakeAttach {
+        port: u16,
+        started: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    impl AttachHost for FakeAttach {
+        fn start(
+            &self,
+            project_id: String,
+            project_path: String,
+        ) -> Pin<Box<dyn Future<Output = Result<u16, String>> + Send>> {
+            self.started.lock().unwrap().push((project_id, project_path));
+            let port = self.port;
+            Box::pin(async move { Ok(port) })
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_off_answers_disabled_and_writes_nothing() {
+        let harness = Harness::new();
+        let mut patch = Map::new();
+        patch.insert("autoAttach".into(), Value::Bool(false));
+        storage::merge_document(&harness.state_file, patch).unwrap();
+
+        let port = harness.start().await;
+        let body = crate::loopback::post_json(
+            port,
+            "/places/attach",
+            &json!({ "placeId": 0, "gameId": 0, "name": "My Level", "sessionId": "ab12cd34" }),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap()
+        .json()
+        .unwrap();
+
+        assert_eq!(body["ok"], json!(false));
+        assert_eq!(body["disabled"], json!(true));
+        assert!(!harness.root.join(SCRATCH_DIR).exists());
+    }
+
+    #[tokio::test]
+    async fn an_attach_writes_one_scratch_project_and_answers_its_port() {
+        let Ok(binary) = std::env::var(crate::daemon::DAEMON_PATH_ENV) else {
+            eprintln!(
+                "skipping: set {} to a `wsync` binary to check the attach route end to end",
+                crate::daemon::DAEMON_PATH_ENV
+            );
+            return;
+        };
+        if !Path::new(&binary).is_file() {
+            eprintln!("skipping: {binary} is not a file");
+            return;
+        }
+
+        let harness = Harness::new();
+        let started = Arc::new(std::sync::Mutex::new(Vec::new()));
+        harness.broker.set_attach_host(Arc::new(FakeAttach {
+            port: 7979,
+            started: Arc::clone(&started),
+        }));
+
+        let port = harness.start().await;
+        let body = crate::loopback::post_json(
+            port,
+            "/places/attach",
+            &json!({ "placeId": 0, "gameId": 0, "name": "My Level", "sessionId": "ab12cd34ff" }),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap()
+        .json()
+        .unwrap();
+
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["port"], json!(7979));
+        assert_eq!(body["ephemeral"], json!(true));
+        assert_eq!(body["placeKey"], json!("my-level-ab12cd34"));
+        assert_eq!(body["key"], json!("unpublished-my-level-ab12cd34"));
+
+        // Exactly one direct child of `_places`, holding a project that claims
+        // the key and no ids.
+        let scratch = harness.root.join(SCRATCH_DIR);
+        let children: Vec<_> = fs::read_dir(&scratch).unwrap().flatten().collect();
+        assert_eq!(children.len(), 1);
+
+        let project: Value = serde_json::from_str(
+            &fs::read_to_string(scratch.join("unpublished-my-level-ab12cd34/default.project.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(project["placeKey"], json!("my-level-ab12cd34"));
+        assert_eq!(project["initialSync"], json!("keep"));
+        assert!(project.get("servePlaceIds").is_none());
+        assert!(project.get("gameId").is_none());
+
+        // Nothing about an attach reaches the Projects registry.
+        assert!(harness.projects().is_empty());
+
+        let started = started.lock().unwrap().clone();
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].0, "attach:unpublished-my-level-ab12cd34");
+
+        // The same window asking again is the same project and the same port.
+        let again = crate::loopback::post_json(
+            port,
+            "/places/attach",
+            &json!({ "placeId": 0, "gameId": 0, "name": "My Level", "sessionId": "ab12cd34ff" }),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap()
+        .json()
+        .unwrap();
+        assert_eq!(again["key"], body["key"]);
+        assert_eq!(fs::read_dir(&scratch).unwrap().flatten().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn attach_without_a_host_says_so_rather_than_panicking() {
+        let harness = Harness::new();
+        let port = harness.start().await;
+        let response = crate::loopback::post_json(
+            port,
+            "/places/attach",
+            &json!({ "placeId": 0, "gameId": 0, "sessionId": "ab12cd34" }),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status, 503);
+    }
 
     #[tokio::test]
     async fn nothing_listens_until_a_folder_is_authorized() {

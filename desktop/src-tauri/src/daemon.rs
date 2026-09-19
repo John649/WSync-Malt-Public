@@ -504,6 +504,26 @@ impl DaemonRegistry {
         data_dir: &Path,
         port: Option<u16>,
     ) -> HostResult<DaemonSession> {
+        self.start_with(project_id, project_path, data_dir, port, &[])
+            .await
+    }
+
+    /// `start`, plus extra arguments for the daemon child.
+    ///
+    /// The one caller that needs them is the attach route (`broker.rs`),
+    /// which starts a **scratch** daemon with `--ephemeral`: it stops itself
+    /// once Studio goes away and deletes the throwaway project on the way
+    /// out. Everything else about the spawn — the owner token, the ready
+    /// line, the supervisor, the heartbeat — is deliberately identical, so an
+    /// attached daemon is stopped and reaped exactly like any other.
+    pub(crate) async fn start_with(
+        &self,
+        project_id: &str,
+        project_path: &str,
+        data_dir: &Path,
+        port: Option<u16>,
+        extra: &[&str],
+    ) -> HostResult<DaemonSession> {
         let _gate = self.start_gate.lock().await;
 
         // Already serving and still answering? Hand back the session we have
@@ -532,6 +552,9 @@ impl DaemonRegistry {
         command.arg("--owner-token-env").arg(OWNER_TOKEN_ENV);
         command.arg("--data-dir").arg(data_dir);
         command.arg("--raw");
+        for argument in extra {
+            command.arg(argument);
+        }
         command.env(OWNER_TOKEN_ENV, &token);
         command
             .stdin(Stdio::null())

@@ -86,6 +86,10 @@ pub fn run() {
                 paths.state_file.clone(),
                 Arc::clone(&state_lock),
             );
+            // `POST /places/attach` starts its throwaway daemon through the
+            // same registry every served project uses, so an attached daemon
+            // is supervised, heartbeaten and reaped exactly like any other.
+            broker.set_attach_host(Arc::new(app.handle().clone()));
             app.manage(AppState {
                 paths,
                 state_lock,

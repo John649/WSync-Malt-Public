@@ -1149,7 +1149,7 @@ function installHostEventListeners() {
   onHostEvent("project-init", onProjectInit);
 
   onHostEvent("daemon:up", (session) => {
-    if (!session?.projectId) return;
+    if (!session?.projectId || isAttachDaemon(session.projectId)) return;
     app.daemonFailures.delete(session.projectId);
     setState({
       servedProjectIds: [...new Set([...servedProjectIds(), session.projectId])],
@@ -1162,7 +1162,7 @@ function installHostEventListeners() {
 
   onHostEvent("daemon:down", (event) => {
     const projectId = event?.projectId;
-    if (!projectId) return;
+    if (!projectId || isAttachDaemon(projectId)) return;
     // A `stopped` reason is our own teardown; the command already updated the
     // store and said so. Everything else is news.
     if (event.reason !== "stopped") {
@@ -1187,6 +1187,16 @@ function installHostEventListeners() {
     refreshLink();
     void pollBacklog();
   });
+}
+
+/**
+ * A throwaway daemon the broker's attach route started for an open Studio
+ * place (docs/places.md). It serves no registered project, nothing about it
+ * belongs in `state.json`, and it disappears with the Studio window — so its
+ * lifecycle events are the host's business and not the Projects view's.
+ */
+function isAttachDaemon(projectId) {
+  return typeof projectId === "string" && projectId.startsWith("attach:");
 }
 
 /** The ledger's debounced write has to land before the state file is flushed. */

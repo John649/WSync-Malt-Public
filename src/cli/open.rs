@@ -60,6 +60,17 @@ pub struct Open {
 	#[arg(long)]
 	keep: bool,
 
+	/// Write the attach project and nothing else: no Studio launch, no
+	/// daemon. The desktop app's `POST /places/attach` calls this so the
+	/// scratch project file has exactly one implementation (docs/places.md)
+	#[arg(long, hide = true, requires = "into")]
+	attach_only: bool,
+
+	/// The `placeKey` an attach project claims, for a place with no ids
+	/// (docs/places.md — "Unpublished places")
+	#[arg(long, hide = true, value_name = "KEY")]
+	place_key: Option<String>,
+
 	/// Print machine-readable JSON
 	#[arg(long)]
 	raw: bool,
@@ -82,11 +93,49 @@ impl Open {
 			_ => None,
 		};
 
+		if self.attach_only {
+			if single_place.is_none() && !self.targets.is_empty() {
+				bail!("--attach-only takes a place id or nothing at all, never a Studio path");
+			}
+
+			return self.write_attach_project(single_place);
+		}
+
 		if single_place.is_none() && !self.targets.is_empty() {
 			return self.select();
 		}
 
 		self.open_place(single_place)
+	}
+
+	/// `--attach-only`: create the scratch project for a place and report
+	/// where it landed. The caller (the desktop app's attach route) starts
+	/// the daemon itself through its own lifecycle, which is why nothing is
+	/// launched or spawned here
+	fn write_attach_project(self, place_id: Option<u64>) -> Result<()> {
+		let workspace = self.into.clone().expect("--attach-only requires --into");
+
+		std::fs::create_dir_all(&workspace)
+			.with_context(|| format!("Failed to create the attach project directory {}", workspace.to_string()))?;
+
+		let project = places::write_scratch_project(&workspace, place_id, self.universe, self.place_key.as_deref())?;
+		// Whether the auto-delete rules would own this directory. The caller
+		// decides on `--ephemeral` from this, rather than guessing at the
+		// scratch roots from outside
+		let scratch = places::is_scratch_dir(&workspace);
+
+		print_json(&json!({
+			"ok": true,
+			"project": project.to_string(),
+			"workspace": workspace.to_string(),
+			"name": places::scratch_project_name(place_id, self.place_key.as_deref()),
+			"placeId": place_id,
+			"placeKey": self.place_key,
+			"gameId": self.universe,
+			"scratch": scratch,
+		}));
+
+		Ok(())
 	}
 
 	/// The original form: select instances in the connected place
@@ -96,6 +145,8 @@ impl Open {
 			("--into", self.into.is_some()),
 			("--no-attach", self.no_attach),
 			("--keep", self.keep),
+			("--attach-only", self.attach_only),
+			("--place-key", self.place_key.is_some()),
 		] {
 			if given {
 				bail!("{flag} belongs to `wsync open <placeId>`, not to selecting Studio paths");
@@ -118,7 +169,13 @@ impl Open {
 		};
 
 		let (selected_place, selected_branch) = match places::selector() {
-			Some((place, branch)) => (Some(place), branch),
+			Some((places::Selector::Id(place), branch)) => (Some(place), branch),
+			// A key names a place that exists only as somebody's open file;
+			// there is no cloud place for Studio to be launched on
+			Some((places::Selector::Key(key), _)) => bail!(
+				"`--place {key}` names an unpublished place, which `{}` cannot launch. Open it in Studio yourself",
+				"wsync open".bold()
+			),
 			None => (None, None),
 		};
 
@@ -137,7 +194,7 @@ impl Open {
 		let entries = places::registry()?;
 		let candidates = places::candidates(&entries);
 		// A place nothing serves is the normal case here, not a failure
-		let serving = places::resolve(&candidates, place_id, selected_branch.as_deref())
+		let serving = places::resolve(&candidates, &places::Selector::Id(place_id), selected_branch.as_deref())
 			.ok()
 			.cloned();
 
@@ -243,7 +300,7 @@ impl Open {
 			)
 		})?;
 
-		let project = places::write_scratch_project(&workspace, place_id, Some(universe))?;
+		let project = places::write_scratch_project(&workspace, Some(place_id), Some(universe), None)?;
 
 		// Only a directory this command owns by name may be auto-deleted, so
 		// `--into` is always a keep
@@ -280,6 +337,37 @@ mod tests {
 		assert_eq!(as_place_id("ReplicatedStorage/Client/UI"), None);
 		assert_eq!(as_place_id(""), None);
 		assert_eq!(as_place_id("12a"), None);
+	}
+
+	#[test]
+	fn attach_only_writes_the_project_and_starts_nothing() {
+		let dir = tempfile::tempdir().unwrap();
+		let command = Open::try_parse_from([
+			"open",
+			"--attach-only",
+			"--into",
+			dir.path().to_str().unwrap(),
+			"--place-key",
+			"my-level-ab12cd34",
+		])
+		.unwrap();
+
+		command.main().unwrap();
+
+		let project = Project::load(&dir.path().join("default.project.json")).unwrap();
+
+		assert_eq!(project.place_key.as_deref(), Some("my-level-ab12cd34"));
+		assert!(project.place_ids.is_empty());
+	}
+
+	#[test]
+	fn attach_only_needs_somewhere_to_write() {
+		let error = match Open::try_parse_from(["open", "--attach-only"]) {
+			Ok(_) => panic!("--attach-only without --into should not parse"),
+			Err(error) => error.to_string(),
+		};
+
+		assert!(error.contains("--into"), "{error}");
 	}
 
 	#[test]

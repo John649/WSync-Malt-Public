@@ -6,7 +6,10 @@
 -- This module owns every decision that does not need a socket or a Roblox
 -- API:
 --
---   * candidate ordering  — the Settings `Host:Port` override first, then
+--   * candidate ordering  — the port this window was handed (a branch
+--                           clone's marker, a place marker's `DaemonPort`,
+--                           an attach the desktop app just made), then the
+--                           Settings `Host:Port` override, then
 --                           `127.0.0.1:7978-7990` (deduplicated); with
 --                           `AutoDiscover = false` the Settings candidate is
 --                           the whole list (pure manual mode)
@@ -53,6 +56,14 @@ export type Settings = {
 	--- pointless connection refusals on every boot. Ranking is unchanged — it
 	--- still has to come back MATCH_EXACT.
 	branchPort: number?,
+	--- The port the desktop app's attach route handed THIS window for THIS
+	--- session (docs/places.md). Probed first and trusted exactly, because
+	--- the daemon on the other end was started for this Studio and claims no
+	--- ids to be recognised by.
+	sessionPort: number?,
+	--- The port the place's own `WSyncPlace` marker names, when it names one.
+	--- Same shortcut as `branchPort`, same rule: still has to rank exact.
+	markerPort: number?,
 }
 
 export type PlaceIdentity = {
@@ -65,6 +76,15 @@ export type PlaceIdentity = {
 	--- The branch name, when `branch` is true: a daemon serving this branch
 	--- says so in its hello, which matches even before ids line up.
 	branchName: string?,
+	--- The `placeKey` this place carries on its `ServerStorage/WSyncPlace`
+	--- marker (docs/places.md — "Unpublished places"). A daemon whose project
+	--- names the same key ranks EXACT, which is the only way a place with no
+	--- ids is told apart from every other place with no ids.
+	placeKey: string?,
+	--- The port the desktop app's attach route handed this window this
+	--- session. A daemon answering there is this window's own, whatever it
+	--- claims — see `rankHello`.
+	sessionPort: number?,
 }
 
 export type HelloClaim = {
@@ -72,6 +92,10 @@ export type HelloClaim = {
 	placeIds: { number }?,
 	--- A branch daemon names the branch it serves (docs/branches.md).
 	branch: string?,
+	--- The `placeKey` this daemon's project claims (docs/places.md).
+	placeKey: string?,
+	--- A scratch daemon that stops itself once Studio goes away — an attach.
+	ephemeral: boolean?,
 	[string]: any,
 }
 
@@ -90,19 +114,29 @@ end
 --- Settings candidate alone.
 function Policy.candidates(settings: Settings): { Candidate }
 	local list: { Candidate } = {}
-	local branchPort = settings.branchPort
+	local seen: { [number]: boolean } = {}
 
-	if branchPort ~= nil then
-		table.insert(list, {
-			host = Policy.LOCAL_HOST,
-			port = branchPort,
-			https = false,
-		})
+	--- The hinted loopback ports, in the order they are trusted: the one this
+	--- session was handed, the branch clone's own, the place marker's.
+	local function hint(port: number?)
+		if port ~= nil and not seen[port] then
+			seen[port] = true
+
+			table.insert(list, {
+				host = Policy.LOCAL_HOST,
+				port = port,
+				https = false,
+			})
+		end
 	end
 
-	local settingsIsBranchPort = branchPort ~= nil and branchPort == settings.port and Policy.isLoopback(settings.host)
+	hint(settings.sessionPort)
+	hint(settings.branchPort)
+	hint(settings.markerPort)
 
-	if not settingsIsBranchPort then
+	local settingsIsHinted = Policy.isLoopback(settings.host) and seen[settings.port] == true
+
+	if not settingsIsHinted then
 		table.insert(list, {
 			host = settings.host,
 			port = settings.port,
@@ -117,7 +151,7 @@ function Policy.candidates(settings: Settings): { Candidate }
 	local coveredPort = if Policy.isLoopback(settings.host) then settings.port else nil
 
 	for port = Policy.PORT_MIN, Policy.PORT_MAX do
-		if port ~= coveredPort and port ~= branchPort then
+		if port ~= coveredPort and not seen[port] then
 			table.insert(list, {
 				host = Policy.LOCAL_HOST,
 				port = port,
@@ -143,13 +177,38 @@ end
 --- `.rbxl` has `GameId == 0`, so there is no universe id for either side to
 --- agree on; ids alone would leave the clone weak against every daemon and
 --- the refusal below would then refuse them all.
-function Policy.rankHello(hello: HelloClaim, place: PlaceIdentity): number
+--- `candidate` is where this hello came from, when the caller knows: it is
+--- what makes the session-port hint meaningful, since the hint is about an
+--- address rather than about anything the daemon says.
+function Policy.rankHello(hello: HelloClaim, place: PlaceIdentity, candidate: Candidate?): number
 	if place.branch ~= true then
 		-- The mirror rule: a window without a marker never binds to a daemon
 		-- that serves a branch, not even when main's own daemon is down —
 		-- that would sync the live place against a branch worktree
 		if hello.branch ~= nil and hello.branch ~= "" then
 			return Policy.MATCH_NONE
+		end
+
+		-- The session hint: the desktop app started this daemon for THIS
+		-- Studio window and told us the port. It claims no ids — it was made
+		-- for a place that has none — so nothing below would ever rank it;
+		-- what makes it exact is that we asked for it. Session state, never
+		-- written into the place, so it dies with the window.
+		if
+			candidate ~= nil
+			and place.sessionPort ~= nil
+			and candidate.port == place.sessionPort
+			and Policy.isLoopback(candidate.host)
+		then
+			return Policy.MATCH_EXACT
+		end
+
+		-- The marker rule: a place that carries a `placeKey` is reached by it.
+		-- This is the id-free half of routing (docs/places.md), so it sits
+		-- above the id rules rather than beside them — a place with no ids has
+		-- nothing else to be told apart by.
+		if place.placeKey ~= nil and place.placeKey ~= "" and hello.placeKey == place.placeKey then
+			return Policy.MATCH_EXACT
 		end
 
 		return Policy.rankStrict(hello, place)
@@ -214,8 +273,15 @@ end
 --- still wins over everything, because both are first in the list.
 ---
 --- `hellos` is sparse — a candidate that did not answer has no entry — so the
---- walk is driven by `count` rather than by `#hellos`.
-function Policy.bestIndex(hellos: { [number]: HelloClaim? }, count: number, place: PlaceIdentity): (number?, number)
+--- walk is driven by `count` rather than by `#hellos`. `candidates` is the
+--- list those indices refer to, when the caller has it: `rankHello` needs it
+--- for the session-port hint.
+function Policy.bestIndex(
+	hellos: { [number]: HelloClaim? },
+	count: number,
+	place: PlaceIdentity,
+	candidates: { Candidate }?
+): (number?, number)
 	local bestIndex: number? = nil
 	local bestRank = Policy.MATCH_NONE
 
@@ -223,7 +289,7 @@ function Policy.bestIndex(hellos: { [number]: HelloClaim? }, count: number, plac
 		local hello = hellos[index]
 
 		if hello ~= nil then
-			local rank = Policy.rankHello(hello, place)
+			local rank = Policy.rankHello(hello, place, if candidates then candidates[index] else nil)
 
 			if rank > bestRank then
 				bestIndex = index
@@ -243,6 +309,7 @@ export type StateName =
 	"idle"
 	| "scanning"
 	| "found"
+	| "attaching"
 	| "create-ready"
 	| "create-confirm"
 	| "creating"
@@ -265,6 +332,9 @@ export type State = {
 	-- `games` list names the open place's GameId), so the POST adopts and
 	-- serves it instead of creating anything — no confirm ceremony needed
 	known: boolean?,
+	-- found: this connection is a temporary attach (docs/places.md) — a
+	-- scratch daemon that disappears with this Studio window
+	temporary: boolean?,
 	-- waiting-daemon: bounded re-scan progress
 	attempt: number?,
 	total: number?,
@@ -284,7 +354,10 @@ export type EventKind =
 	-- Async completions (require a matching generation)
 	| "scan-found"
 	| "scan-none-broker"
+	| "scan-none-attach" -- a broker that may hand this window a scratch daemon
 	| "scan-none-no-broker"
+	| "attach-ok"
+	| "attach-none"
 	| "create-ok"
 	| "create-error"
 	| "wait-progress"
@@ -299,6 +372,7 @@ export type Event = {
 	project: string?,
 	broker: any?,
 	known: boolean?,
+	temporary: boolean?,
 	attempt: number?,
 	total: number?,
 	message: string?,
@@ -307,10 +381,22 @@ export type Event = {
 --- What App must do after a transition: run the candidate scan, hand the
 --- resolved address to Core, POST `/projects/init`, or start the bounded
 --- daemon wait.
-export type Effect = "scan" | "connect" | "create" | "wait"
+export type Effect = "scan" | "connect" | "create" | "wait" | "attach"
 
 local WAIT_EXHAUSTED_MESSAGE = "The daemon did not appear — check the WSync app, then retry"
 local CREATE_FAILED_MESSAGE = "the WSync app could not create the project"
+
+--- The line the connected card shows while the connection is a temporary
+--- attach: a scratch daemon that disappears with this Studio window
+--- (docs/places.md). Nil for an ordinary project connection, which is what
+--- the card shows nothing extra for.
+function Policy.temporaryNote(hello: HelloClaim?): string?
+	if hello == nil or hello.ephemeral ~= true then
+		return nil
+	end
+
+	return "Temporary attach — nothing is written to disk; it closes with this window"
+end
 
 function Policy.initialState(): State
 	return {
@@ -348,7 +434,7 @@ function Policy.step(state: State, event: Event): (State, Effect?)
 			return make("scanning", state.generation + 1), "scan"
 		end
 	elseif kind == "cancel" then
-		if state.name == "scanning" or state.name == "found" then
+		if state.name == "scanning" or state.name == "found" or state.name == "attaching" then
 			return make("idle", state.generation + 1), nil
 		elseif state.name == "waiting-daemon" then
 			return make("create-ready", state.generation + 1, { broker = state.broker, known = state.known }), nil
@@ -400,6 +486,39 @@ function Policy.step(state: State, event: Event): (State, Effect?)
 				return make("create-ready", state.generation, {
 					broker = event.broker,
 					known = event.known == true,
+				}),
+					nil
+			end
+		elseif kind == "scan-none-attach" then
+			-- No daemon, but a broker that can hand this window a throwaway
+			-- one. No click: the whole point of Attach is that opening a place
+			-- is enough (docs/places.md). The fall-back is the ordinary
+			-- create-ready card, which `attach-none` returns to, so a refusal
+			-- or a switched-off setting costs nothing but a round trip.
+			if state.name == "scanning" then
+				return make("attaching", state.generation, {
+					broker = event.broker,
+					known = event.known == true,
+				}),
+					"attach"
+			end
+		elseif kind == "attach-ok" then
+			if state.name == "attaching" then
+				return make("found", state.generation, {
+					host = event.host,
+					port = event.port,
+					project = event.project,
+					temporary = true,
+				}),
+					"connect"
+			end
+		elseif kind == "attach-none" then
+			-- The broker said no (switched off, or it could not). Show what
+			-- the card would have shown without the attach at all.
+			if state.name == "attaching" then
+				return make("create-ready", state.generation, {
+					broker = state.broker,
+					known = state.known,
 				}),
 					nil
 			end
@@ -493,6 +612,15 @@ function Policy.describe(state: State, env: Env): Descriptor
 			action = "Cancel",
 			back = false,
 		}
+	elseif name == "attaching" then
+		local placeName = if env.placeName ~= "" then env.placeName else "this place"
+
+		return {
+			status = `Attaching to '{placeName}' — temporary, nothing is written to disk…`,
+			dot = "amber" :: Dot,
+			action = "Cancel",
+			back = false,
+		}
 	elseif name == "found" then
 		local project = state.project or "project"
 		local where = if state.host == nil or Policy.isLoopback(state.host :: string)
@@ -500,7 +628,9 @@ function Policy.describe(state: State, env: Env): Descriptor
 			else `{state.host}:{state.port}`
 
 		return {
-			status = `Found '{project}' on {where} — connecting…`,
+			status = if state.temporary
+				then `Attached temporarily on {where} — connecting…`
+				else `Found '{project}' on {where} — connecting…`,
 			dot = "green" :: Dot,
 			action = "Cancel",
 			back = false,

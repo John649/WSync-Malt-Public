@@ -80,10 +80,10 @@ pub struct Cli {
 	#[arg(short = 'B', long, global = true)]
 	backtrace: bool,
 
-	/// Address the daemon serving this place id instead of a project
-	/// directory (docs/places.md)
-	#[arg(long, global = true, value_name = "PLACE-ID")]
-	place: Option<u64>,
+	/// Address the daemon serving this place instead of a project directory:
+	/// a place id, or the `placeKey` of an unpublished one (docs/places.md)
+	#[arg(long, global = true, value_name = "PLACE-ID | PLACE-KEY")]
+	place: Option<String>,
 
 	/// With --place, which branch's daemon to take when several serve the
 	/// place; `main` selects the branchless one

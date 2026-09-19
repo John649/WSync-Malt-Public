@@ -89,6 +89,7 @@ local Log = require(WSync.Log)
 local Dom = require(WSync.Lib.Dom)
 local Base64 = require(WSync.Lib.Base64)
 local Branch = require(WSync.Branch)
+local Place = require(WSync.Place)
 local Hex = require(WSync.Transport.Hex)
 local Http = require(WSync.Transport.Http)
 local generateRef = require(WSync.Helpers.generateRef)
@@ -365,7 +366,10 @@ function Journal.isExcluded(instance: Instance, service: Instance): boolean
 		return true
 	end
 
-	return Branch.isMarker(instance)
+	-- The two markers WSync ever leaves in a place: the branch clone's
+	-- (docs/branches.md) and the place key's (docs/places.md). Neither is
+	-- numbered, and neither reaches disk.
+	return Branch.isMarker(instance) or Place.isMarker(instance)
 end
 
 local function serviceIdOf(service: Instance): string

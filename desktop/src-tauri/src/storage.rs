@@ -35,6 +35,11 @@ pub(crate) const STATE_KEYS: &[&str] = &[
     // a project record, because it is an observation cache and not registry
     // truth — losing it costs a sort order, nothing else.
     "lastEdited",
+    // docs/places.md's Attach: whether a Studio that finds no daemon for its
+    // place may be handed a throwaway one automatically. Absent means on —
+    // the feature is the default, and a state file written before it existed
+    // must not read as "off".
+    "autoAttach",
 ];
 
 /// The shape a fresh install starts from. Also fills gaps in an older document,
@@ -49,6 +54,7 @@ pub(crate) fn default_document() -> Map<String, Value> {
     document.insert("appearanceTheme".into(), Value::String("system".into()));
     document.insert("lastView".into(), Value::String("projects".into()));
     document.insert("lastEdited".into(), Value::Object(Map::new()));
+    document.insert("autoAttach".into(), Value::Bool(true));
     document
 }
 

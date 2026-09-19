@@ -118,7 +118,7 @@ impl Target {
 				bail!("--place selects the daemon on its own; drop --project/--port");
 			}
 
-			return Self::resolve_place(place, branch.as_deref());
+			return Self::resolve_place(&place, branch.as_deref());
 		}
 
 		let project_path = project::resolve(targeting.project.clone().unwrap_or_default())?;
@@ -183,7 +183,7 @@ impl Target {
 	/// The place is resolved against every runtime record on this machine
 	/// ([`places::resolve`] owns the rules), so the project identity used for
 	/// verification is the one the chosen daemon reported for itself
-	fn resolve_place(place: u64, branch: Option<&str>) -> Result<Self> {
+	fn resolve_place(place: &places::Selector, branch: Option<&str>) -> Result<Self> {
 		let entries = places::registry()?;
 		let candidates = places::candidates(&entries);
 		let chosen = places::resolve(&candidates, place, branch)?;
@@ -200,8 +200,10 @@ impl Target {
 			daemon::read_record(&daemon::runtime_paths(&state_dir, &chosen.canonical).record).unwrap_or_default();
 
 		debug!(
-			"Live target: place {place} served by {} on port {}",
-			chosen.project, chosen.port
+			"Live target: {} served by {} on port {}",
+			place.describe(),
+			chosen.project,
+			chosen.port
 		);
 
 		Ok(Self {
@@ -272,6 +274,15 @@ pub struct Hello {
 	/// on every non-branch project, which `--place` reads as main
 	#[serde(default)]
 	pub branch: Option<String>,
+	/// The project's `placeKey` (docs/places.md — "Unpublished places"), when
+	/// it names one. Absent on a daemon build that predates the field, which
+	/// reads the same as "this project has no key"
+	#[serde(default)]
+	pub place_key: Option<String>,
+	/// A scratch daemon that stops itself once Studio goes away. Absent on a
+	/// daemon build that predates the field, which reads as "not ephemeral"
+	#[serde(default)]
+	pub ephemeral: bool,
 	/// The Studio plugin holding the live bridge. Absent on a daemon build
 	/// that predates the field, which reads the same as "none connected" —
 	/// `wsync places` prints it, nothing decides on it

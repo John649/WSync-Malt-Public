@@ -99,6 +99,11 @@ pub(crate) struct ProjectFacts {
     /// Design 4.3's WSync extension: creator context, when Studio said the
     /// place belongs to a group.
     pub(crate) group_id: Option<u64>,
+    /// The `placeKey` the open place already carries on its `WSyncPlace`
+    /// marker (docs/places.md — "Unpublished places"). Carried into the new
+    /// project file so a place that reached a scratch daemon by key reaches
+    /// the permanent project by the same key from now on.
+    pub(crate) place_key: Option<String>,
 }
 
 /// The place tree, with the Roblox ids filled in (Design 4.3).
@@ -128,6 +133,9 @@ pub(crate) fn project_document(facts: &ProjectFacts) -> Value {
         document.insert("groupId".into(), json!(group_id));
     }
     document.insert("placeIds".into(), json!(facts.place_ids));
+    if let Some(place_key) = facts.place_key.as_deref().map(str::trim).filter(|key| !key.is_empty()) {
+        document.insert("placeKey".into(), json!(place_key));
+    }
     Value::Object(document)
 }
 
@@ -193,12 +201,15 @@ mod tests {
             game_id: 123,
             place_ids: vec![456, 789],
             group_id: Some(42),
+            place_key: Some("my-level-ab12cd34".into()),
         });
 
         assert_eq!(document["name"], "My \"Game\"");
         assert_eq!(document["gameId"], 123);
         assert_eq!(document["placeIds"], json!([456, 789]));
         assert_eq!(document["groupId"], 42);
+        // The key the place already carries, carried on rather than reminted.
+        assert_eq!(document["placeKey"], "my-level-ab12cd34");
         // Design 7.0: code scope, stated rather than inherited.
         assert_eq!(document["scope"], "code");
 
@@ -234,8 +245,10 @@ mod tests {
             game_id: 1,
             place_ids: vec![],
             group_id: None,
+            place_key: None,
         });
         assert!(document.get("groupId").is_none());
+        assert!(document.get("placeKey").is_none());
         assert_eq!(document["placeIds"], json!([]));
     }
 
@@ -252,6 +265,7 @@ mod tests {
                 game_id: 7,
                 place_ids: vec![8],
                 group_id: None,
+                place_key: None,
             },
         )
         .unwrap();

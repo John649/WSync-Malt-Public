@@ -139,6 +139,24 @@ return function(props: Props): { Instance }
 			TextWrapped = true,
 			TextXAlignment = Enum.TextXAlignment.Right,
 		},
+		-- Attach (docs/places.md): one line saying this connection is
+		-- temporary. The daemon on the other end was made for this window,
+		-- holds nothing on disk, and goes away with it — which the card has
+		-- to say, because everything else about it looks like a project.
+		Text {
+			Size = UDim2.fromScale(1, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			Text = Computed(function(use)
+				return use(props.App.attachNote) or ""
+			end),
+			Visible = Computed(function(use)
+				return use(props.App.attachNote) ~= nil
+			end),
+			Color = REVIEW_COLOR,
+			TextSize = Theme.TextSize.Small,
+			TextWrapped = true,
+			TextXAlignment = Enum.TextXAlignment.Right,
+		},
 		Container {
 			Size = UDim2.fromScale(1, 0),
 			[Children] = {

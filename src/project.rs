@@ -219,6 +219,14 @@ pub struct Project {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub branch: Option<String>,
 
+	/// A name for a place that has no ids to be addressed by (docs/places.md
+	/// — "Unpublished places"). Reported by `/hello`, and matched against the
+	/// `ServerStorage/WSyncPlace` marker the plugin leaves in the place, so an
+	/// unpublished place reaches the daemon that serves it without a place id
+	/// or a universe id ever existing
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub place_key: Option<String>,
+
 	#[serde(alias = "globIgnorePaths", default, skip_serializing_if = "Vec::is_empty")]
 	pub ignore_globs: Vec<Glob>,
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]

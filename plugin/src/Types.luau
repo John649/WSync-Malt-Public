@@ -75,6 +75,13 @@ export type DaemonHello = {
 	canonicalProject: string?,
 	gameId: number?,
 	placeIds: { number }?,
+	--- The project's `placeKey` (docs/places.md — "Unpublished places"), when
+	--- it names one. A place carrying the same key on its `WSyncPlace` marker
+	--- matches this daemon exactly, whatever the ids say
+	placeKey: string?,
+	--- A scratch daemon that stops itself once Studio goes away — an attach.
+	--- Absent on a daemon build that predates the field, which reads as false
+	ephemeral: boolean?,
 	bootId: string?,
 	pid: number?,
 	port: number?,

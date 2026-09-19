@@ -9,6 +9,9 @@
 --   * published place  — only daemons whose `gameId` equals `game.GameId`
 --                        (preferring one whose `placeIds` include
 --                        `game.PlaceId`; a claimless daemon never matches)
+--   * marked place      — whatever its ids, a daemon whose project names the
+--                        same `placeKey` as the place's `ServerStorage/
+--                        WSyncPlace` marker matches exactly (docs/places.md)
 --   * unpublished place — the first responding daemon with no gameId claim
 --
 -- `AutoDiscover = false` restricts the scan to the Settings candidate alone
@@ -31,6 +34,14 @@
 -- candidate list with bounded, cancellable retries until the project's
 -- daemon answers (the broker stamps the project's gameId, so the strict
 -- match holds).
+--
+-- Attach (docs/places.md): when the broker also advertises `attach: true`,
+-- the no-daemon case does not stop at an offer. `attachPlace` asks for a
+-- throwaway daemon for the open place and connects to the port it answers
+-- with — no click, nothing written to disk, and the whole thing gone when the
+-- window closes. The port is trusted for this session alone (`sessionPort`),
+-- because a scratch daemon for an unpublished place claims no ids that any
+-- ranking rule could recognise it by.
 
 local WSync = script:FindFirstAncestor("WSync")
 
@@ -41,6 +52,7 @@ local Transport = require(WSync.Transport)
 local Config = require(WSync.Config)
 local Broker = require(WSync.Broker)
 local Branch = require(WSync.Branch)
+local Place = require(WSync.Place)
 local Log = require(WSync.Log)
 local Hex = require(WSync.Transport.Hex)
 local generateRef = require(WSync.Helpers.generateRef)
@@ -80,7 +92,41 @@ local function candidates(): { Policy.Candidate }
 		https = Config:get("Https") == true,
 		autoDiscover = Config:get("AutoDiscover") == true,
 		branchPort = if identity ~= nil then identity.daemonPort else nil,
+		sessionPort = Discovery.sessionPort,
+		-- A branch clone answers only to its branch daemon, so a place marker
+		-- left behind on the place it was cloned from must not pull the scan
+		-- at a daemon it can never match
+		markerPort = if identity == nil then Place.daemonPort() else nil,
 	})
+end
+
+--- The port the desktop app's attach route handed THIS Studio window. Session
+--- state on purpose: it is never written into the place, so it cannot outlive
+--- the window or reach another one, and a daemon that answers there is only
+--- trusted while this value stands (`Policy.rankHello`).
+Discovery.sessionPort = nil :: number?
+
+--- Remember (or forget, with nil) the attach port for this session.
+function Discovery.setSessionPort(port: number?)
+	Discovery.sessionPort = port
+end
+
+--- The open place as the ranking rules see it. A branch clone is whatever
+--- `Branch` says it is; everything else may additionally carry a `placeKey`
+--- marker, which is the only name an unpublished place has.
+function Discovery.identity(): Policy.PlaceIdentity
+	local identity = Branch.current()
+
+	return {
+		gameId = game.GameId,
+		placeId = game.PlaceId,
+		branch = identity ~= nil,
+		branchName = if identity ~= nil then identity.name else nil,
+		-- The marker rules for a branch clone are untouched: a clone ranks on
+		-- its branch name and nothing else, so a place key is not even read
+		placeKey = if identity == nil then Place.key() else nil,
+		sessionPort = if identity == nil then Discovery.sessionPort else nil,
+	}
 end
 
 --- How long the whole concurrent probe pass may take. On Windows every probe
@@ -113,14 +159,7 @@ function Discovery.scan(shouldContinue: (() -> boolean)?): Promise.TypedPromise<
 		-- On a branch clone `game.PlaceId` is the synthetic id Branch.apply
 		-- stamped at boot, and `branch` makes Policy refuse anything below an
 		-- exact match, so the clone never attaches to main's daemon.
-		local identity = Branch.current()
-
-		local place: Policy.PlaceIdentity = {
-			gameId = game.GameId,
-			placeId = game.PlaceId,
-			branch = identity ~= nil,
-			branchName = if identity ~= nil then identity.name else nil,
-		}
+		local place = Discovery.identity()
 
 		local list = candidates()
 		local total = #list
@@ -167,7 +206,7 @@ function Discovery.scan(shouldContinue: (() -> boolean)?): Promise.TypedPromise<
 
 				local hello = hellos[index]
 
-				if hello ~= nil and Policy.rankHello(hello, place) >= Policy.MATCH_EXACT then
+				if hello ~= nil and Policy.rankHello(hello, place, list[index]) >= Policy.MATCH_EXACT then
 					return index
 				end
 			end
@@ -200,7 +239,7 @@ function Discovery.scan(shouldContinue: (() -> boolean)?): Promise.TypedPromise<
 			return resolve(nil)
 		end
 
-		local bestIndex = Policy.bestIndex(hellos, total, place)
+		local bestIndex = Policy.bestIndex(hellos, total, place, list)
 
 		return resolve(if bestIndex ~= nil then matchAt(bestIndex) else nil)
 	end)
@@ -316,6 +355,10 @@ local function placeInfo(): Broker.PlaceInfo
 		placeName = placeName,
 		creatorType = creatorType,
 		creatorId = creatorId,
+		-- A place already routed by a key keeps it: the project the app is
+		-- about to create claims the same key, so the marker already in the
+		-- place points at it from the next connect on (docs/places.md)
+		placeKey = Place.key(),
 	}
 end
 
@@ -356,6 +399,46 @@ function Discovery.createProject(broker: BrokerMatch)
 		Log.info(`Create Project: '{result.slug}' ({result.status})`)
 
 		return resolve(result)
+	end)
+end
+
+--- `POST /places/attach` to the broker for the open place (docs/places.md).
+--- Resolves one table — `{attached}` on success, `{message, disabled}` when
+--- the app refused or has the flow switched off. Never rejects: a refusal is
+--- a fall-back to the ordinary no-daemon card, not an error page.
+function Discovery.attachPlace(broker: BrokerMatch)
+	return Promise.new(function(resolve)
+		local body = Broker.shapeAttachRequest(placeInfo(), Place.SessionId)
+
+		if body == nil then
+			return resolve({ message = "could not describe this place to the WSync app" })
+		end
+
+		local responseOk, response = pcall(function()
+			return Http.postJson(`http://{broker.host}:{broker.port}/places/attach`, body):expect()
+		end)
+
+		if not responseOk then
+			return resolve({ message = "the WSync app stopped answering — is it still running?" })
+		end
+
+		local decodedOk, decoded = pcall(function()
+			return response:decode()
+		end)
+
+		if not decodedOk then
+			return resolve({ message = "the WSync app answered with an unreadable response" })
+		end
+
+		local attached, failure, disabled = Broker.parseAttachResponse(decoded)
+
+		if attached == nil then
+			return resolve({ message = failure or "the WSync app refused the attach", disabled = disabled })
+		end
+
+		Log.info(`Attach: temporary daemon on port {attached.port}`)
+
+		return resolve({ attached = attached })
 	end)
 end
 

@@ -29,6 +29,16 @@ pub struct Hello {
 	branch: Option<String>,
 	game_id: Option<u64>,
 	place_ids: Vec<u64>,
+	/// The project's `placeKey` (docs/places.md — "Unpublished places"): the
+	/// name a place with no ids is addressed by. Absent on every project that
+	/// does not set one, which is most of them
+	#[serde(skip_serializing_if = "Option::is_none")]
+	place_key: Option<String>,
+	/// A scratch place daemon that deletes itself and its project once Studio
+	/// goes away (`wsync open` attach mode, and the desktop app's
+	/// `POST /places/attach`). The plugin reads it to say the connection is
+	/// temporary; `wsync places` reads its own runtime record instead
+	ephemeral: bool,
 	boot_id: String,
 	pid: u32,
 	port: u16,
@@ -55,7 +65,7 @@ pub struct PluginIdentity {
 pub async fn main(State(state): State<AppState>) -> Json<Hello> {
 	trace!("Received request: hello");
 
-	let (name, project_path, game_id, place_ids, scope, branch) = {
+	let (name, project_path, game_id, place_ids, place_key, scope, branch) = {
 		let project = state.core.project();
 
 		(
@@ -63,6 +73,7 @@ pub async fn main(State(state): State<AppState>) -> Json<Hello> {
 			project.path.clone(),
 			project.game_id,
 			project.place_ids.clone(),
+			project.place_key.clone(),
 			project.scope(),
 			project.branch.clone(),
 		)
@@ -86,6 +97,8 @@ pub async fn main(State(state): State<AppState>) -> Json<Hello> {
 		branch,
 		game_id,
 		place_ids,
+		place_key,
+		ephemeral: state.identity.ephemeral,
 		boot_id: state.identity.boot_id.clone(),
 		pid: process::id(),
 		port: state.identity.port,

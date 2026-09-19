@@ -54,15 +54,62 @@ pub const SCRATCH_DIR: &str = "_places";
 /// call site. A global option reaches the same commands without touching any
 /// of them, and this is where the parsed value is parked for
 /// [`Target::resolve`] to pick up.
-static SELECTOR: Mutex<Option<(u64, Option<String>)>> = Mutex::new(None);
+static SELECTOR: Mutex<Option<(Selector, Option<String>)>> = Mutex::new(None);
+
+/// What `--place` named: a place id, or the `placeKey` of a place that has no
+/// ids to be named by (docs/places.md — "Unpublished places").
+///
+/// The two cannot collide: a place id is digits only, and a key never is —
+/// every key the broker mints carries a `-<hex>` suffix, and one written by
+/// hand is refused as a key only if it happens to be all digits, in which case
+/// it *is* a place id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selector {
+	Id(u64),
+	Key(String),
+}
+
+impl Selector {
+	/// A single all-digit argument is a place id; anything else is a key
+	pub fn parse(text: &str) -> Self {
+		let text = text.trim();
+
+		if !text.is_empty() && text.chars().all(|character| character.is_ascii_digit()) {
+			if let Ok(id) = text.parse() {
+				return Self::Id(id);
+			}
+		}
+
+		Self::Key(text.to_owned())
+	}
+
+	/// `place 128374926` / `place key `my-level-ab12cd34`` — the phrase every
+	/// message about this selector uses
+	pub fn describe(&self) -> String {
+		match self {
+			Self::Id(id) => format!("place {id}"),
+			Self::Key(key) => format!("place key `{key}`"),
+		}
+	}
+}
+
+impl std::fmt::Display for Selector {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Id(id) => write!(formatter, "{id}"),
+			Self::Key(key) => write!(formatter, "{key}"),
+		}
+	}
+}
 
 /// Records the parsed `--place`/`--branch`. Called once, from `Cli::main`
-pub fn set_selector(place: Option<u64>, branch: Option<String>) {
-	*SELECTOR.lock().unwrap_or_else(|error| error.into_inner()) = place.map(|place| (place, branch));
+pub fn set_selector(place: Option<String>, branch: Option<String>) {
+	*SELECTOR.lock().unwrap_or_else(|error| error.into_inner()) =
+		place.map(|place| (Selector::parse(&place), branch));
 }
 
 /// The place selector this invocation carries, if any
-pub fn selector() -> Option<(u64, Option<String>)> {
+pub fn selector() -> Option<(Selector, Option<String>)> {
 	SELECTOR.lock().unwrap_or_else(|error| error.into_inner()).clone()
 }
 
@@ -89,6 +136,9 @@ pub struct Candidate {
 	pub port: u16,
 	pub place_ids: Vec<u64>,
 	pub game_id: Option<u64>,
+	/// The `placeKey` this daemon's project claims, when it sets one
+	/// (docs/places.md — "Unpublished places")
+	pub place_key: Option<String>,
 	/// The branch this daemon serves; `None` is main (or any non-branch
 	/// project), which is what an unqualified `--place` prefers
 	pub branch: Option<String>,
@@ -100,8 +150,11 @@ impl Candidate {
 		matches!(self.source, ClaimSource::Live)
 	}
 
-	fn claims(&self, place: u64) -> bool {
-		self.place_ids.contains(&place)
+	fn claims(&self, place: &Selector) -> bool {
+		match place {
+			Selector::Id(id) => self.place_ids.contains(id),
+			Selector::Key(key) => self.place_key.as_deref() == Some(key.as_str()),
+		}
 	}
 
 	/// `project (port 7970, branch ui-pass)` — the shape every ambiguity
@@ -137,15 +190,23 @@ fn means_main(branch: &str) -> bool {
 /// 5. anything still tied is ambiguous and refuses, listing the candidates.
 ///
 /// Pure on purpose: the probing lives in [`candidates`], the policy here.
-pub fn resolve<'a>(candidates: &'a [Candidate], place: u64, branch: Option<&str>) -> Result<&'a Candidate> {
+pub fn resolve<'a>(candidates: &'a [Candidate], place: &Selector, branch: Option<&str>) -> Result<&'a Candidate> {
 	let claiming: Vec<&Candidate> = candidates.iter().filter(|candidate| candidate.claims(place)).collect();
 
 	if claiming.is_empty() {
+		let open = match place {
+			Selector::Id(id) => format!("wsync open {id}"),
+			// There is nothing to launch Studio on for a key: the place it
+			// names exists only as a file somebody already has open
+			Selector::Key(_) => String::from("wsync daemon start --project <path>"),
+		};
+
 		bail!(
-			"No WSync daemon claims place {place}. Start one for the project that serves it \
+			"No WSync daemon claims {}. Start one for the project that serves it \
 			 (`{}`), or open the place with `{}`",
+			place.describe(),
 			"wsync daemon start --project <path>".bold(),
-			format!("wsync open {place}").bold()
+			open.bold()
 		);
 	}
 
@@ -167,7 +228,8 @@ pub fn resolve<'a>(candidates: &'a [Candidate], place: u64, branch: Option<&str>
 		let wanted = branch.unwrap_or_default();
 
 		bail!(
-			"No daemon serving place {place} is on branch `{wanted}`. Daemons claiming it: {}",
+			"No daemon serving {} is on branch `{wanted}`. Daemons claiming it: {}",
+			place.describe(),
 			describe_all(&claiming)
 		);
 	}
@@ -195,8 +257,9 @@ pub fn resolve<'a>(candidates: &'a [Candidate], place: u64, branch: Option<&str>
 	}
 
 	bail!(
-		"Place {place} is served by {} daemons: {}. Narrow it with --branch <name> (or `--branch main`), \
+		"The {} is served by {} daemons: {}. Narrow it with --branch <name> (or `--branch main`), \
 		 or address one directly with --project/--port",
+		place.describe(),
 		pool.len(),
 		describe_all(&pool)
 	)
@@ -230,6 +293,7 @@ pub struct ProjectClaim {
 	pub name: String,
 	pub game_id: Option<u64>,
 	pub place_ids: Vec<u64>,
+	pub place_key: Option<String>,
 	pub branch: Option<String>,
 }
 
@@ -278,14 +342,34 @@ impl DaemonEntry {
 		}
 	}
 
+	/// The `placeKey` this daemon claims, its own live answer first
+	/// (docs/places.md — "Unpublished places")
+	pub fn place_key(&self) -> Option<String> {
+		match &self.hello {
+			Some(hello) => hello.place_key.clone(),
+			None => self.project.as_ref().and_then(|project| project.place_key.clone()),
+		}
+	}
+
 	/// The project directory this daemon serves
 	pub fn workspace(&self) -> PathBuf {
 		Path::new(&self.record.project).get_parent().to_path_buf()
 	}
 
-	/// A scratch place project created by `wsync open` attach mode
+	/// Whether this daemon stops itself once Studio goes away. The daemon's
+	/// own `/hello` is the authority; the runtime record answers for one that
+	/// is no longer there to ask
+	pub fn ephemeral(&self) -> bool {
+		match &self.hello {
+			Some(hello) => hello.ephemeral,
+			None => self.record.ephemeral,
+		}
+	}
+
+	/// A scratch place project created by `wsync open` attach mode, or by the
+	/// desktop app's `POST /places/attach`
 	pub fn is_attach(&self) -> bool {
-		self.record.ephemeral || is_scratch_dir(&self.workspace())
+		self.ephemeral() || self.record.ephemeral || is_scratch_dir(&self.workspace())
 	}
 
 	pub fn candidate(&self) -> Candidate {
@@ -295,6 +379,7 @@ impl DaemonEntry {
 			port: self.hello.as_ref().map_or(self.record.port, |hello| hello.port),
 			place_ids: self.place_ids(),
 			game_id: self.game_id(),
+			place_key: self.place_key(),
 			branch: self.branch(),
 			source: if self.hello.is_some() {
 				ClaimSource::Live
@@ -364,6 +449,7 @@ pub fn registry() -> Result<Vec<DaemonEntry>> {
 						name: project.name.clone(),
 						game_id: project.game_id,
 						place_ids: project.place_ids.clone(),
+						place_key: project.place_key.clone(),
 						branch: project.branch.clone(),
 					});
 
@@ -474,18 +560,49 @@ fn scratch_roots() -> Vec<PathBuf> {
 	roots
 }
 
+/// The prefix every scratch directory for an *unpublished* place carries.
+/// A published place has a place id to be named by; an unpublished one has
+/// only the key the desktop app minted for it, and the prefix is what keeps
+/// the auto-delete rule as narrow for a key as it is for an id
+pub const UNPUBLISHED_PREFIX: &str = "unpublished-";
+
+/// Longest scratch directory name accepted. The key carries a slug and a hex
+/// suffix; anything past this is not one of ours
+const MAX_SCRATCH_NAME: usize = 96;
+
+/// A directory name a scratch place project is allowed to have: a place id
+/// (digits only), or `unpublished-<slug>-<hex>` — one path component of
+/// `[a-z0-9-]`, no dots and no separators, so it can name nothing but a
+/// direct child
+pub fn is_scratch_name(name: &str) -> bool {
+	if name.is_empty() || name.len() > MAX_SCRATCH_NAME {
+		return false;
+	}
+
+	if name.chars().all(|character| character.is_ascii_digit()) {
+		return true;
+	}
+
+	name.starts_with(UNPUBLISHED_PREFIX)
+		&& name.len() > UNPUBLISHED_PREFIX.len()
+		&& !name.ends_with('-')
+		&& name
+			.chars()
+			.all(|character| character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-')
+}
+
 /// Whether `dir` is a scratch place project this tool may delete.
 ///
 /// The auto-delete is the only destructive thing place routing does, so the
-/// rule is deliberately narrow: the directory must be named after a place id
-/// (digits only) and sit *directly* inside one of the two scratch roots.
-/// A project the user pointed at with `--into` never matches, and neither
-/// does anything else on disk
+/// rule is deliberately narrow: the directory must carry a scratch name — a
+/// place id, or the `unpublished-` key an attach minted — and sit *directly*
+/// inside one of the two scratch roots. A project the user pointed at with
+/// `--into` never matches, and neither does anything else on disk
 pub fn is_scratch_dir(dir: &Path) -> bool {
 	let named_after_a_place = dir
 		.file_name()
 		.and_then(|name| name.to_str())
-		.is_some_and(|name| !name.is_empty() && name.chars().all(|character| character.is_ascii_digit()));
+		.is_some_and(is_scratch_name);
 
 	if !named_after_a_place {
 		return false;
@@ -527,7 +644,16 @@ fn normalize(path: &Path) -> String {
 /// to *reach* a place, not to reconcile with it, so a connect must move
 /// nothing in either direction. Code scope keeps the projection to scripts
 /// and folders
-pub fn write_scratch_project(dir: &Path, place_id: u64, game_id: Option<u64>) -> Result<PathBuf> {
+pub fn write_scratch_project(
+	dir: &Path,
+	place_id: Option<u64>,
+	game_id: Option<u64>,
+	place_key: Option<&str>,
+) -> Result<PathBuf> {
+	if place_id.is_none() && place_key.is_none() {
+		bail!("A scratch place project needs a place id or a place key to be addressed by");
+	}
+
 	let project_path = dir.join("default.project.json");
 
 	for service in SCRATCH_SERVICES {
@@ -554,26 +680,48 @@ pub fn write_scratch_project(dir: &Path, place_id: u64, game_id: Option<u64>) ->
 	}
 
 	let project = json!({
-		"name": format!("place-{place_id}"),
+		"name": scratch_project_name(place_id, place_key),
 		"scope": "code",
 		"initialSync": "keep",
-		"servePlaceIds": [place_id],
+		"servePlaceIds": place_id.map(|id| vec![id]).unwrap_or_default(),
 		"gameId": game_id,
+		"placeKey": place_key,
 		"ignoreGlobs": ["**/.git/**", "**/.wsync-*/**"],
 		"tree": Value::Object(tree),
 	});
 
-	// `gameId: null` would fail the project parser's stricter readings; drop
-	// the key entirely when the universe is unknown
+	// A null would fail the project parser's stricter readings, and an empty
+	// `servePlaceIds` is a claim on nothing; drop each key that has no value
 	let mut project = project;
+	let fields = project.as_object_mut().expect("object");
+
 	if game_id.is_none() {
-		project.as_object_mut().expect("object").remove("gameId");
+		fields.remove("gameId");
+	}
+
+	if place_key.is_none() {
+		fields.remove("placeKey");
+	}
+
+	if place_id.is_none() {
+		fields.remove("servePlaceIds");
 	}
 
 	fs::write(&project_path, format!("{}\n", serde_json::to_string_pretty(&project)?))
 		.with_context(|| format!("Failed to write {}", project_path.to_string()))?;
 
 	Ok(project_path)
+}
+
+/// What a scratch project calls itself. A published place keeps the
+/// `place-<id>` name `wsync open` has always written; an unpublished one is
+/// named after the key it is reached by, which is the only name it has
+pub fn scratch_project_name(place_id: Option<u64>, place_key: Option<&str>) -> String {
+	match (place_id, place_key) {
+		(Some(id), _) => format!("place-{id}"),
+		(None, Some(key)) => key.to_owned(),
+		(None, None) => String::from("place"),
+	}
 }
 
 /// Services a scratch project maps. Code scope means only scripts and
@@ -643,12 +791,13 @@ impl Places {
 			return Ok(());
 		}
 
-		let rows: Vec<[String; 8]> = entries.iter().map(row_cells).collect();
+		let rows: Vec<[String; 9]> = entries.iter().map(row_cells).collect();
 		let headers = [
 			"PROJECT",
 			"PORT",
 			"GAME",
 			"PLACES",
+			"KEY",
 			"BRANCH",
 			"MANAGED BY",
 			"PLUGIN",
@@ -672,7 +821,7 @@ impl Places {
 	}
 }
 
-fn render(cells: &[String; 8], widths: &[usize; 8]) -> String {
+fn render(cells: &[String; 9], widths: &[usize; 9]) -> String {
 	cells
 		.iter()
 		.enumerate()
@@ -692,7 +841,7 @@ fn kind(entry: &DaemonEntry) -> String {
 		return String::from("project");
 	}
 
-	if entry.record.ephemeral {
+	if entry.ephemeral() {
 		String::from("attach (ephemeral)")
 	} else {
 		String::from("attach")
@@ -719,12 +868,13 @@ fn places_cell(entry: &DaemonEntry) -> String {
 	ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",")
 }
 
-fn row_cells(entry: &DaemonEntry) -> [String; 8] {
+fn row_cells(entry: &DaemonEntry) -> [String; 9] {
 	[
 		entry.name(),
 		entry.record.port.to_string(),
 		entry.game_id().map_or_else(|| String::from("-"), |id| id.to_string()),
 		places_cell(entry),
+		entry.place_key().unwrap_or_else(|| String::from("-")),
 		entry.branch().unwrap_or_else(|| String::from("main")),
 		entry.record.managed_by.clone(),
 		plugin_cell(entry),
@@ -742,6 +892,7 @@ fn row_json(entry: &DaemonEntry) -> Value {
 		"bootId": entry.record.boot_id,
 		"gameId": entry.game_id(),
 		"placeIds": entry.place_ids(),
+		"placeKey": entry.place_key(),
 		"branch": entry.branch(),
 		"managedBy": entry.record.managed_by,
 		"live": entry.hello.is_some(),
@@ -749,7 +900,7 @@ fn row_json(entry: &DaemonEntry) -> Value {
 			json!({ "name": plugin.name, "transport": plugin.transport })
 		}),
 		"attach": entry.is_attach(),
-		"ephemeral": entry.record.ephemeral,
+		"ephemeral": entry.ephemeral(),
 	})
 }
 
@@ -764,9 +915,27 @@ mod tests {
 			port,
 			place_ids: places.to_vec(),
 			game_id: Some(7),
+			place_key: None,
 			branch: branch.map(str::to_owned),
 			source,
 		}
+	}
+
+	fn keyed(project: &str, port: u16, key: &str) -> Candidate {
+		Candidate {
+			place_key: Some(key.to_owned()),
+			game_id: None,
+			place_ids: Vec::new(),
+			..candidate(project, port, &[], None, ClaimSource::Live)
+		}
+	}
+
+	fn id(place: u64) -> Selector {
+		Selector::Id(place)
+	}
+
+	fn key(place: &str) -> Selector {
+		Selector::Key(place.to_owned())
 	}
 
 	fn main_daemon() -> Candidate {
@@ -790,13 +959,13 @@ mod tests {
 			candidate("/other/p.json", 7972, &[999], None, ClaimSource::Live),
 		];
 
-		assert_eq!(resolve(&pool, 222, None).unwrap().port, 7970);
+		assert_eq!(resolve(&pool, &id(222), None).unwrap().port, 7970);
 	}
 
 	#[test]
 	fn no_claim_refuses_and_says_how_to_get_one() {
 		let pool = vec![main_daemon()];
-		let error = resolve(&pool, 42, None).unwrap_err().to_string();
+		let error = resolve(&pool, &id(42), None).unwrap_err().to_string();
 
 		assert!(error.contains("No WSync daemon claims place 42"), "{error}");
 		assert!(error.contains("wsync open 42"), "{error}");
@@ -806,21 +975,21 @@ mod tests {
 	fn main_wins_over_a_branch_serving_the_same_place() {
 		let pool = vec![branch_daemon(), main_daemon()];
 
-		assert_eq!(resolve(&pool, 111, None).unwrap().port, 7970);
+		assert_eq!(resolve(&pool, &id(111), None).unwrap().port, 7970);
 	}
 
 	#[test]
 	fn branch_selects_that_branch() {
 		let pool = vec![main_daemon(), branch_daemon()];
 
-		assert_eq!(resolve(&pool, 111, Some("ui-pass")).unwrap().port, 7971);
-		assert_eq!(resolve(&pool, 111, Some("main")).unwrap().port, 7970);
+		assert_eq!(resolve(&pool, &id(111), Some("ui-pass")).unwrap().port, 7971);
+		assert_eq!(resolve(&pool, &id(111), Some("main")).unwrap().port, 7970);
 	}
 
 	#[test]
 	fn an_unknown_branch_refuses_instead_of_falling_back() {
 		let pool = vec![main_daemon(), branch_daemon()];
-		let error = resolve(&pool, 111, Some("nope")).unwrap_err().to_string();
+		let error = resolve(&pool, &id(111), Some("nope")).unwrap_err().to_string();
 
 		assert!(error.contains("is on branch `nope`"), "{error}");
 		assert!(error.contains("ui-pass"), "{error}");
@@ -832,7 +1001,7 @@ mod tests {
 			branch_daemon(),
 			candidate("/other/p.json", 7973, &[111], Some("fx"), ClaimSource::Live),
 		];
-		let error = resolve(&pool, 111, None).unwrap_err().to_string();
+		let error = resolve(&pool, &id(111), None).unwrap_err().to_string();
 
 		assert!(error.contains("served by 2 daemons"), "{error}");
 		assert!(error.contains("--branch"), "{error}");
@@ -845,13 +1014,13 @@ mod tests {
 			main_daemon(),
 		];
 
-		assert_eq!(resolve(&pool, 111, None).unwrap().port, 7970);
+		assert_eq!(resolve(&pool, &id(111), None).unwrap().port, 7970);
 	}
 
 	#[test]
 	fn a_project_file_claim_still_resolves_when_it_is_the_only_one() {
 		let pool = vec![candidate("/dead/p.json", 7974, &[111], None, ClaimSource::ProjectFile)];
-		let resolved = resolve(&pool, 111, None).unwrap();
+		let resolved = resolve(&pool, &id(111), None).unwrap();
 
 		assert_eq!(resolved.port, 7974);
 		assert!(!resolved.is_live());
@@ -863,9 +1032,81 @@ mod tests {
 			main_daemon(),
 			candidate("/twin/p.json", 7975, &[111], None, ClaimSource::Live),
 		];
-		let error = resolve(&pool, 111, None).unwrap_err().to_string();
+		let error = resolve(&pool, &id(111), None).unwrap_err().to_string();
 
 		assert!(error.contains("served by 2 daemons"), "{error}");
+	}
+
+	#[test]
+	fn a_key_resolves_the_daemon_that_claims_it() {
+		let pool = vec![main_daemon(), keyed("/scratch/p.json", 7979, "my-level-ab12cd34")];
+		let resolved = resolve(&pool, &key("my-level-ab12cd34"), None).unwrap();
+
+		assert_eq!(resolved.port, 7979);
+		// ...and an id never reaches a keyed daemon, nor a key an id one
+		assert!(resolve(&pool, &key("something-else"), None).is_err());
+		assert!(resolve(&pool, &id(111), None).unwrap().port == 7970);
+	}
+
+	#[test]
+	fn an_unclaimed_key_says_so_without_offering_a_launch() {
+		let pool = vec![main_daemon()];
+		let error = resolve(&pool, &key("ghost-00000000"), None).unwrap_err().to_string();
+
+		assert!(error.contains("place key `ghost-00000000`"), "{error}");
+		assert!(!error.contains("wsync open ghost"), "{error}");
+	}
+
+	#[test]
+	fn a_selector_reads_digits_as_an_id_and_everything_else_as_a_key() {
+		assert_eq!(Selector::parse("128374926"), Selector::Id(128_374_926));
+		assert_eq!(Selector::parse("  42 "), Selector::Id(42));
+		assert_eq!(Selector::parse("my-level-ab12cd34"), Selector::Key(String::from("my-level-ab12cd34")));
+		// Too long to be a u64: a key, not a silently truncated id
+		assert_eq!(
+			Selector::parse("99999999999999999999999"),
+			Selector::Key(String::from("99999999999999999999999"))
+		);
+	}
+
+	#[test]
+	fn a_scratch_name_is_a_place_id_or_an_unpublished_key() {
+		assert!(is_scratch_name("1234567"));
+		assert!(is_scratch_name("unpublished-my-level-ab12cd34"));
+		assert!(!is_scratch_name("unpublished-"));
+		assert!(!is_scratch_name("unpublished-x-"));
+		assert!(!is_scratch_name("unpublished-My-Level"));
+		assert!(!is_scratch_name("unpublished-a/b"));
+		assert!(!is_scratch_name("unpublished-a.b"));
+		assert!(!is_scratch_name(".."));
+		assert!(!is_scratch_name("my-level-ab12cd34"));
+		assert!(!is_scratch_name(""));
+	}
+
+	#[test]
+	fn an_unpublished_scratch_project_claims_a_key_and_no_ids() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = write_scratch_project(dir.path(), None, None, Some("my-level-ab12cd34")).unwrap();
+		let project: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+
+		assert_eq!(project["name"], json!("my-level-ab12cd34"));
+		assert_eq!(project["placeKey"], json!("my-level-ab12cd34"));
+		assert_eq!(project["initialSync"], json!("keep"));
+		assert!(project.get("servePlaceIds").is_none());
+		assert!(project.get("gameId").is_none());
+
+		let loaded = Project::load(&path).unwrap();
+
+		assert!(loaded.is_place());
+		assert!(loaded.place_ids.is_empty());
+		assert_eq!(loaded.place_key.as_deref(), Some("my-level-ab12cd34"));
+	}
+
+	#[test]
+	fn a_scratch_project_needs_something_to_be_addressed_by() {
+		let dir = tempfile::tempdir().unwrap();
+
+		assert!(write_scratch_project(dir.path(), None, None, None).is_err());
 	}
 
 	#[test]
@@ -873,6 +1114,7 @@ mod tests {
 		let root = scratch_root().unwrap();
 
 		assert!(is_scratch_dir(&root.join("1234567")));
+		assert!(is_scratch_dir(&root.join("unpublished-my-level-ab12cd34")));
 		assert!(!is_scratch_dir(&root.join("not-a-place")));
 		assert!(!is_scratch_dir(&root.join("1234567").join("src")));
 		assert!(!is_scratch_dir(Path::new("/tmp/1234567")));
@@ -881,7 +1123,7 @@ mod tests {
 	#[test]
 	fn a_scratch_project_keeps_both_sides_where_they_are() {
 		let dir = tempfile::tempdir().unwrap();
-		let path = write_scratch_project(dir.path(), 1234567, Some(42)).unwrap();
+		let path = write_scratch_project(dir.path(), Some(1234567), Some(42), None).unwrap();
 		let project: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
 
 		assert_eq!(project["name"], json!("place-1234567"));
@@ -911,7 +1153,7 @@ mod tests {
 	#[test]
 	fn an_unknown_universe_leaves_the_key_out() {
 		let dir = tempfile::tempdir().unwrap();
-		let path = write_scratch_project(dir.path(), 99, None).unwrap();
+		let path = write_scratch_project(dir.path(), Some(99), None, None).unwrap();
 		let project: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
 
 		assert!(project.get("gameId").is_none());
