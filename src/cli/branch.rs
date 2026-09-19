@@ -44,7 +44,7 @@
 //! three places that could have are each pinned down:
 //!
 //!   * `enforce_budget` counts live branch Studios against `DEFAULT_BUDGET`
-//!     (3), so a second and a third branch open normally; the budget is about
+//!     (5) and every Studio window on the machine against `MAX_STUDIOS` (8); the budget is about
 //!     Roblox's window cap, not about the merge.
 //!   * `marks.json` holds one mark per branch and main's daemon fans every
 //!     push from main's plugin out to each marked checkpoint's stream, so each
@@ -131,7 +131,12 @@ const SHAPE_FILE: &str = "checkpoint.shape.json";
 
 /// Live branch Studios allowed at once: past Roblox's window cap a launch
 /// succeeds into a windowless stub, so the budget is a real guardrail
-const DEFAULT_BUDGET: usize = 3;
+const DEFAULT_BUDGET: usize = 5;
+
+/// Roblox Studio stops opening usable windows past this many instances on
+/// one machine (a launch past it comes up as a windowless stub), so every
+/// window counts — main, branches, other places, anything
+const MAX_STUDIOS: usize = 8;
 
 /// Exit code for "the merge stopped on conflicts you have to decide"
 const CONFLICT_EXIT: i32 = 3;
@@ -1374,15 +1379,52 @@ fn enforce_budget(workspace: &Path, budget: usize, wanted: &str) -> Result<()> {
 
 	if live.len() >= budget {
 		bail!(
-			"{} branch Studios are already live ({}) and the budget is {budget} — close one with `{}` before opening \
-			 `{wanted}` (past Roblox's window cap a launch succeeds into a windowless stub)",
+			"{} branch Studios are already live ({}) and the budget is {budget} — close one with `{}` before opening 			 `{wanted}` (past Roblox's window cap a launch succeeds into a windowless stub)",
 			live.len(),
 			live.join(", "),
 			format!("wsync branch rm {}", live[0]).bold()
 		);
 	}
 
+	let studios = studio_count();
+
+	if studios >= MAX_STUDIOS {
+		bail!(
+			"{studios} Roblox Studio windows are already open on this machine and Studio stops opening usable ones at 			 {MAX_STUDIOS} — close one before opening `{wanted}`"
+		);
+	}
+
 	Ok(())
+}
+
+/// How many Roblox Studio processes are running right now, whoever opened
+/// them. Zero when the count cannot be taken, so a broken probe never blocks
+fn studio_count() -> usize {
+	#[cfg(windows)]
+	{
+		let output = Command::new("tasklist")
+			.args(["/FI", "IMAGENAME eq RobloxStudioBeta.exe", "/NH", "/FO", "CSV"])
+			.output();
+
+		return output
+			.map(|out| {
+				String::from_utf8_lossy(&out.stdout)
+					.lines()
+					.filter(|line| line.contains("RobloxStudioBeta.exe"))
+					.count()
+			})
+			.unwrap_or(0);
+	}
+
+	#[cfg(not(windows))]
+	{
+		let output = Command::new("pgrep").args(["-c", "-f", "RobloxStudio"]).output();
+
+		output
+			.ok()
+			.and_then(|out| String::from_utf8_lossy(&out.stdout).trim().parse().ok())
+			.unwrap_or(0)
+	}
 }
 
 /// Keeps `.wsync-branches/` out of the main checkout's status without

@@ -335,7 +335,7 @@ blobs. `branch up` starts one if it is gone.
 
 One owner per branch, recorded in the worktree, taken by the command that
 creates it and stolen only with `--steal`. One merge into main at a time. A
-budget on live branch Studios, default 3, because past Roblox's window cap a
+budget on live branch Studios, default 5, plus a hard cap of 8 Studio windows on the machine, because past Roblox's window cap a
 launch succeeds into a windowless stub.
 
 ## Not in this design
