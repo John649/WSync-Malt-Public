@@ -663,11 +663,8 @@ fn resolve_root(state: &AppState, root_path: &str) -> Result<RootTarget, String>
 		.get_meta(id)
 		.ok_or_else(|| format!("{root_path} has no sync metadata"))?;
 
-	let live_dir = directory_backing(meta).ok_or_else(|| {
-		format!(
-			"{root_path} has no directory backing ($path), and neither does anything above it; only 			 directory-backed roots support the fenced apply"
-		)
-	})?;
+	let live_dir = directory_backing(meta)
+		.ok_or_else(|| format!("{root_path} has no directory behind it ($path), and neither does anything above it"))?;
 
 	let instance = tree.get_instance(id);
 
