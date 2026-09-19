@@ -52,7 +52,7 @@ use std::{
 
 use crate::{
 	cli::client::{print_json, truncate, Client, Target, Targeting},
-	daemon,
+	daemon, docsgen,
 	ext::PathExt,
 	wsync_info, wsync_warn,
 };
@@ -70,6 +70,16 @@ const GAME_ID_ATTRIBUTE: &str = "GameId";
 /// Number attribute on the marker naming the branch daemon's port, so the
 /// plugin's discovery tries it before it ranks anything
 const DAEMON_PORT_ATTRIBUTE: &str = "DaemonPort";
+
+/// What the daemon regenerates in every worktree the moment a plugin
+/// connects. Main's copies and a branch's therefore always differ, so every
+/// merge conflicts on them unless main is simply declared the owner
+const GENERATED_DOCS: [&str; 4] = [
+	docsgen::WSYNC_MD,
+	docsgen::AGENTS_MD,
+	docsgen::CLAUDE_MD,
+	docsgen::CODEX_CONFIG,
+];
 
 /// Read part size for a blob pull: the plugin's `BLOB_READ_MAX_LEN` ceiling,
 /// eight times the chunk the clipboard pump uses. Ten services at 64 KiB a
@@ -760,8 +770,14 @@ impl Finish {
 
 		let worktree = record.worktree();
 
-		// (1) the branch's own commit, scoped to its worktree
-		git_out(&worktree, &["add", "-A"])?;
+		// (1) the branch's own commit, scoped to its worktree and excluding the
+		// docs the daemon regenerates here on every connect — a branch that never
+		// commits them is a branch that cannot conflict on them
+		let excluded: Vec<String> = GENERATED_DOCS.iter().map(|doc| format!(":!{doc}")).collect();
+		let mut add = vec!["add", "-A", "--", "."];
+
+		add.extend(excluded.iter().map(String::as_str));
+		git_out(&worktree, &add)?;
 
 		let committed = if git_out(&worktree, &["diff", "--cached", "--quiet"]).is_err() {
 			git_out(&worktree, &["commit", "-m", &format!("wsync branch {}", record.name)])?;
@@ -776,6 +792,7 @@ impl Finish {
 		// rewrote its own copy in `new` and committed it, so the merge would
 		// otherwise hand main the branch's name, `branch` and synthetic placeId
 		let project_file = repo_relative(&main.workspace, &main.project);
+		let owned = main_owned_paths(&project_file);
 
 		// A `finish` that parked conflicts left the merge in progress on purpose,
 		// so a rerun after `branch pick` resumes it rather than starting another.
@@ -792,7 +809,7 @@ impl Finish {
 			// every plugin connect, and the branch committed its own regenerated
 			// copies — so git refuses the merge before it starts unless that
 			// overlap is committed first
-			commit_blocking_work(&main.workspace, &record.git_branch, &record.name, &project_file)?
+			commit_blocking_work(&main.workspace, &record.git_branch, &record.name, &owned)?
 		};
 
 		if !parked.is_empty() && !self.raw {
@@ -825,6 +842,20 @@ impl Finish {
 			})
 		};
 
+		// Main's own copies go back before anything is called a conflict: these
+		// paths conflict on every single merge and resolving them by hand every
+		// time would be the whole job
+		let restored = restore_main_owned(&main.workspace, &owned);
+
+		if !restored.contains(&project_file) {
+			wsync_warn!(
+				"Could not restore main's own {} from HEAD — check it before the next `{}`, because the merge may have \
+				 given main the branch's name, `branch` and synthetic placeId",
+				project_file.bold(),
+				"wsync branch new".bold()
+			);
+		}
+
 		let unmerged = unmerged_paths(&main.workspace);
 
 		if !unmerged.is_empty() {
@@ -836,32 +867,15 @@ impl Finish {
 			process::exit(CONFLICT_EXIT);
 		}
 
-		// A refusal with nothing left unmerged is git declining to start —
-		// its own message is the diagnosis, so it is printed verbatim
+		// git exits non-zero for a merge it would not start AND for one it
+		// started and left conflicted. `MERGE_HEAD` tells them apart, and the
+		// conflicts may be ones just resolved above — only a merge that never
+		// began is a refusal, and then git's own message is the diagnosis
 		if let Some(message) = refusal {
-			print_merge_refusal(&record.name, &record.git_branch, &message, self.raw);
-			process::exit(CONFLICT_EXIT);
-		}
-
-		// `HEAD` is still main's pre-merge tip until the commit below — a merge
-		// left in progress by an earlier run included — so main's own project
-		// file comes back from there, into both the index and the working tree,
-		// over whatever the branch brought in.
-		//
-		// A failure here is reported rather than fatal. `merge --no-commit`
-		// has already staged the whole merge, so bailing now would leave main
-		// mid-merge with a half-finished branch behind it — worse than a project
-		// file the user can check
-		let restored = git_try(&main.workspace, &["checkout", "HEAD", "--", &project_file])?;
-
-		if !restored.0 {
-			wsync_warn!(
-				"Could not restore main's own {} from HEAD ({}) — check it before the next `{}`, because the merge may \
-				 have given main the branch's name, `branch` and synthetic placeId",
-				project_file.bold(),
-				restored.2.trim(),
-				"wsync branch new".bold()
-			);
+			if !merge_in_progress(&main.workspace) {
+				print_merge_refusal(&record.name, &record.git_branch, &message, self.raw);
+				process::exit(CONFLICT_EXIT);
+			}
 		}
 
 		// (3) the instance replay, into main's Studio
@@ -933,9 +947,9 @@ impl Finish {
 		paths.sort();
 		paths.dedup();
 
-		// Already staged from `HEAD` above; re-adding it would put the branch's
-		// copy straight back
-		paths.retain(|path| path != &project_file);
+		// Already staged from `HEAD` above; re-adding them would put the
+		// branch's copies straight back
+		paths.retain(|path| !owned.contains(path));
 
 		if !paths.is_empty() {
 			let mut args = vec!["add", "--"];
@@ -988,6 +1002,7 @@ impl Finish {
 				"parked": parked,
 				"leftDirty": left_dirty,
 				"projectRestored": project_file,
+				"restored": restored,
 				"saved": saved,
 				"saveReason": save_reason,
 				"applied": replayed.get("applied").cloned().unwrap_or(Value::Null),
@@ -1383,8 +1398,49 @@ fn detach(command: &mut Command) {
 	{
 		use std::os::windows::process::CommandExt;
 
+		disinherit_std_handles();
+
 		// DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
 		command.creation_flags(0x0000_0008 | 0x0000_0200);
+	}
+}
+
+/// Stops this process's own standard handles from reaching any child.
+///
+/// Null stdio is not enough on Windows. `CreateProcessW` is called with
+/// `bInheritHandles = TRUE` whenever any stdio is passed, and that hands the
+/// child EVERY inheritable handle this process holds — including the pipe a
+/// caller gave us as stdout, which arrived inheritable precisely because we
+/// inherited it. A detached daemon then held a duplicate of that write end,
+/// and `wsync branch new | …` never saw EOF however cleanly the CLI exited.
+///
+/// Clearing the flag costs nothing: nothing spawned here wants our stdio, and
+/// the handles keep working for this process
+#[cfg(target_os = "windows")]
+fn disinherit_std_handles() {
+	use std::ffi::c_void;
+
+	const STD_INPUT: u32 = -10i32 as u32;
+	const STD_OUTPUT: u32 = -11i32 as u32;
+	const STD_ERROR: u32 = -12i32 as u32;
+	const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+
+	extern "system" {
+		fn GetStdHandle(std_handle: u32) -> *mut c_void;
+		fn SetHandleInformation(object: *mut c_void, mask: u32, flags: u32) -> i32;
+	}
+
+	for id in [STD_INPUT, STD_OUTPUT, STD_ERROR] {
+		// SAFETY: both calls take a handle this process already owns and change
+		// only its inheritance flag. Neither reads nor writes any memory, and a
+		// failure on a redirected or closed handle is ignored on purpose
+		unsafe {
+			let handle = GetStdHandle(id);
+
+			if !handle.is_null() && handle as isize != -1 {
+				SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+			}
+		}
 	}
 }
 
@@ -1915,19 +1971,24 @@ fn print_conflicts(name: &str, conflicts: &[Value], path: &Path, raw: bool) {
 }
 
 /// Commits exactly the files main has changed that the branch also touched,
-/// except `exclude` — main's project file, which the merge is not allowed to
-/// carry over and so is never worth committing on main's behalf.
+/// except `exclude` — the paths main owns outright, which a merge never
+/// carries over and so are never worth committing on main's behalf.
 /// so `git merge` stops refusing. The daemon regenerates the agent docs on
 /// every plugin connect, which leaves main permanently dirty on files a
 /// branch commits too; that overlap is the whole problem and the only thing
 /// committed here. Never `git add -A` — unrelated work in main stays exactly
 /// where it was. Returns what was committed and how many changed files were
 /// left alone
-fn commit_blocking_work(workspace: &Path, git_branch: &str, name: &str, exclude: &str) -> Result<(Vec<String>, usize)> {
+fn commit_blocking_work(
+	workspace: &Path,
+	git_branch: &str,
+	name: &str,
+	exclude: &[String],
+) -> Result<(Vec<String>, usize)> {
 	let touched: HashSet<String> = git_out(workspace, &["diff", "--name-only", &format!("HEAD...{git_branch}")])
 		.unwrap_or_default()
 		.lines()
-		.filter(|line| !line.is_empty() && *line != exclude)
+		.filter(|line| !line.is_empty() && !exclude.iter().any(|owned| owned == line))
 		.map(str::to_owned)
 		.collect();
 
@@ -1957,6 +2018,42 @@ fn commit_blocking_work(workspace: &Path, git_branch: &str, name: &str, exclude:
 	git_out(workspace, &commit)?;
 
 	Ok((blocking, left_alone))
+}
+
+/// The paths main owns outright, which a merge must never carry over: main's
+/// project file, because the branch rewrote its own copy in `new`, and every
+/// doc the daemon regenerates, because those differ between any two worktrees
+/// by construction
+fn main_owned_paths(project_file: &str) -> Vec<String> {
+	let mut owned = vec![project_file.to_owned()];
+
+	owned.extend(GENERATED_DOCS.iter().map(|doc| (*doc).to_owned()));
+	owned.sort();
+	owned.dedup();
+
+	owned
+}
+
+/// Puts main's own copies back over whatever the merge brought in, in both
+/// the index and the working tree. A conflicted path is resolved to main's
+/// side by the same call. Anything main does not track is skipped, not an
+/// error — and nothing here is ever fatal, because `merge --no-commit` has
+/// already staged the merge and bailing would strand main mid-merge
+fn restore_main_owned(workspace: &Path, owned: &[String]) -> Vec<String> {
+	let mut restored = Vec::new();
+
+	for path in owned {
+		let checked_out = git_try(workspace, &["checkout", "HEAD", "--", path])
+			.map(|result| result.0)
+			.unwrap_or(false);
+
+		if checked_out {
+			git_try(workspace, &["add", "--", path]).ok();
+			restored.push(path.clone());
+		}
+	}
+
+	restored
 }
 
 /// Is a merge in progress here? `MERGE_HEAD` exists only between a
