@@ -81,6 +81,7 @@
 
 local CollectionService = game:GetService("CollectionService")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
+local RunService = game:GetService("RunService")
 
 local WSync = script:FindFirstAncestor("WSync")
 
@@ -259,6 +260,39 @@ local looping = false
 -- those changes ARE the journal — recording them again would duplicate every
 -- event the next flush pushes.
 local muted = false
+
+-- The plugin's OWN write window. Everything `Core/Processor/Write` applies
+-- came from the daemon — a file the worktree already carries, or the initial
+-- sync normalising properties — and it reaches main through git, not through
+-- the journal. Recording it as well replayed it into main a SECOND time: a
+-- module added in a branch worktree landed as a duplicate ModuleScript, and
+-- ten `set prop=Color` on emitters nobody had touched rode along with it.
+-- `applyDepth` counts rather than flags, because `applyChanges` drives
+-- `applyAddition`, which drives itself for every child of a snapshot.
+local applyDepth = 0
+
+-- Studio delivers `Changed`, `DescendantAdded` and `DescendantRemoving`
+-- DEFERRED: the listeners for what an apply just wrote run at a resumption
+-- point AFTER the apply returns, so a window that closed synchronously would
+-- already be open again by the time they arrive. It therefore stays shut
+-- until the first Heartbeat after the outermost apply, which is strictly
+-- later than the drain those callbacks are delivered in. `applyGeneration`
+-- is what tells a pending release that a newer window has taken over.
+local applyGrace = false
+local applyGeneration = 0
+
+--- Is one of the plugin's own writes in flight, or are its deferred signals
+--- still arriving?
+local function isApplyMuted(): boolean
+	return applyDepth > 0 or applyGrace
+end
+
+--- Is anything at all being recorded right now? Two reasons it might not be:
+--- a replay of this clone's own journal (`muted`), and a write the plugin is
+--- applying on the daemon's behalf.
+local function isMuted(): boolean
+	return muted or isApplyMuted()
+end
 
 -- The id a replay is about to parent an instance under, consumed by the very
 -- next `DescendantAdded`. A replay creates instances that ALREADY have an id —
@@ -943,7 +977,7 @@ end
 --- pending set stays bounded by the number of distinct `(id, op, prop)` an
 --- editor touched between two flushes.
 local function emit(id: string, op: string, fields: Event?)
-	if not active or muted then
+	if not active or isMuted() then
 		return
 	end
 
@@ -1257,6 +1291,13 @@ end
 local function drainDirty()
 	drainScheduled = false
 
+	if isApplyMuted() then
+		-- Marked BEFORE the plugin's window opened, so it is a Studio edit and
+		-- has to survive: draining it here would hand every event to a muted
+		-- `emit` and lose it. `Journal.endApply` reschedules this drain.
+		return
+	end
+
 	local work = dirty
 	dirty = {}
 
@@ -1321,6 +1362,18 @@ end
 
 local function markDirty(instance: Instance, prop: string)
 	if not active or muted or idOf[instance] == nil then
+		return
+	end
+
+	if isApplyMuted() then
+		-- The plugin's own write. Nothing is recorded — but where it moved
+		-- something to still has to be remembered, or a later REAL move back
+		-- to the old parent would compare equal to a stale `parentOf` and
+		-- emit nothing.
+		if prop == "Parent" then
+			parentOf[instance] = parentIdOf(instance) or parentOf[instance]
+		end
+
 		return
 	end
 
@@ -1491,6 +1544,85 @@ function Journal.touched(instance: Instance?, rec: string?)
 	if rec ~= nil then
 		dirtyRec[instance] = rec
 	end
+end
+
+--------------------------------------------------------------------------------
+-- The plugin's own writes (Core/Processor/Write)
+--------------------------------------------------------------------------------
+
+--- Open the window in which nothing the plugin itself applies is recorded.
+--- Nests, and every `beginApply` must be paired with an `endApply`.
+function Journal.beginApply()
+	applyDepth += 1
+
+	-- Any release still pending from an earlier window is stale: this one owns
+	-- the mute until its own `endApply` hands it on.
+	applyGeneration += 1
+	applyGrace = false
+end
+
+--- Close it — but not before the next Heartbeat, because the signals the
+--- listeners run on are deferred and have not been delivered yet.
+function Journal.endApply()
+	if applyDepth <= 0 then
+		applyDepth = 0
+
+		return
+	end
+
+	applyDepth -= 1
+
+	if applyDepth > 0 then
+		return
+	end
+
+	if not active then
+		-- Nothing is being recorded, so there is nothing to hold shut: a
+		-- Studio with no branch open pays nothing for any of this.
+		applyGrace = false
+
+		return
+	end
+
+	applyGrace = true
+	applyGeneration += 1
+
+	local generation = applyGeneration
+	local connection: RBXScriptConnection
+
+	connection = RunService.Heartbeat:Connect(function()
+		connection:Disconnect()
+
+		if generation ~= applyGeneration then
+			-- A later window reopened the mute; its own release ends it.
+			return
+		end
+
+		applyGrace = false
+
+		-- A Studio edit marked before the window opened was deliberately left
+		-- undrained (`drainDirty`), so it is this that gets it out.
+		if next(dirty) ~= nil then
+			scheduleDrain()
+		end
+	end)
+end
+
+--- Apply `fn(...)` inside one window, however it returns. Errors are
+--- re-raised with the window closed, so a failed apply cannot leave the
+--- recorder muted for the rest of the session.
+function Journal.withMuted(fn: (...any) -> ...any, ...: any): ...any
+	Journal.beginApply()
+
+	local results = table.pack(pcall(fn, ...))
+
+	Journal.endApply()
+
+	if results[1] ~= true then
+		error(results[2], 0)
+	end
+
+	return table.unpack(results, 2, results.n)
 end
 
 --- The recording name stamped on every event until it is cleared (`rec`).
@@ -1711,6 +1843,15 @@ local function onDescendantAdded(instance: Instance, service: Instance)
 	watch(instance)
 	sessionAdded[id] = true
 
+	if isApplyMuted() then
+		-- The plugin put this here on the daemon's behalf: the worktree
+		-- already holds it and git is how it reaches main, so an `add` would
+		-- be the second copy. It is still numbered and watched — an instance
+		-- the recorder does not know is one a later Studio edit has no id to
+		-- name — and no blob is captured for something that is not travelling.
+		return
+	end
+
 	local class = instance.ClassName
 
 	-- An *added root* is one whose parent was already there when this Studio
@@ -1741,7 +1882,7 @@ end
 --- time, so the whole cycle is settled together, once everything that might
 --- cancel a removal has run.
 local function queueRemoval(instance: Instance)
-	if muted or idOf[instance] == nil or removedOnce[instance] then
+	if isMuted() or idOf[instance] == nil or removedOnce[instance] then
 		return
 	end
 

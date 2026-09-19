@@ -6,6 +6,12 @@ local Log = require(WSync.Log)
 local Types = require(WSync.Types)
 local Config = require(WSync.Config)
 
+-- The branch recorder (docs/branches.md — "Journal"). Nothing this processor
+-- applies is a Studio-originated change, and the recorder has to be told so;
+-- see the wrapper at the bottom of this file. No cycle: Journal reaches Log,
+-- Branch, Lib and Transport only, never back into Core.
+local Journal = require(WSync.Journal)
+
 local equals = require(WSync.Helpers.equals)
 local setWaypoint = require(WSync.Helpers.setWaypoint)
 
@@ -480,6 +486,28 @@ function WriteProcessor:applyRemoval(object: Types.Ref | Instance, initial: bool
 	end
 
 	return object
+end
+
+--- Nothing this processor applies is a Studio edit. It came from the daemon,
+--- which means the worktree already carries it and git is what takes it to
+--- main; journalling it as well replayed it into main a SECOND time — a
+--- module added in a branch worktree arriving as a duplicate ModuleScript,
+--- and sync-normalised emitter properties replayed as edits nobody made.
+--- So every entry point applies inside a journal mute window.
+---
+--- Wrapped here rather than threaded through the bodies: they are built out
+--- of early returns and they recurse (`applyChanges` -> `applyAddition` ->
+--- its children), and a window that has to be closed on twenty paths is a
+--- window that stays open on one of them. The mute nests on a depth count,
+--- and is released a Heartbeat after the outermost apply — Studio delivers
+--- the signals the journal listens to deferred, so they land after the apply
+--- has already returned.
+for _, name in { "applyChanges", "applyAddition", "applyUpdate", "applyRemoval" } do
+	local apply = WriteProcessor[name]
+
+	WriteProcessor[name] = function(self, ...)
+		return Journal.withMuted(apply, self, ...)
+	end
 end
 
 return WriteProcessor
