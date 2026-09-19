@@ -546,7 +546,7 @@ function App:__runAttach(state)
 		-- scratch daemon claims no ids, so the port IS the identity, and it
 		-- must not outlive the window that asked for it (Policy.rankHello).
 		Discovery.setSessionPort(attached.port)
-		self.attachNote:set(Policy.temporaryNote({ ephemeral = true }))
+		self.attachNote:set(if attached.ephemeral == false then nil else Policy.temporaryNote({ ephemeral = true }))
 		self:__rememberPlace(attached.placeKey, attached.port)
 
 		Log.stage(`Connect: attached temporarily on port {attached.port}`)
@@ -802,6 +802,21 @@ function App:__connectTo(host: string, port: number, generation: number)
 		end
 
 		if status.kind == "reconnecting" then
+			-- A temporary daemon that stays gone is gone for good: it stops
+			-- itself once its window leaves, and nothing restarts it. Past a
+			-- few attempts the port is dropped and discovery runs again, which
+			-- finds whatever serves this place now (a real project's daemon,
+			-- or a fresh attach) instead of counting down forever
+			if Discovery.sessionPort ~= nil and (status.attempt or 0) >= 4 then
+				Log.stage("Reconnect: the temporary daemon is gone; scanning again")
+				Discovery.setSessionPort(nil)
+				self.attachTried = false
+				self:disconnect(true)
+				self:dispatch({ kind = "retry" })
+
+				return
+			end
+
 			self.transportStatus:set(`Reconnecting in {status.secondsLeft}s (attempt {status.attempt})…`)
 			self:setIcon("Warn")
 		elseif status.kind == "connecting" then

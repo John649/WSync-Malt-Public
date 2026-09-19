@@ -363,6 +363,15 @@ pub(crate) trait AttachHost: Send + Sync + 'static {
         project_id: String,
         project_path: String,
     ) -> Pin<Box<dyn Future<Output = Result<u16, String>> + Send>>;
+
+    /// Serve a registered project the ordinary way (no `--ephemeral`): the
+    /// place that just opened belongs to it, so it gets its real daemon,
+    /// exactly as the Serving toggle would start it.
+    fn serve(
+        &self,
+        project_id: String,
+        project_path: String,
+    ) -> Pin<Box<dyn Future<Output = Result<u16, String>> + Send>>;
 }
 
 impl AttachHost for AppHandle {
@@ -384,6 +393,27 @@ impl AttachHost for AppHandle {
             state
                 .daemons
                 .start_with(&project_id, &project_path, &data_dir, None, &["--ephemeral"])
+                .await
+                .map(|session| session.port)
+                .map_err(|error| error.message)
+        })
+    }
+
+    fn serve(
+        &self,
+        project_id: String,
+        project_path: String,
+    ) -> Pin<Box<dyn Future<Output = Result<u16, String>> + Send>> {
+        let handle = self.clone();
+
+        Box::pin(async move {
+            let Some(state) = handle.try_state::<crate::AppState>() else {
+                return Err("the app is shutting down".to_string());
+            };
+            let data_dir = state.paths.data_dir.clone();
+            state
+                .daemons
+                .start(&project_id, &project_path, &data_dir, None)
                 .await
                 .map(|session| session.port)
                 .map_err(|error| error.message)
@@ -831,7 +861,7 @@ impl Broker {
                     "name": attached.name,
                     "key": attached.key,
                     "placeKey": attached.place_key,
-                    "ephemeral": true,
+                    "ephemeral": attached.ephemeral,
                 }),
             ),
             Err(error) => HttpReply::error(error.status, error.message),
@@ -845,6 +875,31 @@ impl Broker {
                 "this WSync build cannot start an attach daemon",
             ));
         };
+
+        // A place that belongs to a project the app already knows gets THAT
+        // project served — never a scratch daemon, which would sit there
+        // keep-only while the user believes their edits are reaching disk.
+        if request.place_id != 0 {
+            if let Some((id, path)) = registered_project_for_place(&self.read_registry().await, request.place_id)
+            {
+                let port = host.serve(id.clone(), path.clone()).await.map_err(|error| {
+                    InitError::new(500, format!("the project's daemon did not start: {error}"))
+                })?;
+                let name = Path::new(&path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| id.clone());
+
+                return Ok(Attached {
+                    port,
+                    project: path,
+                    name,
+                    key: id,
+                    place_key: None,
+                    ephemeral: false,
+                });
+            }
+        }
 
         let (key, place_key) = attach_key(request.place_id, request.name.as_deref(), &request.session_id);
 
@@ -881,6 +936,7 @@ impl Broker {
             name: written.name,
             key,
             place_key,
+            ephemeral: true,
         })
     }
 
@@ -1267,6 +1323,9 @@ struct Attached {
     name: String,
     key: String,
     place_key: Option<String>,
+    /// False when the place belonged to a registered project and that
+    /// project's own daemon was served instead of a scratch one
+    ephemeral: bool,
 }
 
 /// What `wsync open --attach-only` reported.
@@ -1714,6 +1773,45 @@ fn verify_inside(root: &Path, directory: &Path) -> Result<(), InitError> {
 /// A project already in the registry for this GameId, if its folder is still
 /// there. A record pointing at a folder the user deleted is not a reason to
 /// refuse to create a new one.
+/// The registered project whose project file claims `place_id`, as
+/// `(id, directory)`. Reads each record's `default.project.json`, so a claim
+/// edited on disk counts without the registry having to notice
+fn registered_project_for_place(document: &Map<String, Value>, place_id: u64) -> Option<(String, String)> {
+    let projects = document.get("projects")?.as_array()?;
+    for project in projects {
+        let (Some(id), Some(path)) = (
+            project.get("id").and_then(Value::as_str),
+            project.get("path").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let directory = Path::new(path);
+        if !directory.is_dir() {
+            continue;
+        }
+        let file = if directory.join("default.project.json").is_file() {
+            directory.join("default.project.json")
+        } else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let claims = ["servePlaceIds", "placeIds"]
+            .iter()
+            .filter_map(|key| parsed.get(*key).and_then(Value::as_array))
+            .flat_map(|ids| ids.iter().filter_map(Value::as_u64).collect::<Vec<_>>())
+            .any(|id| id == place_id);
+        if claims {
+            return Some((id.to_string(), path.to_string()));
+        }
+    }
+    None
+}
+
 fn existing_project(document: &Map<String, Value>, game_id: u64) -> Option<InitOutcome> {
     // GameId 0 is every unpublished place at once, not an identity — adopting
     // by it would hand one place's project to a different place.
@@ -3079,6 +3177,16 @@ mod tests {
 
     impl AttachHost for FakeAttach {
         fn start(
+            &self,
+            project_id: String,
+            project_path: String,
+        ) -> Pin<Box<dyn Future<Output = Result<u16, String>> + Send>> {
+            self.started.lock().unwrap().push((project_id, project_path));
+            let port = self.port;
+            Box::pin(async move { Ok(port) })
+        }
+
+        fn serve(
             &self,
             project_id: String,
             project_path: String,
