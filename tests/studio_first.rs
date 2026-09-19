@@ -346,3 +346,129 @@ async fn a_daemon_restart_keeps_the_pending_review_answerable() {
 	let (_, backlog) = get_json(&daemon, "/backlog").await;
 	assert_eq!(backlog["entries"].as_array().unwrap().len(), 1);
 }
+
+/// Every file under `dir`, by path relative to it, with its mtime
+fn mtimes(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, std::time::SystemTime> {
+	fn walk(
+		base: &std::path::Path,
+		current: &std::path::Path,
+		stamps: &mut std::collections::BTreeMap<std::path::PathBuf, std::time::SystemTime>,
+	) {
+		for entry in fs::read_dir(current).unwrap() {
+			let entry = entry.unwrap();
+			let path = entry.path();
+
+			if path.is_dir() {
+				walk(base, &path, stamps);
+			} else {
+				let relative = path.strip_prefix(base).unwrap().to_owned();
+				stamps.insert(relative, entry.metadata().unwrap().modified().unwrap());
+			}
+		}
+	}
+
+	let mut stamps = std::collections::BTreeMap::new();
+	walk(dir, dir, &mut stamps);
+	stamps
+}
+
+/// The names under `.wsync-backups` — transfer batches plus the backlog store
+fn backup_dirs(daemon: &TestDaemon) -> Vec<String> {
+	let root = daemon.root.join(".wsync-backups");
+
+	let Ok(entries) = fs::read_dir(root) else {
+		return Vec::new();
+	};
+
+	let mut names: Vec<String> = entries
+		.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+		.collect();
+
+	names.sort();
+	names
+}
+
+/// The reconnect case this whole apply exists for: Studio's content is
+/// already on disk, so the connect must write nothing at all.
+///
+/// Before this was incremental, every connect to a Team Create place rewrote
+/// every file under `src/` — 1 273 of them, byte-for-byte identical — gave
+/// each a new mtime, copied each into a fresh backup batch and handed the
+/// watcher a burst of writes that changed nothing.
+#[tokio::test]
+async fn a_reconnect_that_finds_the_disk_already_matching_writes_nothing() {
+	let daemon = code_place();
+	tokio::time::sleep(SETTLE).await;
+
+	let keep_me = child_ref_in(&daemon, "ReplicatedStorage", "KeepMe").await.unwrap();
+	let (plugin, hello, _) = studio_data_model(&daemon).await;
+
+	let (status, receipt) = post_json(
+		&daemon,
+		"/compare",
+		&json!({
+			"submissionId": "sub-first-connect",
+			"chunkIndex": 0,
+			"finalChunk": true,
+			"entries": compare_entries(&keep_me, &hello),
+		}),
+	)
+	.await;
+
+	assert_eq!(status, 200);
+	assert_eq!(receipt["ok"], true, "first connect: {receipt}");
+	// One batch: ReplicatedStorage displaces its `differs` original, while
+	// ServerScriptService is empty on disk and only gains files, so it
+	// displaces nothing and needs no backup of its own
+	let backups = receipt["backups"].as_array().unwrap();
+
+	assert_eq!(backups.len(), 1, "{receipt}");
+	assert!(backups[0].as_str().unwrap().ends_with("/ReplicatedStorage"));
+	assert!(receipt["written"].as_u64().unwrap() >= 4, "first connect writes: {receipt}");
+
+	// The state the second connect meets: Studio's content on disk
+	tokio::time::sleep(SETTLE).await;
+
+	let src = daemon.root.join("src");
+	let before = mtimes(&src);
+	let batches_before = backup_dirs(&daemon);
+
+	assert!(!before.is_empty());
+
+	// The same place, connecting again. Studio still holds what disk now
+	// holds, so the apply has nothing to do
+	let (status, receipt) = post_json(
+		&daemon,
+		"/compare",
+		&json!({
+			"submissionId": "sub-reconnect",
+			"chunkIndex": 0,
+			"finalChunk": true,
+			"restart": true,
+			"entries": compare_entries(&keep_me, &hello),
+		}),
+	)
+	.await;
+
+	assert_eq!(status, 200);
+	assert_eq!(receipt["ok"], true, "reconnect: {receipt}");
+	assert_eq!(receipt["applied"], true);
+
+	// Nothing written, nothing displaced, no backup batch
+	assert_eq!(receipt["written"], 0, "reconnect: {receipt}");
+	assert_eq!(receipt["entries"], 0, "reconnect: {receipt}");
+	assert!(receipt["backups"].as_array().unwrap().is_empty(), "{receipt}");
+	assert!(receipt["unchanged"].as_u64().unwrap() >= 4, "reconnect: {receipt}");
+
+	for root in receipt["committedRoots"].as_array().unwrap() {
+		assert_eq!(root["backup"], Value::Null, "root: {root}");
+		assert_eq!(root["recoveryAction"], "none", "root: {root}");
+	}
+
+	// No file was touched: an untouched file keeps its mtime, and the watcher
+	// it would otherwise have woken never hears about it
+	assert_eq!(mtimes(&src), before, "a matching disk must not be rewritten");
+	assert_eq!(backup_dirs(&daemon), batches_before, "no new backup batch");
+
+	plugin.abort();
+}

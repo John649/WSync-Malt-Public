@@ -537,7 +537,26 @@ async fn partial_failure_keeps_committed_roots_and_their_backups() {
 
 	assert_eq!(status, 200);
 	assert_eq!(receipt["ok"], true, "second transfer should succeed: {receipt}");
-	assert_eq!(receipt["backups"].as_array().unwrap().len(), 2);
+
+	// The apply is incremental: ReplicatedStorage committed in the first
+	// transfer, so this one finds its file already holding Studio's bytes and
+	// writes nothing to it — no rewrite, no backup, no batch entry. Only
+	// ServerScriptService, which failed the first time, is displaced here
+	let backups = receipt["backups"].as_array().unwrap();
+	assert_eq!(backups.len(), 1, "only the root that changed is backed up: {receipt}");
+	assert!(backups[0].as_str().unwrap().ends_with("/ServerScriptService"));
+
+	let committed = receipt["committedRoots"].as_array().unwrap();
+	let replicated = committed
+		.iter()
+		.find(|root| root["root"] == "ReplicatedStorage")
+		.expect("every staged root is reported");
+
+	assert_eq!(replicated["entries"], 0, "nothing displaced: {replicated}");
+	assert_eq!(replicated["written"], 0, "nothing rewritten: {replicated}");
+	assert_eq!(replicated["backup"], Value::Null);
+	assert_eq!(replicated["recoveryAction"], "none");
+	assert!(replicated["unchanged"].as_u64().unwrap() >= 1);
 
 	assert_eq!(
 		fs::read_to_string(daemon.root.join("server").join("Main.server.luau")).unwrap(),

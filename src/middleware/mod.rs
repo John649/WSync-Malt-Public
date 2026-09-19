@@ -409,13 +409,9 @@ fn new_snapshot_file_child(path: &Path, context: &Context, vfs: &Vfs) -> Result<
 				// Windows kills it without unwinding, with no panic message
 				// and an exit code of 0. Seen live on a directory carrying
 				// both `init.server.luau` and `init.runserver.luau`.
+				// `child_source_of` already chose this file over the others and
+				// named each loser once; here they are only skipped
 				if is_child_source(&entry, context) {
-					warn!(
-						"{} and {} are both child scripts of the same directory; only the first is synced",
-						path.display(),
-						entry.display()
-					);
-
 					continue;
 				}
 

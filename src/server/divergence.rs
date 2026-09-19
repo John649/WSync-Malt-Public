@@ -586,8 +586,8 @@ async fn studio_first_commit(state: &AppState, items: Vec<Item>, accepted: u64, 
 
 	let options = bulk::StudioFirstOptions { preserve };
 
-	let backups = match bulk::apply_roots(state, &transfer_id, &staged_roots, Some(&options)).await {
-		Ok(backups) => backups,
+	let applied = match bulk::apply_roots(state, &transfer_id, &staged_roots, Some(&options)).await {
+		Ok(applied) => applied,
 		Err((status, mut payload)) => {
 			fs::remove_dir_all(&staging).ok();
 
@@ -662,7 +662,14 @@ async fn studio_first_commit(state: &AppState, items: Vec<Item>, accepted: u64, 
 		"applied": true,
 		"direction": "studio",
 		"transferId": transfer_id,
-		"backups": backups,
+		"backups": applied.backups,
+		// What the apply actually wrote. A reconnect that finds the disk
+		// already holding Studio's content reports `entries: 0` with no
+		// backups: nothing was rewritten and no backup batch was created
+		"entries": applied.entries,
+		"written": applied.written,
+		"unchanged": applied.unchanged,
+		"committedRoots": applied.roots,
 		"backlogged": backlogged,
 		// Named, never silently dropped: these entries had no directory
 		// anywhere above them, so the apply had nowhere to put them

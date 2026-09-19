@@ -42,6 +42,7 @@ use crate::{
 		BULK_ROOT_MAX_BYTES, BULK_SCRIPT_MAX_BYTES, BULK_TRANSFER_MAX_BYTES, REQUEST_DEFAULT_TIMEOUT_MS,
 		SOURCE_READ_CHUNK_BYTES,
 	},
+	config::Config,
 	core::{
 		changes::Changes,
 		conflict::{self, ContentState},
@@ -671,25 +672,7 @@ fn sync_tree_in_place(stage: &Path, live: &Path) -> Result<(), String> {
 			continue;
 		}
 
-		let from = stage.join(relative);
-		let to = live.join(relative);
-
-		if let Some(parent) = to.parent() {
-			fs::create_dir_all(parent).map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
-		}
-
-		let temp = to.with_file_name(format!(
-			".{}.wsync-tmp",
-			to.file_name().unwrap_or_default().to_string_lossy()
-		));
-
-		fs::copy(&from, &temp).map_err(|err| format!("failed to stage {}: {err}", to.display()))?;
-
-		if let Err(err) = rename_with_retry(&temp, &to) {
-			fs::remove_file(&temp).ok();
-
-			return Err(format!("failed to replace {}: {err}", to.display()));
-		}
+		replace_file(&stage.join(relative), &live.join(relative))?;
 	}
 
 	// Whatever the stage does not carry has left the projection
@@ -757,6 +740,340 @@ fn fingerprint_dir(dir: &Path) -> Result<BTreeMap<PathBuf, [u8; 32]>, String> {
 	walk(dir, dir, &mut fingerprint).map_err(|err| format!("failed to read {}: {err}", dir.display()))?;
 
 	Ok(fingerprint)
+}
+
+// The incremental apply: writing only what actually differs
+
+/// Extensions whose middleware reads through `Vfs::read_to_string`, which
+/// folds line endings when `ignore_line_endings` is on. Only these may be
+/// compared line-ending-insensitively: the byte readers (`.rbxm`, `.rbxmx`,
+/// `.csv`, `.msgpack`) are handed every byte the file holds, so for them a
+/// carriage return is content
+const TEXT_READ_EXTENSIONS: [&str; 8] = ["luau", "lua", "txt", "md", "json", "toml", "yaml", "yml"];
+
+/// The reader's own normalization (`StdBackend::read_to_string`)
+fn normalize_endings(contents: &str) -> String {
+	if contents.contains('\r') {
+		contents.replace("\r\n", "\n").replace('\r', "\n")
+	} else {
+		contents.to_owned()
+	}
+}
+
+/// Whether two files hold the same content *as the projection reads it*.
+///
+/// Equal bytes are equal content, always. When the bytes differ and
+/// `ignore_line_endings` is on — the default, and exactly what the VFS
+/// applies when a middleware reads a text file — a text file is compared
+/// again with `\r\n` and lone `\r` folded to `\n`. Those two files project to
+/// the same instance, so rewriting the live one would rewrite every line of
+/// every file in a CRLF checkout to change nothing the sync can see
+fn same_content(staged_file: &Path, live_file: &Path) -> Result<bool, String> {
+	let read = |path: &Path| fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()));
+
+	let staged = read(staged_file)?;
+	let live = read(live_file)?;
+
+	if staged == live {
+		return Ok(true);
+	}
+
+	if !Config::new().ignore_line_endings {
+		return Ok(false);
+	}
+
+	let textual = live_file
+		.extension()
+		.and_then(|extension| extension.to_str())
+		.is_some_and(|extension| TEXT_READ_EXTENSIONS.contains(&extension.to_lowercase().as_str()));
+
+	if !textual {
+		return Ok(false);
+	}
+
+	match (String::from_utf8(staged), String::from_utf8(live)) {
+		(Ok(staged), Ok(live)) => Ok(normalize_endings(&staged) == normalize_endings(&live)),
+		// Not text after all, whatever the extension claims: bytes decide
+		_ => Ok(false),
+	}
+}
+
+/// Every file (with its digest) and every directory under `root`, keyed by
+/// path relative to it.
+///
+/// Directories are indexed too, not just walked: code scope syncs folders
+/// **including empty ones** (Design §7.0), so "the stage has a folder the
+/// disk does not" is a real difference that no file-level comparison sees
+#[derive(Debug, Default)]
+struct TreeIndex {
+	files: BTreeMap<PathBuf, [u8; 32]>,
+	dirs: BTreeSet<PathBuf>,
+}
+
+fn index_tree(root: &Path) -> Result<TreeIndex, String> {
+	fn walk(base: &Path, current: &Path, index: &mut TreeIndex) -> std::io::Result<()> {
+		for entry in fs::read_dir(current)? {
+			let entry = entry?;
+			let path = entry.path();
+			let relative = path.strip_prefix(base).unwrap_or(&path).to_owned();
+
+			if entry.file_type()?.is_dir() {
+				index.dirs.insert(relative);
+				walk(base, &path, index)?;
+			} else {
+				index.files.insert(relative, Sha256::digest(fs::read(&path)?).into());
+			}
+		}
+
+		Ok(())
+	}
+
+	let mut index = TreeIndex::default();
+
+	if root.is_dir() {
+		walk(root, root, &mut index).map_err(|err| format!("failed to read {}: {err}", root.display()))?;
+	}
+
+	Ok(index)
+}
+
+/// What landing the stage on the live tree would actually change, path by
+/// path — the difference between an apply and a rewrite.
+///
+/// The whole-root swap is correct but indiscriminate: it replaced 1 273 files
+/// to change none of them, gave every one a new mtime, copied every one into
+/// the backup batch and handed the watcher a burst of writes that meant
+/// nothing. The plan is what makes the apply proportional to the difference
+#[derive(Debug, Default)]
+struct ApplyPlan {
+	/// Live files the stage replaces with different content
+	changed: Vec<PathBuf>,
+	/// Files the stage carries and the live tree has no entry for
+	created: Vec<PathBuf>,
+	/// Live files the stage does not carry — they have left the projection
+	removed: Vec<PathBuf>,
+	/// Directories the stage has and the live tree does not (an empty folder
+	/// is an instance too)
+	created_dirs: Vec<PathBuf>,
+	/// Directories the live tree has and the stage does not
+	removed_dirs: Vec<PathBuf>,
+	/// Files both sides already agree on: never opened for writing, never
+	/// backed up, mtime untouched, no watcher event
+	unchanged: usize,
+	/// A path that is a file on one side and a directory on the other.
+	/// Per-file replacement cannot express that without a moment where the
+	/// root holds neither shape, so the whole-tree swap runs instead
+	shape_change: Option<PathBuf>,
+}
+
+impl ApplyPlan {
+	/// Nothing to write, nothing to remove, nothing to back up
+	fn is_empty(&self) -> bool {
+		self.changed.is_empty()
+			&& self.created.is_empty()
+			&& self.removed.is_empty()
+			&& self.created_dirs.is_empty()
+			&& self.removed_dirs.is_empty()
+	}
+
+	/// Live files this apply displaces — exactly what the backup batch holds
+	fn backup_entries(&self) -> usize {
+		self.changed.len() + self.removed.len()
+	}
+
+	fn written(&self) -> usize {
+		self.changed.len() + self.created.len()
+	}
+}
+
+/// Compares the assembled stage against the live tree (Design §7.4-A). Both
+/// sides are read once; only paths whose digests disagree are read again for
+/// the line-ending comparison
+fn plan_apply(stage: &Path, live: &Path) -> Result<ApplyPlan, String> {
+	let staged = index_tree(stage)?;
+	let current = index_tree(live)?;
+
+	let mut plan = ApplyPlan::default();
+
+	for (relative, digest) in &staged.files {
+		if current.dirs.contains(relative) {
+			plan.shape_change = Some(relative.clone());
+			return Ok(plan);
+		}
+
+		match current.files.get(relative) {
+			Some(live_digest) => {
+				if live_digest == digest || same_content(&stage.join(relative), &live.join(relative))? {
+					plan.unchanged += 1;
+				} else {
+					plan.changed.push(relative.clone());
+				}
+			}
+			None => plan.created.push(relative.clone()),
+		}
+	}
+
+	for relative in current.files.keys() {
+		if staged.dirs.contains(relative) {
+			plan.shape_change = Some(relative.clone());
+			return Ok(plan);
+		}
+
+		if !staged.files.contains_key(relative) {
+			plan.removed.push(relative.clone());
+		}
+	}
+
+	for relative in &staged.dirs {
+		if !current.dirs.contains(relative) {
+			plan.created_dirs.push(relative.clone());
+		}
+	}
+
+	for relative in &current.dirs {
+		if !staged.dirs.contains(relative) {
+			plan.removed_dirs.push(relative.clone());
+		}
+	}
+
+	Ok(plan)
+}
+
+/// Copies one file into place through a neighbouring temp file, so a reader
+/// sees either the whole old file or the whole new one
+fn replace_file(from: &Path, to: &Path) -> Result<(), String> {
+	if let Some(parent) = to.parent() {
+		fs::create_dir_all(parent).map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+	}
+
+	let temp = to.with_file_name(format!(
+		".{}.wsync-tmp",
+		to.file_name().unwrap_or_default().to_string_lossy()
+	));
+
+	fs::copy(from, &temp).map_err(|err| format!("failed to stage {}: {err}", to.display()))?;
+
+	if let Err(err) = rename_with_retry(&temp, to) {
+		fs::remove_file(&temp).ok();
+
+		return Err(format!("failed to replace {}: {err}", to.display()));
+	}
+
+	Ok(())
+}
+
+/// What the file-level apply has already done to the live tree — the ledger
+/// a failure rolls back against
+#[derive(Default)]
+struct Touched {
+	written: Vec<PathBuf>,
+	removed: Vec<PathBuf>,
+	made_dirs: Vec<PathBuf>,
+}
+
+/// Lands the plan on the live tree. Every file goes through temp+rename, and
+/// the plan's whole backup is written before this runs, so the caller can put
+/// back anything a mid-way failure touched
+fn run_plan(plan: &ApplyPlan, stage: &Path, live: &Path, touched: &mut Touched) -> Result<(), String> {
+	for relative in &plan.created_dirs {
+		let dir = live.join(relative);
+
+		fs::create_dir_all(&dir).map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
+		touched.made_dirs.push(relative.clone());
+	}
+
+	for relative in plan.changed.iter().chain(&plan.created) {
+		replace_file(&stage.join(relative), &live.join(relative))?;
+		touched.written.push(relative.clone());
+	}
+
+	for relative in &plan.removed {
+		let path = live.join(relative);
+
+		fs::remove_file(&path).map_err(|err| format!("failed to remove {}: {err}", path.display()))?;
+		touched.removed.push(relative.clone());
+	}
+
+	// Deepest first: every file a removed directory held is in `removed`, so
+	// what is left here is empty
+	for relative in plan.removed_dirs.iter().rev() {
+		let dir = live.join(relative);
+
+		if dir.is_dir() {
+			fs::remove_dir_all(&dir).map_err(|err| format!("failed to remove {}: {err}", dir.display()))?;
+		}
+	}
+
+	Ok(())
+}
+
+/// Undoes exactly what `run_plan` managed to do before it failed: originals
+/// come back from the backup, paths the stage invented are removed again, and
+/// directories it created go with them. Reports whether the root came back
+/// whole — a half-applied root is the one outcome this path may not leave
+fn rollback_plan(plan: &ApplyPlan, live: &Path, backup: &Path, touched: &Touched) -> bool {
+	let created: HashSet<&PathBuf> = plan.created.iter().collect();
+	let mut restored = true;
+
+	for relative in &touched.written {
+		let path = live.join(relative);
+
+		if created.contains(relative) {
+			// Nothing stood here before the apply
+			restored &= fs::remove_file(&path).is_ok();
+			continue;
+		}
+
+		restored &= fs::copy(backup.join(relative), &path).is_ok();
+	}
+
+	for relative in &touched.removed {
+		let path = live.join(relative);
+
+		if let Some(parent) = path.parent() {
+			fs::create_dir_all(parent).ok();
+		}
+
+		restored &= fs::copy(backup.join(relative), &path).is_ok();
+	}
+
+	for relative in touched.made_dirs.iter().rev() {
+		// Best effort, and only while empty: a directory the apply created
+		// and then filled is carried by the files restored above
+		fs::remove_dir(live.join(relative)).ok();
+	}
+
+	restored
+}
+
+/// Applies the plan with its backup: every live file the plan overwrites or
+/// removes is copied into `backup` — under the same relative layout the
+/// whole-tree backup uses — before anything is written. Untouched files never
+/// enter the backup, so the batch is the size of the change
+fn apply_plan(plan: &ApplyPlan, stage: &Path, live: &Path, backup: &Path) -> Result<(), String> {
+	for relative in plan.changed.iter().chain(&plan.removed) {
+		let from = live.join(relative);
+		let to = backup.join(relative);
+
+		if let Some(parent) = to.parent() {
+			fs::create_dir_all(parent).map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+		}
+
+		fs::copy(&from, &to).map_err(|err| format!("failed to back up {}: {err}", from.display()))?;
+	}
+
+	let mut touched = Touched::default();
+
+	if let Err(err) = run_plan(plan, stage, live, &mut touched) {
+		let restored = rollback_plan(plan, live, backup, &touched);
+
+		return Err(format!(
+			"{err}; the file-level apply was rolled back and the live root was {}",
+			if restored { "restored" } else { "NOT restored" }
+		));
+	}
+
+	Ok(())
 }
 
 /// Materializes the pulled subtree into `stage_root` through the regular
@@ -975,9 +1292,67 @@ pub fn refresh_roots(state: &AppState, roots: &BTreeSet<String>) {
 	}
 }
 
+/// What one root's apply actually did to the disk — the receipt's facts
+pub struct RootOutcome {
+	/// `<transfer>/<root>`, named only when something was displaced into it.
+	/// `None` means the disk already held the staged content: no backup
+	/// directory was created, because there was nothing to put in it
+	pub backup: Option<String>,
+	/// Live files displaced into the backup (overwritten or removed)
+	pub entries: usize,
+	/// Files written (replaced + created)
+	pub written: usize,
+	/// Files left exactly as they were, mtime included
+	pub unchanged: usize,
+	/// The whole-tree swap ran, so the backup holds the entire former root
+	pub whole_tree: bool,
+}
+
+impl RootOutcome {
+	/// How a recovery puts this root back. Unchanged for every root that has
+	/// a backup — `backupScope` is what says how much of the root that
+	/// backup covers, because a file-level backup holds only the files the
+	/// apply displaced and is restored *over* the root, not *as* it
+	fn recovery_action(&self) -> &'static str {
+		if self.backup.is_some() {
+			"restoreBackup"
+		} else {
+			"none"
+		}
+	}
+
+	/// What the backup covers: the whole former root, only the displaced
+	/// files, or nothing at all
+	fn backup_scope(&self) -> &'static str {
+		if self.whole_tree {
+			"root"
+		} else if self.backup.is_some() {
+			"files"
+		} else {
+			"none"
+		}
+	}
+
+	fn json(&self, root_name: &str) -> Value {
+		json!({
+			"root": root_name,
+			"backup": self.backup,
+			"entries": self.entries,
+			"written": self.written,
+			"unchanged": self.unchanged,
+			"recoveryAction": self.recovery_action(),
+			"backupScope": self.backup_scope(),
+		})
+	}
+}
+
 /// Applies one root: pull → stage → fence → (preserve + overlay when
-/// studio-first) → swap → refresh tree → stamp baselines. Returns the backup
-/// name (`<transfer>/<root>`) on success
+/// studio-first) → plan → file-level apply (or the whole-tree swap) →
+/// refresh tree → stamp baselines.
+///
+/// The apply is incremental at the file level: a staged file the disk
+/// already holds is not rewritten, not backed up and not given a new mtime,
+/// and a root the disk already matches is not touched at all
 async fn apply_root(
 	state: &AppState,
 	transfer_dir: &Path,
@@ -985,7 +1360,7 @@ async fn apply_root(
 	root_name: &str,
 	transfer_bytes: &mut u64,
 	studio_first: Option<&StudioFirstOptions>,
-) -> Result<String, String> {
+) -> Result<RootOutcome, String> {
 	let target = resolve_root(state, root_name)?;
 
 	// A missing live directory is not a failure: the root is mapped but has
@@ -1078,7 +1453,7 @@ async fn apply_root(
 
 	vfs.pause();
 
-	let swapped = (|| -> Result<(), String> {
+	let swapped = (|| -> Result<RootOutcome, String> {
 		let current = fingerprint_dir(&target.live_dir)?;
 
 		if current != fence {
@@ -1088,12 +1463,57 @@ async fn apply_root(
 			));
 		}
 
+		if studio_first.is_some() {
+			// Disk-only and out-of-projection files stay on the live disk:
+			// the stage is overlaid so the apply carries them forward instead
+			// of displacing them into the backup. Overlaying before the plan
+			// is what makes them compare equal and drop out of it
+			overlay_unclaimed(&target.live_dir, &stage_root, &target.context)?;
+		}
+
+		// What this apply would actually change. Files the stage and the disk
+		// already agree on are not rewritten, not backed up and not given a
+		// new mtime — and the watcher, which used to see a burst of writes
+		// that changed nothing, hears nothing about them
+		let plan = plan_apply(&stage_root, &target.live_dir)?;
+
+		if plan.is_empty() {
+			info!(
+				"{root_name}: disk already matches the staged projection, {} file(s) unchanged; \
+				 nothing written and no backup taken",
+				plan.unchanged
+			);
+
+			return Ok(RootOutcome {
+				backup: None,
+				entries: 0,
+				written: 0,
+				unchanged: plan.unchanged,
+				whole_tree: false,
+			});
+		}
+
 		if let Some(options) = studio_first {
-			// Preserve the disk originals of `differs` entries under this
-			// root into the review store — the fence just proved these bytes
-			// are the generation the comparison ran against (Design §7.0)
+			// Preserve the disk originals of the `differs` entries this apply
+			// really replaces — the fence just proved these bytes are the
+			// generation the comparison ran against (Design §7.0). An entry
+			// whose file the stage agrees with byte for byte was displaced by
+			// nothing, so there is no original to keep and nothing to backlog.
+			// A shape change takes the whole-tree swap, which displaces the
+			// entire root, so there the whole preserve set stands
+			let displaced: HashSet<PathBuf> = plan
+				.changed
+				.iter()
+				.chain(&plan.removed)
+				.map(|relative| target.live_dir.join(relative))
+				.collect();
+
 			for (live_path, preserve_target) in &options.preserve {
 				if !live_path.starts_with(&target.live_dir) || !live_path.is_file() {
+					continue;
+				}
+
+				if plan.shape_change.is_none() && !displaced.contains(live_path) {
 					continue;
 				}
 
@@ -1109,12 +1529,37 @@ async fn apply_root(
 					)
 				})?;
 			}
-
-			// Disk-only and out-of-projection files stay on the live disk:
-			// the stage is overlaid so the swap carries them forward instead
-			// of displacing them into the backup
-			overlay_unclaimed(&target.live_dir, &stage_root, &target.context)?;
 		}
+
+		// The ordinary path: replace only what differs, in place. The live
+		// directory is never renamed, so no watch has to move and nothing
+		// outside the plan is touched
+		if plan.shape_change.is_none() {
+			apply_plan(&plan, &stage_root, &target.live_dir, &backup_path)?;
+
+			return Ok(RootOutcome {
+				backup: (plan.backup_entries() > 0).then(|| format!("{transfer_name}/{}", target.key)),
+				entries: plan.backup_entries(),
+				written: plan.written(),
+				unchanged: plan.unchanged,
+				whole_tree: false,
+			});
+		}
+
+		// A path is a file on one side and a directory on the other. Replacing
+		// that per path would pass through a state where the root holds
+		// neither shape, so the whole root moves at once instead
+		if let Some(path) = &plan.shape_change {
+			debug!(
+				"{root_name}: {} changes shape between disk and Studio; applying the whole root",
+				path.display()
+			);
+		}
+
+		// Counted while both trees still stand: the backup is about to hold
+		// every live file, and the stage is about to become the root
+		let displaced = current.len();
+		let written = count_files(&stage_root);
 
 		// The watch must move off the directory before it is renamed away
 		// (inotify-style watchers follow inodes, not paths, and on Windows the
@@ -1192,13 +1637,22 @@ async fn apply_root(
 
 		vfs.watch(&target.live_dir, true).ok();
 
-		Ok(())
+		Ok(RootOutcome {
+			backup: Some(format!("{transfer_name}/{}", target.key)),
+			entries: displaced,
+			written,
+			unchanged: 0,
+			whole_tree: true,
+		})
 	})();
 
-	if let Err(message) = swapped {
-		vfs.resume();
-		return Err(message);
-	}
+	let outcome = match swapped {
+		Ok(outcome) => outcome,
+		Err(message) => {
+			vfs.resume();
+			return Err(message);
+		}
+	};
 
 	// Refresh the daemon tree from the swapped root. The resulting changes
 	// are dropped deliberately — Studio already holds exactly this state
@@ -1208,15 +1662,68 @@ async fn apply_root(
 	vfs.resume();
 
 	info!(
-		"Keep-Studio apply committed root {root_name} (backup {transfer_name}/{})",
-		target.key
+		"Keep-Studio apply committed root {root_name}: {} file(s) written, {} unchanged, {} backed up ({})",
+		outcome.written,
+		outcome.unchanged,
+		outcome.entries,
+		outcome.backup.as_deref().unwrap_or("no backup needed"),
 	);
 
-	Ok(format!("{transfer_name}/{}", target.key))
+	Ok(outcome)
+}
+
+/// How many files a tree holds, without reading any of them
+fn count_files(dir: &Path) -> usize {
+	let Ok(entries) = fs::read_dir(dir) else {
+		return 0;
+	};
+
+	entries
+		.flatten()
+		.map(|entry| {
+			let path = entry.path();
+
+			if path.is_dir() {
+				count_files(&path)
+			} else {
+				1
+			}
+		})
+		.sum()
+}
+
+/// What a whole transfer did to the disk — the receipt's disk-side facts.
+///
+/// `backups` keeps its old shape (the names of the backup directories this
+/// transfer wrote) and is simply empty when nothing was displaced
+#[derive(Default)]
+pub struct TransferOutcome {
+	pub backups: Vec<String>,
+	/// Live files displaced into the backup across every root
+	pub entries: usize,
+	/// Files written across every root
+	pub written: usize,
+	/// Files left exactly as they were
+	pub unchanged: usize,
+	/// Per-root detail, in commit order
+	pub roots: Vec<Value>,
+}
+
+impl TransferOutcome {
+	fn record(&mut self, root_name: &str, root: RootOutcome) {
+		self.entries += root.entries;
+		self.written += root.written;
+		self.unchanged += root.unchanged;
+		self.roots.push(root.json(root_name));
+
+		if let Some(backup) = root.backup {
+			self.backups.push(backup);
+		}
+	}
 }
 
 /// Runs the fenced per-root apply for every staged root in sequence. Returns
-/// the backup names on success, or the pinned failure payload with its HTTP
+/// what landed on success, or the pinned failure payload with its HTTP
 /// status (the terminal, replayable partial receipt — earlier committed roots
 /// stand, never rolled back, and their backups are preserved indefinitely
 /// because the transfer never marks complete)
@@ -1225,9 +1732,9 @@ pub async fn apply_roots(
 	transfer_id: &str,
 	staged_roots: &BTreeSet<String>,
 	studio_first: Option<&StudioFirstOptions>,
-) -> Result<Vec<String>, (StatusCode, Value)> {
+) -> Result<TransferOutcome, (StatusCode, Value)> {
 	if staged_roots.is_empty() {
-		return Ok(Vec::new());
+		return Ok(TransferOutcome::default());
 	}
 
 	let workspace_dir = state.core.project().workspace_dir.clone();
@@ -1249,8 +1756,7 @@ pub async fn apply_roots(
 		));
 	}
 
-	let mut committed: Vec<Value> = Vec::new();
-	let mut backups: Vec<String> = Vec::new();
+	let mut outcome = TransferOutcome::default();
 	let mut transfer_bytes = 0u64;
 
 	for root_name in staged_roots {
@@ -1265,14 +1771,7 @@ pub async fn apply_roots(
 		.await;
 
 		match applied {
-			Ok(backup) => {
-				committed.push(json!({
-					"root": root_name,
-					"backup": backup,
-					"recoveryAction": "restoreBackup",
-				}));
-				backups.push(backup);
-			}
+			Ok(root) => outcome.record(root_name, root),
 			Err(error) => {
 				warn!("Keep-Studio apply failed at root {root_name}: {error}");
 
@@ -1284,41 +1783,64 @@ pub async fn apply_roots(
 						"recoveryRequired": true,
 						"failedRoot": root_name,
 						"error": error,
-						"committedRoots": committed,
+						"committedRoots": outcome.roots,
 					}),
 				));
 			}
 		}
 	}
 
-	// The completion marker is what makes this transfer's backups prunable
-	let marker = json!({
-		"choiceId": transfer_id,
-		"completedAt": Utc::now().to_rfc3339(),
-		"roots": staged_roots.iter().collect::<Vec<_>>(),
-	});
-
-	if let Err(err) = fs::write(transfer_dir.join(BACKUP_COMPLETE_MARKER), marker.to_string()) {
-		warn!("Failed to write the backup completion marker: {err}");
-	}
-
-	// Leftover empty staging directory
+	// Leftover staging directory (the file-level apply copies out of it
+	// rather than renaming it away, so it is normally still here)
 	fs::remove_dir_all(transfer_dir.join(STAGE_DIR)).ok();
+
+	if outcome.backups.is_empty() {
+		// Nothing was displaced, so there is no batch: a transfer directory
+		// holding only the emptied stage is not a backup of anything, and
+		// without a completion marker it would never be pruned either
+		fs::remove_dir_all(&transfer_dir).ok();
+
+		info!(
+			"{}: disk already matches, {} files unchanged",
+			if studio_first.is_some() { "Studio-first" } else { "Keep-Studio" },
+			outcome.unchanged
+		);
+	} else {
+		// The completion marker is what makes this transfer's backups prunable
+		let marker = json!({
+			"choiceId": transfer_id,
+			"completedAt": Utc::now().to_rfc3339(),
+			"roots": staged_roots.iter().collect::<Vec<_>>(),
+			"entries": outcome.entries,
+			"written": outcome.written,
+			"unchanged": outcome.unchanged,
+		});
+
+		if let Err(err) = fs::write(transfer_dir.join(BACKUP_COMPLETE_MARKER), marker.to_string()) {
+			warn!("Failed to write the backup completion marker: {err}");
+		}
+	}
 
 	prune_backups(&backups_root);
 
-	Ok(backups)
+	Ok(outcome)
 }
 
 /// Applies the Keep-Studio decision for every staged root in sequence,
 /// producing the pinned success or partial receipt (Design §7.4-A)
 pub async fn apply_keep_studio(state: &AppState, choice_id: &str, staged_roots: BTreeSet<String>) -> Response {
 	match apply_roots(state, choice_id, &staged_roots, None).await {
-		Ok(backups) => Json(json!({
+		Ok(outcome) => Json(json!({
 			"ok": true,
 			"applied": true,
 			"direction": "studio",
-			"backups": backups,
+			"backups": outcome.backups,
+			// What the apply actually did: `entries: 0` with nothing in
+			// `backups` means the disk already held the staged projection
+			"entries": outcome.entries,
+			"written": outcome.written,
+			"unchanged": outcome.unchanged,
+			"committedRoots": outcome.roots,
 		}))
 		.into_response(),
 		Err((status, payload)) => (status, Json(payload)).into_response(),
@@ -1433,6 +1955,228 @@ mod tests {
 			.join(format!("{stamp}-recent-{:03}", BACKUP_KEEP_COUNT + 2))
 			.exists());
 		assert!(!root.join(format!("{stamp}-recent-000")).exists());
+	}
+
+	/// A live tree and a stage that holds exactly the same thing
+	fn twin_trees() -> (tempfile::TempDir, PathBuf, PathBuf) {
+		let scratch = tempfile::tempdir().unwrap();
+		let live = scratch.path().join("live");
+		let stage = scratch.path().join("stage");
+
+		for root in [&live, &stage] {
+			fs::create_dir_all(root.join("Nested")).unwrap();
+			fs::write(root.join("Hello.luau"), b"return \"hello\"\n").unwrap();
+			fs::write(root.join("ModA.luau"), b"return \"mod-a\"\n").unwrap();
+			fs::write(root.join("Nested").join("Deep.luau"), b"return \"deep\"\n").unwrap();
+		}
+
+		(scratch, live, stage)
+	}
+
+	/// Every file under `root`, by relative path, with its mtime
+	fn mtimes(root: &Path) -> BTreeMap<PathBuf, std::time::SystemTime> {
+		index_tree(root)
+			.unwrap()
+			.files
+			.keys()
+			.map(|relative| {
+				let stamp = fs::metadata(root.join(relative)).unwrap().modified().unwrap();
+				(relative.clone(), stamp)
+			})
+			.collect()
+	}
+
+	#[test]
+	fn a_stage_the_disk_already_holds_writes_nothing_and_backs_up_nothing() {
+		let (scratch, live, stage) = twin_trees();
+		let backup = scratch.path().join("backup");
+
+		let plan = plan_apply(&stage, &live).unwrap();
+
+		assert!(plan.is_empty(), "nothing to do: {plan:?}");
+		assert_eq!(plan.unchanged, 3);
+		assert_eq!(plan.backup_entries(), 0);
+		assert_eq!(plan.written(), 0);
+		assert!(plan.shape_change.is_none());
+
+		// Even run outright, an empty plan is a no-op: no write, no backup
+		// directory, no new mtime anywhere
+		let before = mtimes(&live);
+		apply_plan(&plan, &stage, &live, &backup).unwrap();
+
+		assert!(!backup.exists(), "an unchanged root creates no backup batch");
+		assert_eq!(mtimes(&live), before, "untouched files keep their mtime");
+	}
+
+	#[test]
+	fn one_changed_file_is_written_and_backed_up_alone() {
+		let (scratch, live, stage) = twin_trees();
+		let backup = scratch.path().join("backup");
+
+		fs::write(stage.join("ModA.luau"), b"return \"studio mod-a\"\n").unwrap();
+
+		let plan = plan_apply(&stage, &live).unwrap();
+
+		assert_eq!(plan.changed, vec![PathBuf::from("ModA.luau")]);
+		assert!(plan.created.is_empty() && plan.removed.is_empty());
+		assert_eq!(plan.unchanged, 2);
+		assert_eq!(plan.backup_entries(), 1);
+
+		let before = mtimes(&live);
+
+		apply_plan(&plan, &stage, &live, &backup).unwrap();
+
+		// Exactly that file was written
+		assert_eq!(
+			fs::read_to_string(live.join("ModA.luau")).unwrap(),
+			"return \"studio mod-a\"\n"
+		);
+
+		let after = mtimes(&live);
+
+		for relative in before.keys() {
+			if relative == Path::new("ModA.luau") {
+				continue;
+			}
+
+			assert_eq!(before[relative], after[relative], "{} must not be rewritten", relative.display());
+		}
+
+		// The backup batch holds that one displaced original, nothing else
+		let backed_up = index_tree(&backup).unwrap();
+
+		assert_eq!(backed_up.files.keys().collect::<Vec<_>>(), vec![&PathBuf::from("ModA.luau")]);
+		assert_eq!(
+			fs::read_to_string(backup.join("ModA.luau")).unwrap(),
+			"return \"mod-a\"\n"
+		);
+
+		// No temp file survived the rename
+		assert!(!live.join(".ModA.luau.wsync-tmp").exists());
+	}
+
+	#[test]
+	fn additions_removals_and_folders_are_planned_per_path() {
+		let (scratch, live, stage) = twin_trees();
+		let backup = scratch.path().join("backup");
+
+		fs::write(stage.join("Extra.luau"), b"return \"extra\"\n").unwrap();
+		fs::remove_file(stage.join("Hello.luau")).unwrap();
+		fs::create_dir_all(stage.join("Empty")).unwrap();
+		fs::create_dir_all(live.join("Gone")).unwrap();
+
+		let plan = plan_apply(&stage, &live).unwrap();
+
+		assert_eq!(plan.created, vec![PathBuf::from("Extra.luau")]);
+		assert_eq!(plan.removed, vec![PathBuf::from("Hello.luau")]);
+		assert_eq!(plan.created_dirs, vec![PathBuf::from("Empty")]);
+		assert_eq!(plan.removed_dirs, vec![PathBuf::from("Gone")]);
+		assert_eq!(plan.unchanged, 2);
+
+		let before = mtimes(&live);
+
+		apply_plan(&plan, &stage, &live, &backup).unwrap();
+
+		assert!(live.join("Extra.luau").is_file());
+		assert!(!live.join("Hello.luau").exists());
+		assert!(live.join("Empty").is_dir(), "an empty folder is an instance too");
+		assert!(!live.join("Gone").exists());
+
+		let after = mtimes(&live);
+
+		for relative in [PathBuf::from("ModA.luau"), PathBuf::from("Nested").join("Deep.luau")] {
+			assert_eq!(before[&relative], after[&relative], "{} must not be rewritten", relative.display());
+		}
+
+		// A removed file is displaced and backed up; a created one displaces
+		// nothing, so it has no original to keep
+		let backed_up = index_tree(&backup).unwrap();
+
+		assert_eq!(backed_up.files.keys().collect::<Vec<_>>(), vec![&PathBuf::from("Hello.luau")]);
+	}
+
+	#[test]
+	fn line_endings_alone_are_not_a_change_for_what_the_reader_normalizes() {
+		let scratch = tempfile::tempdir().unwrap();
+		let live = scratch.path().join("live");
+		let stage = scratch.path().join("stage");
+
+		fs::create_dir_all(&live).unwrap();
+		fs::create_dir_all(&stage).unwrap();
+
+		// The disk checkout has CRLF, Studio hands back LF
+		fs::write(live.join("Hello.luau"), b"local a = 1\r\nreturn a\r\n").unwrap();
+		fs::write(stage.join("Hello.luau"), b"local a = 1\nreturn a\n").unwrap();
+
+		// A byte reader's file: every byte it holds is content
+		fs::write(live.join("Model.rbxmx"), b"<roblox>\r\n</roblox>\r\n").unwrap();
+		fs::write(stage.join("Model.rbxmx"), b"<roblox>\n</roblox>\n").unwrap();
+
+		let plan = plan_apply(&stage, &live).unwrap();
+
+		assert_eq!(plan.unchanged, 1, "the script reads the same either way");
+		assert_eq!(plan.changed, vec![PathBuf::from("Model.rbxmx")]);
+
+		// A real edit still lands, line endings or not
+		fs::write(stage.join("Hello.luau"), b"local a = 2\nreturn a\n").unwrap();
+
+		let plan = plan_apply(&stage, &live).unwrap();
+
+		assert!(plan.changed.contains(&PathBuf::from("Hello.luau")));
+	}
+
+	#[test]
+	fn a_path_that_changes_shape_falls_back_to_the_whole_tree() {
+		let (scratch, live, stage) = twin_trees();
+
+		// `Hello` gained children: the file becomes a directory
+		fs::remove_file(stage.join("Hello.luau")).unwrap();
+		fs::create_dir_all(stage.join("Hello.luau")).unwrap();
+		fs::write(stage.join("Hello.luau").join("init.luau"), b"return 1\n").unwrap();
+
+		let plan = plan_apply(&stage, &live).unwrap();
+
+		assert_eq!(plan.shape_change, Some(PathBuf::from("Hello.luau")));
+
+		drop(scratch);
+	}
+
+	#[test]
+	fn a_failed_apply_puts_the_root_back() {
+		let (scratch, live, stage) = twin_trees();
+		let backup = scratch.path().join("backup");
+
+		fs::write(stage.join("ModA.luau"), b"return \"studio mod-a\"\n").unwrap();
+		fs::write(stage.join("Extra.luau"), b"return \"extra\"\n").unwrap();
+
+		let mut plan = plan_apply(&stage, &live).unwrap();
+
+		// A removal of something that is not there fails the run after the
+		// writes have already landed — the shape of any mid-apply failure
+		plan.removed.push(PathBuf::from("Nowhere.luau"));
+
+		// Its backup copy has to exist for the rollback to restore it, which
+		// is exactly what the missing source denies
+		let error = apply_plan(&plan, &stage, &live, &backup).unwrap_err();
+
+		assert!(error.contains("failed to back up"), "error: {error}");
+
+		// Nothing was written: the backup runs before the first write
+		assert_eq!(fs::read_to_string(live.join("ModA.luau")).unwrap(), "return \"mod-a\"\n");
+		assert!(!live.join("Extra.luau").exists());
+
+		// A failure *inside* the run — here a file the stage wants under a
+		// path that is already a file — is rolled back whole, after two
+		// writes have already landed
+		plan.removed.clear();
+		plan.created.push(PathBuf::from("Hello.luau").join("Child.luau"));
+
+		let error = apply_plan(&plan, &stage, &live, &backup).unwrap_err();
+
+		assert!(error.contains("rolled back"), "error: {error}");
+		assert!(error.contains("was restored"), "error: {error}");
+		assert_eq!(fs::read_to_string(live.join("ModA.luau")).unwrap(), "return \"mod-a\"\n");
+		assert!(!live.join("Extra.luau").exists(), "a created file is removed again");
 	}
 
 	#[test]
