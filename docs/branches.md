@@ -167,6 +167,49 @@ its journal: `branch up` reopens the clone, renumbers, and replays.
 Main keeps one journal with a checkpoint mark per branch. A branch's merge reads
 main's events after its mark.
 
+### Blobs travel with the flush
+
+An `add`'s blob is pinned in the plugin's own transfer store, and for a while
+that was the only copy — the merge drained it out of the branch's Studio at
+`finish`. So closing a branch's window destroyed the payloads its journal
+named, and `branch finish` on a closed branch failed outright:
+`journal_flush` had nobody to answer. The bytes now travel with the events:
+
+- `POST /journal/append` answers first, then pulls. The batch is on disk
+  before anything else happens — a flush waiting on eleven serialized subtrees
+  is a recorder that cannot hand over its events — and a background pass then
+  drains each newly referenced blob with the same `branch_blob_open` /
+  `branch_blob_read` / `branch_blob_close` ops the CLI uses, checks the
+  sha256 the plugin named, writes it to `journal/blobs/<id>` and closes the
+  plugin's pin.
+- `journal/blobs.json` indexes what is owed: `stored` once the bytes are on
+  disk, `pending` until then, with the last failure's reason on it. A pull
+  that fails never drops its event — the event is the record and the blob is
+  only its payload — and the next append retries it. An id already on disk is
+  never pulled twice.
+- A blob an *earlier* `add` for the same instance carried is deleted once its
+  replacement is stored. Re-serializing a subtree on the refresh timer would
+  otherwise leave every intermediate copy on disk, and a replay only ever
+  reads the last one.
+- `GET /journal` reports `blobsOnDisk` and `blobsMissing` beside the events,
+  which is what a merge consults before it starts, and `POST /journal/append`
+  answers with the `blobsPending` it has just gone off to fetch.
+- Only a **branch** daemon keeps blobs. Main's stream exists for a branch's
+  conflict detection, which reads main's *events*; main's own `add` payloads
+  are never replayed anywhere, so pulling them would mean writing a serialized
+  subtree to disk for every instance anyone ever adds to main.
+
+On the way out the branch plugin also pushes. `plugin.Unloading` runs one last
+flush and then POSTs the pinned bytes of each added root to
+`POST /journal/blob/<id>?encoding=base64` — base64 because `RequestAsync` sends
+a Lua string and a serialized place is not text — newest capture first, bounded
+at three seconds, and never raising. It is best effort in the strict sense:
+`plugin.Unloading` is the only close hook Studio offers a plugin, and it does
+not fire when the process is killed. That is exactly why the daemon pulls
+rather than waiting to be pushed to. The pull is the contract; the unload push
+is only the last few seconds the pull did not get to, and a plugin that never
+pushes is merged from exactly as before.
+
 ## Two or more live branches
 
 `wsync branch new B` while branch A is still open is ordinary, and four
@@ -244,8 +287,9 @@ were untouched, and only the finished branch's mark was dropped.
 
 1. `git merge --no-ff --no-commit` main into the branch worktree. Conflicts are
    resolved there, with the branch Studio showing the result.
-2. Ship the branch journal and blobs to main's daemon. Main's plugin replays
-   them against the live tree inside one `ChangeHistoryService` recording:
+2. Read the branch's journal and its blobs off the branch daemon's disk and
+   ship them to main's daemon. Main's plugin replays them against the live
+   tree inside one `ChangeHistoryService` recording:
    - an id only the branch touched: apply;
    - an id only main touched: keep;
    - an id both touched: a conflict, unless the values are equal;
@@ -261,6 +305,31 @@ were untouched, and only the finished branch's mark was dropped.
 An id that never existed at the checkpoint (added on the branch) cannot be
 "recovered" as a rename of something else, because it has no counterpart to be
 paired with. That is the whole reason to track instead of diff.
+
+### A closed branch Studio still merges
+
+`finish` needs the branch's plugin for exactly one call, `journal_flush`, and
+that call only tops up a journal the daemon already holds: every event was
+pushed on the recorder's own two-second timer, and every blob those events
+name was pulled off the plugin as they arrived ("Blobs travel with the
+flush"). So a flush that finds nobody home is a note, not a failure:
+
+```
+Branch alpha's Studio is closed; merging from the journal on disk
+```
+
+and the merge runs from `journal/<checkpoint>.jsonl` and `journal/blobs/`.
+
+The one thing that stops it is a payload that never made it across. Before
+main is touched at all, `finish` checks every blob its events reference
+against `blobsOnDisk`; if one is missing it refuses, names the ids, and says
+to run `wsync branch up <name>` — which reopens the clone, replays, and leaves
+the branch in a state the next `finish` can read. `finish` never launches a
+Studio itself. Merging without a blob would silently drop the instances it
+carries, which is the failure mode the whole design exists to avoid.
+
+The branch daemon does have to be running: it serves the journal and the
+blobs. `branch up` starts one if it is gone.
 
 ## Locks and budget
 

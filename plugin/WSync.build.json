@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
   "artifact": "WSync.rbxm",
-  "sha256": "c2b50f5dc2fc04b6f58208c3b18053363a1847616ab9b6384c99bb3a9ad11b55",
+  "sha256": "f8c57b6fb2250aa2c611afe154dc72cc42cf37974196de623b623bedce2c74ef",
   "pluginVersion": "0.1.0",
   "protocolVersion": 1,
-  "builtAt": "2026-09-19T04:00:38.341Z",
-  "buildCommit": "35522bf989ad",
+  "builtAt": "2026-09-19T13:41:45.946Z",
+  "buildCommit": "5cd9816c918c",
   "buildDirty": true
 }

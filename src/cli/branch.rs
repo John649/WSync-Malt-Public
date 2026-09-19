@@ -29,6 +29,17 @@
 //! Still unverified here: the daemon routes `POST /journal/mark`,
 //! `GET /journal?checkpoint=`, `POST /sync/pause` and `POST /sync/resume`.
 //!
+//! A CLOSED BRANCH STUDIO STILL MERGES. `finish` needs a plugin for exactly
+//! one call — `journal_flush`, which tops up a journal the daemon already
+//! holds — so a flush that finds no plugin is a note ("branch Studio is
+//! closed; merging from the journal on disk"), not a failure. The payloads
+//! come off disk too: the branch daemon pulls each `add`'s blob out of the
+//! plugin as the event that names it is appended, and `GET /journal` reports
+//! which ids made it (`blobsOnDisk`) and which did not (`blobsMissing`). A
+//! blob that is missing is the one thing that stops a closed-Studio merge,
+//! and it stops it before main is touched, naming `wsync branch up <name>`.
+//! Nothing here ever launches a Studio to rescue a merge.
+//!
 //! MORE THAN ONE LIVE BRANCH. Nothing here assumes a single branch, and the
 //! three places that could have are each pinned down:
 //!
@@ -72,9 +83,10 @@ use std::{
 };
 
 use crate::{
-	cli::client::{print_json, truncate, Client, Target, Targeting},
+	cli::client::{print_json, truncate, Client, Envelope, Target, Targeting},
 	daemon, docsgen,
 	ext::PathExt,
+	server::journal::{finish_decision, FinishDecision},
 	wsync_info, wsync_warn,
 };
 
@@ -687,9 +699,10 @@ impl Up {
 		let journal = fetch_journal(&branch, &record.checkpoint)?;
 		let decisions = read_decisions(&root);
 
-		// A clone that has just been reopened has nothing pinned, so a blob the
-		// daemon did not keep is reported rather than fatal
-		let blobs = collect_blobs(&branch, &journal, false, self.raw)?;
+		// A clone that has just been reopened has nothing pinned, so its
+		// payloads come off the daemon's own disk; a blob the daemon never
+		// managed to pull is reported rather than fatal
+		let blobs = collect_blobs(&branch, &journal, BlobSource::PluginOptional, self.raw)?;
 		let replayed = replay(
 			&branch,
 			&record.checkpoint,
@@ -848,17 +861,46 @@ impl Finish {
 
 		// The branch's journal and blobs come out before main is touched at
 		// all: main's plugin cannot reach the branch daemon, so every `add`
-		// payload travels inline, drained from the branch's own plugin while
-		// its Studio is still up — and nothing below has to unwind if this
-		// part fails
+		// payload travels inline — and nothing below has to unwind if this
+		// part fails.
+		//
+		// A CLOSED BRANCH STUDIO IS NOT A FAILED MERGE. The flush is the one
+		// thing here that needs a plugin, and it is only ever topping up a
+		// journal the daemon already holds: every event was pushed on the
+		// recorder's own two-second timer, and every blob those events name
+		// was pulled off the plugin as they arrived. So a flush that finds
+		// nobody home is a note, not an error — the merge runs from disk.
+		// What it may NOT do is run from a disk that is missing a payload,
+		// which is the one case that sends the person back to `branch up`
 		let branch = Client::connect(&record.targeting(&main.project))?;
-		branch
-			.request_with_timeout("journal_flush", json!({}), HEAVY_TIMEOUT_MS)?
-			.into_value(self.raw)?;
+		let flush = branch.request_with_timeout("journal_flush", json!({}), HEAVY_TIMEOUT_MS)?;
+		let studio_closed = studio_is_closed(&flush);
+
+		if !studio_closed {
+			flush.into_value(self.raw)?;
+		}
 
 		let journal = fetch_journal(&branch, &record.checkpoint)?;
 		let decisions = read_decisions(&root);
-		let blobs = collect_blobs(&branch, &journal, true, self.raw)?;
+
+		let source = if studio_closed {
+			if let Some(refusal) = blobs_missing_on_disk(&journal).refusal(&record.name) {
+				bail!("{refusal}");
+			}
+
+			if !self.raw {
+				wsync_info!(
+					"Branch {}'s Studio is closed; merging from the journal on disk",
+					record.name.bold()
+				);
+			}
+
+			BlobSource::DiskOnly
+		} else {
+			BlobSource::PluginRequired
+		};
+
+		let blobs = collect_blobs(&branch, &journal, source, self.raw)?;
 
 		// Main's daemon holds every disk push from here until the replay is
 		// done: the parking commit, the merge and the restore of main's own
@@ -1749,6 +1791,27 @@ fn upload_blob(port: u16, id: &str, payload: &[u8]) -> Result<()> {
 	Ok(())
 }
 
+/// `GET /journal/blob/<id>` — the bytes the daemon kept beside the journal,
+/// or `None` when it never got them. This is the copy a merge prefers: it
+/// needs no Studio, which is the whole point of the daemon pulling blobs as
+/// the events that name them are appended
+fn download_blob(port: u16, id: &str) -> Result<Option<Vec<u8>>> {
+	let response = reqwest::blocking::Client::builder()
+		.no_proxy()
+		.timeout(Duration::from_secs(30))
+		.redirect(reqwest::redirect::Policy::none())
+		.build()?
+		.get(format!("http://localhost:{port}/journal/blob/{id}"))
+		.send()
+		.with_context(|| format!("Failed to read blob {id} from the daemon on port {port}"))?;
+
+	if !response.status().is_success() {
+		return Ok(None);
+	}
+
+	Ok(Some(response.bytes()?.to_vec()))
+}
+
 /// Brings a branch's daemon and Studio back if either is gone. Returns what
 /// had to be restarted
 fn restart(record: &mut Record, root: &Path, project: &Path, budget: usize, workspace: &Path) -> Result<Vec<String>> {
@@ -1935,57 +1998,173 @@ fn decisions_map(decisions: &[Value]) -> Value {
 	Value::Object(map)
 }
 
-/// Gathers the `{artifactId: <base64 rbxm>}` a replay needs: whatever the
-/// daemon already kept, plus every `add` event's blob drained from the plugin
-/// that pinned it. `required` is false where the pin is legitimately gone —
-/// a reopened clone starts with an empty blob store
-fn collect_blobs(client: &Client, journal: &Value, required: bool, raw: bool) -> Result<Value> {
+/// Where a replay's payloads may come from when the daemon does not have
+/// them on disk
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlobSource {
+	/// A live branch Studio: anything the daemon is still missing is drained
+	/// from the plugin, and a blob neither side has fails the merge
+	PluginRequired,
+	/// `branch up`: a reopened clone pins nothing, so a blob that is neither
+	/// on disk nor in the plugin only skips its own `add`
+	PluginOptional,
+	/// The branch's Studio is closed. Disk is all there is, and `finish` has
+	/// already checked that disk is enough
+	DiskOnly,
+}
+
+/// Gathers the `{artifactId: <base64 rbxm>}` a replay needs.
+///
+/// Disk first, always: the daemon pulls each `add`'s blob out of the plugin
+/// moments after the event that names it, so by merge time the bytes are
+/// normally sitting in the journal's own `blobs/` directory and no Studio has
+/// to be alive for them. The plugin is the fallback for what has not made it
+/// across yet — and under [`BlobSource::DiskOnly`] there is no plugin to ask.
+///
+/// PER INSTANCE, NOT PER ID. An added root is serialized more than once: at
+/// the `add`, then again on the refresh timer while the branch keeps working,
+/// and each re-capture emits another `add` carrying another id. The daemon
+/// keeps the newest and drops the ones it superseded, so the one payload that
+/// survives is shipped under EVERY id that instance's events name — the
+/// replay looks a blob up by the id its own event carries, and every one of
+/// them has to resolve to the same subtree
+fn collect_blobs(client: &Client, journal: &Value, source: BlobSource, raw: bool) -> Result<Value> {
 	let mut blobs = journal
 		.get("blobs")
 		.and_then(Value::as_object)
 		.cloned()
 		.unwrap_or_default();
 
-	let mut wanted: Vec<String> = journal
+	let events = journal
 		.get("events")
 		.and_then(Value::as_array)
-		.map(|events| {
-			events
-				.iter()
-				.filter(|event| event.get("op").and_then(Value::as_str) == Some("add"))
-				.filter_map(|event| event.get("blob").and_then(Value::as_str))
-				.map(str::to_owned)
-				.collect()
-		})
+		.cloned()
 		.unwrap_or_default();
 
-	wanted.sort();
-	wanted.dedup();
+	let port = client.port();
 
-	for artifact in wanted {
-		if blobs.get(&artifact).and_then(Value::as_str).is_some() {
+	for (owner, ids) in crate::server::journal::blob_groups(&events) {
+		if ids.iter().any(|id| blobs.get(id).and_then(Value::as_str).is_some()) {
 			continue;
 		}
 
-		// Not closed: a replay that comes back with conflicts is run again
-		// after `branch pick`, and it needs the same payloads
-		match pull_blob(client, &artifact, raw) {
-			Ok(payload) => {
-				blobs.insert(
-					artifact,
-					json!(base64::engine::general_purpose::STANDARD.encode(payload)),
-				);
+		// Newest first: the last serialization of a subtree is the one the
+		// daemon kept, and the one whose bytes describe the branch as it
+		// actually ended up
+		let mut payload = None;
+		let mut refusal = None;
+
+		for id in ids.iter().rev() {
+			match download_blob(port, id) {
+				Ok(Some(bytes)) => {
+					payload = Some(bytes);
+					break;
+				}
+				Ok(None) => {}
+				Err(error) => {
+					wsync_warn!("Could not read journal blob {id} from the daemon on port {port}: {error}");
+				}
 			}
-			Err(error) if !required => {
-				wsync_warn!("Journal blob {artifact} is no longer pinned, so its `add` will be skipped: {error}");
+
+			if source == BlobSource::DiskOnly {
+				continue;
 			}
-			Err(error) => {
-				return Err(error.context(format!("Journal blob {artifact} could not be drained for the replay")));
+
+			// Not closed: a replay that comes back with conflicts is run again
+			// after `branch pick`, and it needs the same payloads
+			match pull_blob(client, id, raw) {
+				Ok(bytes) => {
+					payload = Some(bytes);
+					break;
+				}
+				Err(error) => refusal = Some((id.clone(), error)),
 			}
+		}
+
+		let Some(payload) = payload else {
+			match source {
+				BlobSource::DiskOnly => bail!(
+					"Branch instance {owner}'s subtree is not in the journal on disk ({}) and this branch's Studio \
+					 is closed, so there is nowhere left to read it from",
+					ids.join(", ")
+				),
+				BlobSource::PluginOptional => {
+					wsync_warn!(
+						"Journal blob(s) {} for {owner} are no longer pinned, so its `add` will be skipped",
+						ids.join(", ")
+					);
+
+					continue;
+				}
+				BlobSource::PluginRequired => {
+					let (id, error) = refusal.expect("a required pull that found nothing reports why");
+
+					return Err(error.context(format!("Journal blob {id} could not be drained for the replay")));
+				}
+			}
+		};
+
+		let encoded = json!(base64::engine::general_purpose::STANDARD.encode(payload));
+
+		for id in ids {
+			blobs.insert(id, encoded.clone());
 		}
 	}
 
 	Ok(Value::Object(blobs))
+}
+
+/// The branch's Studio is not there to answer.
+///
+/// A `journal_flush` reaches the plugin through the branch daemon, so "no
+/// Studio" arrives as a daemon-authored `PLUGIN_ERROR`: as `plugin_missing`
+/// when nothing was ever dispatched, and as a disconnect message when the
+/// socket died with the request in flight. Both mean the same thing for a
+/// merge — there is nothing left to flush, and the journal on disk is the
+/// whole record
+fn studio_is_closed(envelope: &Envelope) -> bool {
+	if envelope.ok {
+		return false;
+	}
+
+	if envelope.plugin_missing() {
+		return true;
+	}
+
+	if envelope.error_code() != "PLUGIN_ERROR" {
+		return false;
+	}
+
+	let message = envelope.error_message().to_ascii_lowercase();
+
+	message.contains("no studio plugin connected")
+		|| message.contains("plugin disconnected")
+		|| message.contains("does not support requests")
+}
+
+/// Every blob id the journal's events reference that the daemon does not
+/// have on disk. `blobsOnDisk` is the daemon's own answer; a daemon build
+/// that predates it reports neither list, and the ids are then all treated as
+/// missing rather than assumed present
+fn blobs_missing_on_disk(journal: &Value) -> FinishDecision {
+	let events = journal
+		.get("events")
+		.and_then(Value::as_array)
+		.cloned()
+		.unwrap_or_default();
+
+	let on_disk: HashSet<String> = journal
+		.get("blobsOnDisk")
+		.and_then(Value::as_array)
+		.map(|ids| {
+			ids.iter()
+				.filter_map(Value::as_str)
+				.map(str::to_owned)
+				.collect::<HashSet<String>>()
+		})
+		.unwrap_or_default();
+
+	finish_decision(&events, &on_disk)
 }
 
 fn conflicts_of(replayed: &Value) -> Vec<Value> {

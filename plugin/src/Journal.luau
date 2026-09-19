@@ -126,6 +126,11 @@ Journal.OBSERVE_CHUNK = 2000
 -- whichever comes first (the CLI's pull contract).
 Journal.BLOB_TTL_SECONDS = 600
 Journal.BLOB_READ_MAX_LEN = 512 * 1024
+-- How long the unload push may spend before it gives up on what is left.
+-- `plugin.Unloading` runs while Studio is tearing the session down and
+-- nothing there is owed a yield, so the last word is bounded by the clock
+-- rather than by how much there is to say.
+Journal.UNLOAD_BUDGET_SECONDS = 3
 
 -- Properties the recorder never reports. `Parent` is structure (move events
 -- carry it) and `Source` is git's (wsync writes every script to disk as it
@@ -228,7 +233,19 @@ local watchInstance: (Instance) -> () = function() end
 -- removal batch, both of which are defined further down.
 local onParentChanged: (Instance) -> () = function() end
 
-type AddedRoot = { instance: Instance, parent: string, name: string, class: string, capturedAt: number, capturedTick: number }
+-- `blobId` is the LAST blob this root was serialized into: the one its most
+-- recent `add` carries, and so the only one a replay reads. The unload push
+-- walks these, so a Studio that is closing has something concrete to hand
+-- over rather than a store keyed by ids only the journal knows.
+type AddedRoot = {
+	instance: Instance,
+	parent: string,
+	name: string,
+	class: string,
+	blobId: string?,
+	capturedAt: number,
+	capturedTick: number,
+}
 
 local addedRoots: { [string]: AddedRoot } = {}
 
@@ -1112,6 +1129,42 @@ function Journal.fetchBlob(blobId: string): (string?, string?)
 	return body :: string, nil
 end
 
+--- Push a pinned blob's bytes INTO this Studio's own daemon:
+--- `POST /journal/blob/<id>?encoding=base64`.
+---
+--- The daemon normally pulls (`branch_blob_open`/`read`/`close`) shortly
+--- after the `add` that names the blob is appended, and that pull is the
+--- contract — a plugin that never pushes is still merged from. This is the
+--- other direction, for the one moment the pull cannot happen: the window is
+--- closing, so there is no later round trip to be had and the bytes go out
+--- now or not at all.
+---
+--- Returns `(true, nil)` or `(false, reason)`.
+function Journal.pushBlob(blobId: string): (boolean, string?)
+	if endpoint == nil then
+		return false, "this Studio is not connected to a daemon"
+	end
+
+	local entry = Transfers.getOut(blobs, blobId, os.clock())
+
+	if entry == nil then
+		return false, `blob {blobId} is closed, expired, or was never captured`
+	end
+
+	local scheme = if (endpoint :: any).https then "https" else "http"
+	local url = `{scheme}://{(endpoint :: any).host}:{(endpoint :: any).port}/journal/blob/{blobId}?encoding=base64`
+
+	local ok, err = pcall(function()
+		Http.postText(url, Base64.encode(buffer.tostring(entry.bytes)), "text/plain"):expect()
+	end)
+
+	if not ok then
+		return false, `POST /journal/blob/{blobId} failed: {tostring(err)}`
+	end
+
+	return true, nil
+end
+
 --- Drop a pinned blob. Returns false when there was nothing to drop, so a
 --- double close reads as "already gone" rather than as an error.
 function Journal.dropBlob(blobId: string): boolean
@@ -1147,6 +1200,8 @@ local function refreshBlobs()
 		if blobId == nil then
 			continue
 		end
+
+		root.blobId = blobId
 
 		-- A refresh is NOT a second add. While the original is still pending it
 		-- is patched in place (no new seq, no second event); once it has gone
@@ -1264,6 +1319,95 @@ function Journal.flush(): { flushed: number, pending: number }
 	lastFlushAt = os.clock()
 
 	return { flushed = #batch, pending = pendingCount }
+end
+
+--- The recorder's last word, run from `plugin.Unloading`.
+---
+--- Everything pending goes out as one ordinary flush, and then the bytes of
+--- every added root still pinned are pushed after it, newest capture first,
+--- until `UNLOAD_BUDGET_SECONDS` runs out. Both halves are best effort and
+--- neither may raise: Studio is closing the session around this call, and a
+--- branch whose last seconds of work did not make it is a branch that merges
+--- without them — not a Studio that refuses to close.
+---
+--- `plugin.Unloading` is the only close hook Studio offers a plugin, and it
+--- does not fire when the process is killed. That is precisely why the
+--- daemon pulls blobs as the journal appends them (docs/branches.md,
+--- "Journal") rather than leaving the transfer to this moment: this is the
+--- belt, and the pull is the braces.
+function Journal.unload(): { flushed: number, pushed: number, skipped: number }
+	if not active or checkpointId == nil then
+		return { flushed = 0, pushed = 0, skipped = 0 }
+	end
+
+	local started = os.clock()
+	local flushed = 0
+
+	local okFlush, result = pcall(Journal.flush)
+
+	if okFlush and type(result) == "table" then
+		flushed = (result :: any).flushed or 0
+	end
+
+	-- Newest capture first: an older blob for the same root has already been
+	-- superseded by the one the last `add` carries, so if the budget only
+	-- covers some of them it should cover the ones a replay will read.
+	local roots: { AddedRoot } = {}
+
+	for _, root in addedRoots do
+		if root.blobId ~= nil then
+			table.insert(roots, root)
+		end
+	end
+
+	table.sort(roots, function(a, b)
+		return a.capturedAt > b.capturedAt
+	end)
+
+	local pushed = 0
+	local skipped = 0
+
+	for _, root in roots do
+		if os.clock() - started >= Journal.UNLOAD_BUDGET_SECONDS then
+			skipped += #roots - pushed - skipped
+			break
+		end
+
+		local ok = Journal.pushBlob(root.blobId :: string)
+
+		if ok then
+			pushed += 1
+		else
+			skipped += 1
+		end
+	end
+
+	Log.debug(`Journal: unload pushed {flushed} event(s) and {pushed} blob(s), {skipped} left behind`)
+
+	return { flushed = flushed, pushed = pushed, skipped = skipped }
+end
+
+--- Connect the unload push once, to the Plugin this module was loaded under.
+--- Hooked from `Journal.start` rather than at require time, so a Studio that
+--- never records a journal never registers anything.
+local unloadConnected = false
+
+local function connectUnload()
+	if unloadConnected then
+		return
+	end
+
+	local host = script:FindFirstAncestorWhichIsA("Plugin")
+
+	if host == nil then
+		return
+	end
+
+	unloadConnected = true
+
+	host.Unloading:Connect(function()
+		pcall(Journal.unload)
+	end)
 end
 
 --------------------------------------------------------------------------------
@@ -1869,6 +2013,7 @@ local function onDescendantAdded(instance: Instance, service: Instance)
 			parent = parent,
 			name = instance.Name,
 			class = class,
+			blobId = blobId,
 			capturedAt = os.clock(),
 			capturedTick = emitTick + 1,
 		}
@@ -2025,6 +2170,7 @@ function Journal.start(checkpoint: string, services: { Instance }?)
 
 	subscribeTags()
 	startLoop()
+	connectUnload()
 
 	Log.stage(`Journal: recording checkpoint {checkpoint} over {checkpointCount} instances`)
 end

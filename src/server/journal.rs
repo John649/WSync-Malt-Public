@@ -16,6 +16,22 @@
 //! - `marks.json` — main's daemon's record of which checkpoint each branch
 //!   was cut at, so a merge knows where in main's own journal to start.
 //! - `blobs/<id>` — the serialized subtrees an `add` event refers to.
+//! - `blobs.json` — which of those ids have arrived and which are still owed,
+//!   so a reader can tell "no blob yet" from "no blob ever".
+//!
+//! BLOBS TRAVEL WITH THE FLUSH. An `add` event names a blob the plugin pinned
+//! in its own transfer store, and for a long time that was the only copy: a
+//! merge drained it out of the branch's Studio at `finish`. A branch whose
+//! Studio had been closed therefore could not be merged at all — there was
+//! nobody left to answer, and the bytes went with the window. So an append
+//! that references blob ids now pulls them straight away: the batch is
+//! answered first (a flush has to stay fast), then a background pass drains
+//! each new blob over the same `branch_blob_open`/`read`/`close` ops the CLI
+//! uses and stores it under `blobs/`. An id already on disk is never pulled
+//! twice, and a blob an earlier `add` for the same instance carried is
+//! deleted once its replacement is stored. A pull that fails is logged and
+//! left `pending` in the index for the next append to retry — it never drops
+//! the event, because the event is the record and the blob is its payload.
 //!
 //! The store is deliberately dumb: it does not parse, validate or order the
 //! events it is handed. What an event means is the plugin's and the merge
@@ -44,17 +60,23 @@ use axum::{
 	http::{header, StatusCode},
 	response::{IntoResponse, Json, Response},
 };
+use base64::Engine;
 use log::{debug, trace, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
+	collections::HashSet,
 	fs::{self, OpenOptions},
 	io::{ErrorKind, Write},
 	path::{Path, PathBuf},
-	sync::Mutex,
+	sync::{
+		atomic::{AtomicBool, Ordering},
+		Mutex,
+	},
 };
 
-use crate::{constants::BRANCHES_DIR, lock, server::AppState};
+use crate::{constants::BRANCHES_DIR, lock, server::bulk, server::AppState};
 
 /// Directory under [`BRANCHES_DIR`] that holds every journal
 const JOURNAL_DIR: &str = "journal";
@@ -65,10 +87,32 @@ const MARKS_FILE: &str = "marks.json";
 /// Where blobs land inside [`JOURNAL_DIR`]
 const BLOBS_DIR: &str = "blobs";
 
+/// The blob index inside [`JOURNAL_DIR`]: which referenced ids are on disk
+const BLOBS_FILE: &str = "blobs.json";
+
 /// How many events one `POST /journal/append` may carry. A bound, not a
 /// policy: the plugin batches on a timer, and a batch this large means
 /// something upstream stopped batching
 const APPEND_MAX_EVENTS: usize = 4096;
+
+/// An indexed blob whose bytes are on disk
+pub const BLOB_STORED: &str = "stored";
+
+/// An indexed blob the journal references but has not pulled yet
+pub const BLOB_PENDING: &str = "pending";
+
+/// How much of a blob one `branch_blob_read` carries. Mirrors the plugin's
+/// own `Journal.BLOB_READ_MAX_LEN`, which is the ceiling it enforces
+const BLOB_READ_MAX_LEN: usize = 512 * 1024;
+
+/// How long one `branch_blob_*` op may take. A serialized subtree can be
+/// large and the plugin serializes it on the main thread, so this is the
+/// transfer surface's deadline rather than the 5 s remote-op default
+const BLOB_OP_TIMEOUT_MS: u64 = 30_000;
+
+/// Parts one blob may be read in before the pull is called broken. A bound on
+/// a plugin that answers `eof: false` forever, not a policy
+const BLOB_MAX_PARTS: usize = 4096;
 
 /// Checkpoint ids, branch names and blob ids all become path components, so
 /// they are restricted to a set with no way out of the journal directory: no
@@ -95,12 +139,150 @@ pub struct Mark {
 	pub at: String,
 }
 
+/// One blob an event references, and what the daemon has done about it.
+///
+/// `state` is [`BLOB_STORED`] once the bytes are under `blobs/`, and
+/// [`BLOB_PENDING`] until then — with `error` carrying why the last pull
+/// failed, so a retry is a decision someone can read rather than a silent
+/// loop. `owner` is the instance id whose `add` carried the blob: a later
+/// `add` for the same instance supersedes this one, which is how a refreshed
+/// subtree stops the journal accumulating every intermediate serialization
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BlobRecord {
+	pub id: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub owner: Option<String>,
+	pub state: String,
+	#[serde(default)]
+	pub bytes: u64,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub error: Option<String>,
+}
+
+/// A blob id an event named, with the instance it belongs to
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobRef {
+	pub id: String,
+	pub owner: Option<String>,
+}
+
+/// Every blob id a batch of events references, in arrival order and
+/// deduplicated: an `add` carries the serialized subtree, and a blob-only
+/// refresh (`add` with `update: true`) carries a fresher one for the same
+/// instance. Anything else with a plain-name `blob` field is taken at its
+/// word — the store does not decide what an event means
+pub fn blob_refs(events: &[Value]) -> Vec<BlobRef> {
+	let mut refs: Vec<BlobRef> = Vec::new();
+
+	for event in events {
+		let Some(id) = event.get("blob").and_then(Value::as_str).filter(|id| safe_name(id)) else {
+			continue;
+		};
+
+		if refs.iter().any(|blob| blob.id == id) {
+			continue;
+		}
+
+		refs.push(BlobRef {
+			id: id.to_owned(),
+			owner: event.get("id").and_then(Value::as_str).map(str::to_owned),
+		});
+	}
+
+	refs
+}
+
+/// The blob ids one instance's `add`s carried, oldest first, grouped by that
+/// instance and in the order the instances first appear.
+///
+/// An instance's blobs are INTERCHANGEABLE. Each is a serialization of the
+/// same subtree at a different moment — the `add` when it appeared, then a
+/// refresh every `BLOB_REFRESH_SECONDS` while the branch keeps working — and
+/// a replay reconstructs the subtree from whichever one it is handed. That is
+/// what makes deleting a superseded blob safe: the merge asks by the id its
+/// event names, and the CLI answers with the freshest serialization of the
+/// same instance under that name.
+///
+/// An event with a blob but no instance id is its own group, which is the
+/// conservative reading: nothing may stand in for it
+pub fn blob_groups(events: &[Value]) -> Vec<(String, Vec<String>)> {
+	let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+
+	for blob in blob_refs(events) {
+		let owner = blob.owner.unwrap_or_else(|| blob.id.clone());
+
+		match groups.iter_mut().find(|(key, _)| *key == owner) {
+			Some((_, ids)) => ids.push(blob.id),
+			None => groups.push((owner, vec![blob.id])),
+		}
+	}
+
+	groups
+}
+
+/// Whether a merge can run from the journal on disk alone.
+///
+/// This is the question `wsync branch finish` asks when the branch's Studio
+/// is closed: every added subtree has to have a serialization on disk,
+/// because there is no plugin left to drain. An instance whose blobs are ALL
+/// gone is not an `add` the merge may quietly skip — it is a merge that must
+/// not start, because skipping it drops the instances that blob carries
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinishDecision {
+	Proceed,
+	Refuse { missing: Vec<String> },
+}
+
+impl FinishDecision {
+	/// The message a refusal prints, naming the branch to reopen. `None` when
+	/// the decision is to proceed
+	pub fn refusal(&self, branch: &str) -> Option<String> {
+		let FinishDecision::Refuse { missing } = self else {
+			return None;
+		};
+
+		Some(format!(
+			"Branch {branch}'s Studio is closed and {} of its added subtree(s) never reached the journal on disk \
+			 ({}). Reopen it with `wsync branch up {branch}` and run the finish again — merging without those blobs \
+			 would drop the instances they carry",
+			missing.len(),
+			missing.join(", ")
+		))
+	}
+}
+
+/// [`FinishDecision`] for a journal's events against the ids actually on
+/// disk. An instance is satisfied by ANY one of its serializations, so a
+/// superseded id that has been cleaned up does not refuse a merge the newest
+/// one can serve
+pub fn finish_decision(events: &[Value], on_disk: &HashSet<String>) -> FinishDecision {
+	let missing: Vec<String> = blob_groups(events)
+		.into_iter()
+		.filter(|(_, ids)| !ids.iter().any(|id| on_disk.contains(id)))
+		.filter_map(|(_, ids)| ids.last().cloned())
+		.collect();
+
+	if missing.is_empty() {
+		FinishDecision::Proceed
+	} else {
+		FinishDecision::Refuse { missing }
+	}
+}
+
 /// The on-disk journal for one workspace. The mutex serializes writers
 /// against each other; readers go straight to the file, which is safe
 /// because a line is only ever appended whole
 pub struct JournalStore {
 	dir: PathBuf,
 	write: Mutex<()>,
+	/// A blob pull pass is running. Only one at a time reaches the plugin,
+	/// because the plugin answers one request at a time anyway and a second
+	/// pass would pull the same ids twice
+	pulling: AtomicBool,
+	/// Something was appended since the running pass took its list, so it
+	/// goes round again rather than the append having to wait for it
+	wanted: AtomicBool,
 }
 
 impl JournalStore {
@@ -108,6 +290,8 @@ impl JournalStore {
 		Self {
 			dir: workspace_dir.join(BRANCHES_DIR).join(JOURNAL_DIR),
 			write: Mutex::new(()),
+			pulling: AtomicBool::new(false),
+			wanted: AtomicBool::new(false),
 		}
 	}
 
@@ -121,6 +305,10 @@ impl JournalStore {
 
 	fn blob_path(&self, id: &str) -> PathBuf {
 		self.dir.join(BLOBS_DIR).join(id)
+	}
+
+	fn blobs_path(&self) -> PathBuf {
+		self.dir.join(BLOBS_FILE)
 	}
 
 	/// Every stream one append has to reach: the one it names, then every
@@ -279,9 +467,8 @@ impl JournalStore {
 		Ok((marks, true))
 	}
 
-	fn put_blob(&self, id: &str, bytes: &[u8]) -> Result<(), String> {
-		let _guard = lock!(self.write);
-
+	/// The bytes, with no index bookkeeping and no lock of its own
+	fn write_blob_file(&self, id: &str, bytes: &[u8]) -> Result<(), String> {
 		let blobs = self.dir.join(BLOBS_DIR);
 
 		fs::create_dir_all(&blobs).map_err(|err| format!("Failed to create the blob directory: {err}"))?;
@@ -299,6 +486,197 @@ impl JournalStore {
 	fn blob(&self, id: &str) -> Option<Vec<u8>> {
 		fs::read(self.blob_path(id)).ok()
 	}
+
+	// The blob index
+
+	/// What the index currently says. A missing or damaged index is an empty
+	/// one: it is a record of intent, and the directory is the truth
+	pub fn blob_index(&self) -> Vec<BlobRecord> {
+		let Ok(contents) = fs::read_to_string(self.blobs_path()) else {
+			return Vec::new();
+		};
+
+		match serde_json::from_str::<Vec<BlobRecord>>(&contents) {
+			Ok(records) => records,
+			Err(err) => {
+				warn!("Failed to read the journal blob index: {err}");
+
+				Vec::new()
+			}
+		}
+	}
+
+	fn write_blob_index(&self, records: &[BlobRecord]) -> Result<(), String> {
+		fs::create_dir_all(&self.dir).map_err(|err| format!("Failed to create the journal directory: {err}"))?;
+
+		let path = self.blobs_path();
+		let temp = path.with_extension("tmp");
+
+		let contents = serde_json::to_string_pretty(records)
+			.map_err(|err| format!("Failed to serialize the blob index: {err}"))?;
+
+		fs::write(&temp, contents).map_err(|err| format!("Failed to write the blob index: {err}"))?;
+		fs::rename(&temp, &path).map_err(|err| format!("Failed to move the blob index into place: {err}"))?;
+
+		Ok(())
+	}
+
+	/// Every blob id whose bytes are actually under `blobs/`. Read from the
+	/// directory rather than from the index, so bytes that arrived some other
+	/// way — a plugin that pushed them itself on unload, a `finish` that
+	/// uploaded a checkpoint shape — count exactly as much as ones this
+	/// daemon pulled
+	pub fn stored_blobs(&self) -> HashSet<String> {
+		let mut stored = HashSet::new();
+
+		let Ok(entries) = fs::read_dir(self.dir.join(BLOBS_DIR)) else {
+			return stored;
+		};
+
+		for entry in entries.flatten() {
+			let name = entry.file_name().to_string_lossy().into_owned();
+
+			if safe_name(&name) && !name.ends_with(".tmp") {
+				stored.insert(name);
+			}
+		}
+
+		stored
+	}
+
+	/// Records every blob a batch references and returns the ids that still
+	/// have to be pulled — the ones with no bytes on disk, whether they are
+	/// new or a pull that failed earlier. An id already stored is never
+	/// returned, so a re-sent batch costs one directory listing and nothing
+	/// else
+	pub fn note_blobs(&self, refs: &[BlobRef]) -> Vec<String> {
+		if refs.is_empty() {
+			return self.pending_blobs();
+		}
+
+		let _guard = lock!(self.write);
+
+		let stored = self.stored_blobs();
+		let mut records = self.blob_index();
+		let mut changed = false;
+
+		for blob in refs {
+			match records.iter_mut().find(|record| record.id == blob.id) {
+				Some(record) => {
+					if record.owner.is_none() && blob.owner.is_some() {
+						record.owner.clone_from(&blob.owner);
+						changed = true;
+					}
+				}
+				None => {
+					records.push(BlobRecord {
+						id: blob.id.clone(),
+						owner: blob.owner.clone(),
+						state: if stored.contains(&blob.id) {
+							BLOB_STORED
+						} else {
+							BLOB_PENDING
+						}
+						.to_owned(),
+						bytes: 0,
+						error: None,
+					});
+
+					changed = true;
+				}
+			}
+		}
+
+		if changed {
+			if let Err(message) = self.write_blob_index(&records) {
+				warn!("{message}");
+			}
+		}
+
+		records
+			.into_iter()
+			.filter(|record| !stored.contains(&record.id))
+			.map(|record| record.id)
+			.collect()
+	}
+
+	/// Indexed ids with no bytes on disk, oldest first
+	pub fn pending_blobs(&self) -> Vec<String> {
+		let stored = self.stored_blobs();
+
+		self.blob_index()
+			.into_iter()
+			.filter(|record| !stored.contains(&record.id))
+			.map(|record| record.id)
+			.collect()
+	}
+
+	/// A blob's bytes have arrived. Marks it stored and drops every blob an
+	/// EARLIER `add` for the same instance carried: those are intermediate
+	/// serializations of a subtree that has since been re-captured, and the
+	/// replay only ever reads the last one. Returns what was superseded
+	pub fn store_blob(&self, id: &str, bytes: &[u8]) -> Result<Vec<String>, String> {
+		let _guard = lock!(self.write);
+
+		self.write_blob_file(id, bytes)?;
+
+		let mut records = self.blob_index();
+
+		let Some(at) = records.iter().position(|record| record.id == id) else {
+			// A blob nothing in the journal names — a checkpoint shape, pushed
+			// here so a clone can fetch it. Stored, not indexed
+			return Ok(Vec::new());
+		};
+
+		records[at].state = BLOB_STORED.to_owned();
+		records[at].bytes = bytes.len() as u64;
+		records[at].error = None;
+
+		let owner = records[at].owner.clone();
+		let mut superseded = Vec::new();
+
+		if let Some(owner) = owner {
+			for record in records.iter().take(at) {
+				if record.owner.as_deref() == Some(owner.as_str()) && record.id != id {
+					superseded.push(record.id.clone());
+				}
+			}
+		}
+
+		for stale in &superseded {
+			if let Err(err) = fs::remove_file(self.blob_path(stale)) {
+				if err.kind() != ErrorKind::NotFound {
+					warn!("Failed to drop the superseded journal blob {stale}: {err}");
+				}
+			}
+		}
+
+		records.retain(|record| !superseded.contains(&record.id));
+
+		self.write_blob_index(&records)?;
+
+		Ok(superseded)
+	}
+
+	/// A pull that did not land. The event keeps its blob id and the index
+	/// keeps the reason, so the next append retries it instead of the failure
+	/// being a thing only the log remembers
+	pub fn blob_failed(&self, id: &str, reason: &str) {
+		let _guard = lock!(self.write);
+
+		let mut records = self.blob_index();
+
+		let Some(record) = records.iter_mut().find(|record| record.id == id) else {
+			return;
+		};
+
+		record.state = BLOB_PENDING.to_owned();
+		record.error = Some(reason.to_owned());
+
+		if let Err(message) = self.write_blob_index(&records) {
+			warn!("{message}");
+		}
+	}
 }
 
 /// Lines currently in a stream. Counted from the file rather than tracked in
@@ -313,6 +691,169 @@ fn count_lines(path: &Path) -> usize {
 			0
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// The blob pull
+// ---------------------------------------------------------------------------
+
+/// Drains every blob the journal still owes out of the connected plugin.
+///
+/// Spawned by `POST /journal/append` AFTER it has answered, because a flush
+/// that waited for eleven serialized subtrees to cross the wire would stall
+/// the recorder that is trying to hand over its events. One pass runs at a
+/// time — the plugin answers one request at a time anyway — and an append
+/// that lands mid-pass sets `wanted` so the pass goes round again instead of
+/// queueing a second one.
+///
+/// Nothing here can fail an append. A plugin that is gone, a blob that has
+/// expired, a disk that will not take the bytes: each is logged and left
+/// `pending` in the index, and the next append tries again
+pub async fn pump_blobs(state: AppState) {
+	let store = state.journal.clone();
+
+	store.wanted.store(true, Ordering::SeqCst);
+
+	if store.pulling.swap(true, Ordering::SeqCst) {
+		return;
+	}
+
+	while store.wanted.swap(false, Ordering::SeqCst) {
+		let pending = store.pending_blobs();
+
+		if pending.is_empty() {
+			continue;
+		}
+
+		debug!("Journal blobs: pulling {} blob(s) out of the plugin", pending.len());
+
+		for id in pending {
+			match pull_blob(&state, &id).await {
+				Ok(bytes) => {
+					let stored = bytes.len();
+
+					match store.store_blob(&id, &bytes) {
+						Ok(superseded) => {
+							debug!(
+								"Journal blob {id}: stored {stored} byte(s) from the plugin{}",
+								if superseded.is_empty() {
+									String::new()
+								} else {
+									format!(", superseding {}", superseded.join(", "))
+								}
+							);
+
+							// The bytes are safe on disk, so the plugin does
+							// not have to keep holding them: this is the same
+							// drain `branch finish` used to do at merge time,
+							// only seconds after the event instead of days
+							drop(
+								bulk::plugin_request(
+									&state,
+									"branch_blob_close",
+									json!({ "artifactId": id }),
+									BLOB_OP_TIMEOUT_MS,
+								)
+								.await,
+							);
+						}
+						Err(message) => {
+							warn!("Journal blob {id}: {message}");
+							store.blob_failed(&id, &message);
+						}
+					}
+				}
+				Err(message) => {
+					debug!("Journal blob {id} could not be pulled yet: {message}");
+					store.blob_failed(&id, &message);
+
+					// A plugin that is not there will not be there for the
+					// next id either, and a pass that asks anyway spends one
+					// timeout per blob
+					if message.contains("no Studio plugin connected") {
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	store.pulling.store(false, Ordering::SeqCst);
+}
+
+/// One blob, over the ops the CLI's own pull uses: `branch_blob_open` for the
+/// size and digest, `branch_blob_read` in bounded base64 parts, and the
+/// digest checked before anything is called stored
+async fn pull_blob(state: &AppState, id: &str) -> Result<Vec<u8>, String> {
+	let opened = bulk::plugin_request(
+		state,
+		"branch_blob_open",
+		json!({ "artifactId": id }),
+		BLOB_OP_TIMEOUT_MS,
+	)
+	.await
+	.map_err(|error| error.to_string())?;
+
+	let total = opened.get("bytes").and_then(Value::as_u64).unwrap_or_default() as usize;
+	let expected = opened.get("sha256").and_then(Value::as_str).map(str::to_owned);
+
+	let mut bytes: Vec<u8> = Vec::with_capacity(total);
+
+	for _ in 0..BLOB_MAX_PARTS {
+		let part = bulk::plugin_request(
+			state,
+			"branch_blob_read",
+			json!({ "artifactId": id, "offset": bytes.len(), "maxLen": BLOB_READ_MAX_LEN }),
+			BLOB_OP_TIMEOUT_MS,
+		)
+		.await
+		.map_err(|error| error.to_string())?;
+
+		let data = part.get("data").and_then(Value::as_str).unwrap_or_default();
+		let eof = part.get("eof").and_then(Value::as_bool).unwrap_or(false);
+
+		if !data.is_empty() {
+			let decoded = base64::engine::general_purpose::STANDARD
+				.decode(data)
+				.map_err(|err| format!("the plugin answered branch_blob_read with undecodable base64: {err}"))?;
+
+			bytes.extend_from_slice(&decoded);
+		} else if !eof {
+			return Err("the plugin answered branch_blob_read with no data and no eof".to_owned());
+		}
+
+		if eof {
+			if total > 0 && bytes.len() != total {
+				return Err(format!("the plugin sent {} of {total} byte(s)", bytes.len()));
+			}
+
+			if let Some(expected) = expected {
+				let actual = hex_digest(&bytes);
+
+				if !expected.eq_ignore_ascii_case(&actual) {
+					return Err(format!("sha256 is {actual}, the plugin named {expected}"));
+				}
+			}
+
+			return Ok(bytes);
+		}
+	}
+
+	Err(format!(
+		"the plugin did not finish the blob within {BLOB_MAX_PARTS} part(s)"
+	))
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+	let mut hasher = Sha256::new();
+
+	hasher.update(bytes);
+
+	hasher
+		.finalize()
+		.iter()
+		.map(|byte| format!("{byte:02x}"))
+		.collect::<String>()
 }
 
 // POST /journal/append
@@ -349,12 +890,35 @@ pub async fn append(State(state): State<AppState>, Json(request): Json<AppendReq
 				streams.len()
 			);
 
+			// The events are on disk; their payloads are not. Index what this
+			// batch references, then answer — and only then go and drain the
+			// bytes, so the plugin's flush is never held up by a transfer it
+			// is not waiting for.
+			//
+			// Only a BRANCH daemon keeps blobs. Main's stream exists for a
+			// branch's conflict detection, which reads main's *events*; its
+			// `add` payloads are never replayed anywhere, so pulling them
+			// would be main's daemon writing a serialized subtree to disk for
+			// every instance anyone adds, forever
+			let owed = if state.core.project().branch.is_some() {
+				let owed = state.journal.note_blobs(&blob_refs(&request.events));
+
+				if !owed.is_empty() {
+					tokio::spawn(pump_blobs(state.clone()));
+				}
+
+				owed
+			} else {
+				Vec::new()
+			};
+
 			Json(json!({
 				"ok": true,
 				"checkpoint": request.checkpoint,
 				"appended": appended,
 				"total": total,
 				"streams": streams,
+				"blobsPending": owed,
 			}))
 			.into_response()
 		}
@@ -383,13 +947,36 @@ pub async fn read(State(state): State<AppState>, Query(params): Query<ReadParams
 	let after = params.after.unwrap_or(0);
 
 	match state.journal.read(&checkpoint, after) {
-		Ok(events) => Json(json!({
-			"ok": true,
-			"checkpoint": checkpoint,
-			"after": after,
-			"events": events,
-		}))
-		.into_response(),
+		Ok(events) => {
+			// Which of the events' payloads a merge can read from here
+			// without a Studio. `blobsOnDisk` is what `branch finish` checks
+			// before it starts on a closed branch; `blobsMissing` is what it
+			// would have to reopen that branch for. Both are facts about the
+			// directory, not about intent — main's daemon keeps no blobs at
+			// all (see `append`), so on main everything an `add` names is
+			// missing and nothing reads these lists
+			let stored = state.journal.stored_blobs();
+			let mut on_disk = Vec::new();
+			let mut missing = Vec::new();
+
+			for blob in blob_refs(&events) {
+				if stored.contains(&blob.id) {
+					on_disk.push(blob.id);
+				} else {
+					missing.push(blob.id);
+				}
+			}
+
+			Json(json!({
+				"ok": true,
+				"checkpoint": checkpoint,
+				"after": after,
+				"events": events,
+				"blobsOnDisk": on_disk,
+				"blobsMissing": missing,
+			}))
+			.into_response()
+		}
 		Err(message) => error(StatusCode::INTERNAL_SERVER_ERROR, &message),
 	}
 }
@@ -476,6 +1063,13 @@ pub async fn marks(State(state): State<AppState>) -> Response {
 	Json(json!({ "ok": true, "marks": state.journal.marks() })).into_response()
 }
 
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PutBlobParams {
+	/// `base64` when the body is base64 text rather than the bytes
+	encoding: Option<String>,
+}
+
 /// `POST /journal/blob/:id` — the raw body becomes the blob.
 ///
 /// Blobs are the serialized subtrees an `add` event refers to. They are kept
@@ -483,19 +1077,53 @@ pub async fn marks(State(state): State<AppState>) -> Response {
 /// plugin that made them on demand: by the time a merge reads a blob the
 /// Studio that produced it is usually closed, and the existing clipboard
 /// upload path serves bytes *out of a live plugin*, which is exactly the
-/// thing a merge cannot rely on
-pub async fn put_blob(State(state): State<AppState>, RoutePath(id): RoutePath<String>, body: Bytes) -> Response {
+/// thing a merge cannot rely on.
+///
+/// `?encoding=base64` takes the same bytes as base64 text, which is how the
+/// PLUGIN pushes: `HttpService:RequestAsync` sends a Lua string and a
+/// serialized place is not text. It is the plugin's own last word on the way
+/// out (`plugin.Unloading`), racing the window's close against a pull this
+/// daemon would otherwise have to make — whichever arrives first wins, and
+/// storing the same bytes twice is storing them once
+pub async fn put_blob(
+	State(state): State<AppState>,
+	RoutePath(id): RoutePath<String>,
+	Query(params): Query<PutBlobParams>,
+	body: Bytes,
+) -> Response {
 	trace!("Received request: journal blob (put)");
 
 	if !safe_name(&id) {
 		return error(StatusCode::BAD_REQUEST, "id must be a plain name");
 	}
 
-	match state.journal.put_blob(&id, &body) {
-		Ok(()) => {
-			debug!("Journal blob {id}: stored {} byte(s)", body.len());
+	let bytes = match params.encoding.as_deref() {
+		None | Some("") | Some("binary") => body.to_vec(),
+		Some("base64") => {
+			let text: Vec<u8> = body
+				.iter()
+				.copied()
+				.filter(|byte| !byte.is_ascii_whitespace())
+				.collect();
 
-			Json(json!({ "ok": true, "id": id, "bytes": body.len() })).into_response()
+			match base64::engine::general_purpose::STANDARD.decode(&text) {
+				Ok(bytes) => bytes,
+				Err(err) => return error(StatusCode::BAD_REQUEST, &format!("body is not base64: {err}")),
+			}
+		}
+		Some(other) => {
+			return error(
+				StatusCode::BAD_REQUEST,
+				&format!("encoding must be `base64` or absent, not `{other}`"),
+			)
+		}
+	};
+
+	match state.journal.store_blob(&id, &bytes) {
+		Ok(superseded) => {
+			debug!("Journal blob {id}: stored {} byte(s)", bytes.len());
+
+			Json(json!({ "ok": true, "id": id, "bytes": bytes.len(), "superseded": superseded })).into_response()
 		}
 		Err(message) => error(StatusCode::INTERNAL_SERVER_ERROR, &message),
 	}
@@ -642,5 +1270,230 @@ mod tests {
 		let (_, _, streams) = store.append("session", &events(1)).expect("the append lands");
 
 		assert_eq!(streams, vec!["session".to_owned(), "alpha".to_owned()]);
+	}
+
+	// The blob index
+
+	fn add(id: &str, blob: &str) -> Value {
+		json!({ "id": id, "op": "add", "blob": blob })
+	}
+
+	fn on_disk(ids: &[&str]) -> HashSet<String> {
+		ids.iter().map(|id| (*id).to_owned()).collect()
+	}
+
+	/// An `add` names a blob nobody has yet, so the index owes it and the
+	/// append reports it as the thing the pull pass has to go and fetch
+	#[test]
+	fn a_referenced_blob_starts_out_pending() {
+		let (_dir, store) = store();
+
+		let owed = store.note_blobs(&blob_refs(&[add("new:1", "aa"), add("new:2", "bb")]));
+
+		assert_eq!(owed, vec!["aa".to_owned(), "bb".to_owned()]);
+
+		let index = store.blob_index();
+
+		assert_eq!(index.len(), 2);
+		assert!(index.iter().all(|record| record.state == BLOB_PENDING));
+		assert_eq!(index[0].owner.as_deref(), Some("new:1"));
+	}
+
+	/// Once the bytes are on disk the id is stored, is not owed any more, and
+	/// is not pulled a second time however often its event is re-appended
+	#[test]
+	fn a_stored_blob_is_not_owed_again() {
+		let (_dir, store) = store();
+
+		store.note_blobs(&blob_refs(&[add("new:1", "aa")]));
+		store.store_blob("aa", b"rbxm").expect("the blob is stored");
+
+		let record = store
+			.blob_index()
+			.into_iter()
+			.find(|record| record.id == "aa")
+			.expect("aa is indexed");
+
+		assert_eq!(record.state, BLOB_STORED);
+		assert_eq!(record.bytes, 4);
+		assert_eq!(store.blob("aa").as_deref(), Some(&b"rbxm"[..]));
+
+		assert!(store.pending_blobs().is_empty());
+		assert!(store.note_blobs(&blob_refs(&[add("new:1", "aa")])).is_empty());
+	}
+
+	/// A refreshed subtree is a second blob for the same instance. Storing it
+	/// drops the first one's bytes and its index entry — the replay only ever
+	/// reads the last `add` — and leaves another instance's blob alone
+	#[test]
+	fn a_newer_blob_supersedes_the_one_its_instance_carried_before() {
+		let (_dir, store) = store();
+
+		store.note_blobs(&blob_refs(&[add("new:1", "aa"), add("new:2", "cc")]));
+		store.store_blob("aa", b"first").expect("aa is stored");
+		store.store_blob("cc", b"other").expect("cc is stored");
+
+		store.note_blobs(&blob_refs(&[add("new:1", "bb")]));
+
+		let superseded = store.store_blob("bb", b"second").expect("bb is stored");
+
+		assert_eq!(superseded, vec!["aa".to_owned()]);
+		assert!(store.blob("aa").is_none());
+		assert_eq!(store.blob("bb").as_deref(), Some(&b"second"[..]));
+		assert_eq!(store.blob("cc").as_deref(), Some(&b"other"[..]));
+
+		let ids: Vec<String> = store.blob_index().into_iter().map(|record| record.id).collect();
+
+		assert_eq!(ids, vec!["cc".to_owned(), "bb".to_owned()]);
+	}
+
+	/// A pull that failed stays owed, with the reason on it, so the next
+	/// append retries rather than the event quietly losing its payload
+	#[test]
+	fn a_failed_pull_stays_pending_and_is_retried() {
+		let (_dir, store) = store();
+
+		store.note_blobs(&blob_refs(&[add("new:1", "aa")]));
+		store.blob_failed("aa", "no Studio plugin connected");
+
+		let record = store
+			.blob_index()
+			.into_iter()
+			.find(|record| record.id == "aa")
+			.expect("aa is indexed");
+
+		assert_eq!(record.state, BLOB_PENDING);
+		assert_eq!(record.error.as_deref(), Some("no Studio plugin connected"));
+		assert_eq!(store.pending_blobs(), vec!["aa".to_owned()]);
+		assert_eq!(store.note_blobs(&[]), vec!["aa".to_owned()]);
+	}
+
+	/// Bytes that arrive by the other route — the plugin pushing them itself
+	/// on unload — count exactly as much as ones this daemon pulled
+	#[test]
+	fn a_pushed_blob_settles_the_index_it_was_never_pulled_for() {
+		let (_dir, store) = store();
+
+		store.note_blobs(&blob_refs(&[add("new:1", "aa")]));
+		store.store_blob("aa", b"pushed").expect("aa is stored");
+
+		assert!(store.stored_blobs().contains("aa"));
+		assert!(store.pending_blobs().is_empty());
+	}
+
+	/// Every serialization of one instance is one group; an event with a blob
+	/// but no instance id stands alone, because nothing may stand in for it
+	#[test]
+	fn a_re_serialized_instance_groups_its_blobs_together() {
+		let events = vec![
+			add("new:1", "aa"),
+			add("new:2", "cc"),
+			add("new:1", "bb"),
+			json!({ "op": "add", "blob": "dd" }),
+		];
+
+		assert_eq!(
+			blob_groups(&events),
+			vec![
+				("new:1".to_owned(), vec!["aa".to_owned(), "bb".to_owned()]),
+				("new:2".to_owned(), vec!["cc".to_owned()]),
+				("dd".to_owned(), vec!["dd".to_owned()]),
+			]
+		);
+	}
+
+	/// A blob id that would escape the journal directory is not a blob
+	#[test]
+	fn an_unsafe_blob_id_is_not_referenced() {
+		assert!(blob_refs(&[json!({ "id": "new:1", "op": "add", "blob": "../escape" })]).is_empty());
+		assert!(blob_refs(&[json!({ "id": "new:1", "op": "add", "blob": "" })]).is_empty());
+		assert!(blob_refs(&[json!({ "id": "new:1", "op": "set" })]).is_empty());
+	}
+
+	// The finish decision
+
+	/// Every payload is on disk, so the merge runs without the branch's
+	/// Studio — which is the whole point
+	#[test]
+	fn finish_proceeds_when_every_blob_is_on_disk() {
+		let events = vec![
+			add("new:1", "aa"),
+			json!({ "id": "7", "op": "set" }),
+			add("new:2", "bb"),
+		];
+
+		let decision = finish_decision(&events, &on_disk(&["aa", "bb", "unrelated"]));
+
+		assert_eq!(decision, FinishDecision::Proceed);
+		assert_eq!(decision.refusal("alpha"), None);
+	}
+
+	/// One payload missing is not an `add` the merge may skip: it is a merge
+	/// that must not start, and the refusal has to say which branch to reopen
+	#[test]
+	fn finish_refuses_when_one_blob_is_missing() {
+		let events = vec![add("new:1", "aa"), add("new:2", "bb")];
+
+		let decision = finish_decision(&events, &on_disk(&["aa"]));
+
+		assert_eq!(
+			decision,
+			FinishDecision::Refuse {
+				missing: vec!["bb".to_owned()]
+			}
+		);
+
+		let refusal = decision.refusal("alpha").expect("a refusal names the branch");
+
+		assert!(refusal.contains("alpha"), "{refusal}");
+		assert!(refusal.contains("wsync branch up alpha"), "{refusal}");
+		assert!(refusal.contains("bb"), "{refusal}");
+	}
+
+	/// A journal with no `add` at all merges from disk with nothing to fetch
+	#[test]
+	fn finish_proceeds_on_a_journal_with_no_blobs() {
+		let events = events(3);
+
+		assert_eq!(finish_decision(&events, &HashSet::new()), FinishDecision::Proceed);
+	}
+
+	/// The same blob named twice is one blob, and one missing id is reported
+	/// once rather than per event
+	#[test]
+	fn a_repeated_blob_id_is_reported_once() {
+		let events = vec![add("new:1", "aa"), add("new:1", "aa")];
+
+		assert_eq!(
+			finish_decision(&events, &HashSet::new()),
+			FinishDecision::Refuse {
+				missing: vec!["aa".to_owned()]
+			}
+		);
+	}
+
+	/// A re-serialized instance keeps only its newest blob on disk, and its
+	/// older `add` still names the one that was deleted. That must not refuse
+	/// a merge: the CLI ships the survivor's bytes under both ids, so the
+	/// instance is served either way
+	#[test]
+	fn a_superseded_id_does_not_refuse_a_merge_the_newest_blob_can_serve() {
+		let events = vec![add("new:1", "aa"), add("new:1", "bb")];
+
+		assert_eq!(finish_decision(&events, &on_disk(&["bb"])), FinishDecision::Proceed);
+	}
+
+	/// An instance whose serializations are ALL gone is named by its newest
+	/// id, which is the one worth looking for
+	#[test]
+	fn an_instance_with_no_serialization_left_refuses_by_its_newest_id() {
+		let events = vec![add("new:1", "aa"), add("new:1", "bb"), add("new:2", "cc")];
+
+		assert_eq!(
+			finish_decision(&events, &on_disk(&["cc"])),
+			FinishDecision::Refuse {
+				missing: vec!["bb".to_owned()]
+			}
+		);
 	}
 }

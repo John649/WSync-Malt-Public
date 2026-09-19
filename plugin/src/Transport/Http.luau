@@ -99,4 +99,34 @@ function Http.postJson(url: string, body: { [string]: any }?)
 	return request("POST", url, body, "json")
 end
 
+-- Already-encoded bodies (`POST /journal/blob/<id>?encoding=base64`)
+
+--- POST a body that is already a string, with no encoder in between.
+--- `RequestAsync` sends a Lua string and a serialized place is not text, so
+--- the journal's blob push hands over base64 and the daemon decodes it.
+function Http.postText(url: string, body: string, contentType: string?): Promise.TypedPromise<Response>
+	return Promise.new(function(resolve, reject)
+		local success, response = pcall(function()
+			return HttpService:RequestAsync({
+				Url = url,
+				Method = "POST",
+				Headers = {
+					["Content-Type"] = contentType or "text/plain",
+				},
+				Body = body,
+			})
+		end)
+
+		if success then
+			if response.Success then
+				resolve(methodify(response, "json"))
+			else
+				reject(Error.fromResponse(response))
+			end
+		else
+			reject(Error.fromMessage(response))
+		end
+	end)
+end
+
 return Http
