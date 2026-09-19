@@ -1107,11 +1107,6 @@ impl Finish {
 
 		resume(&client);
 
-		// The replay lives in main's Studio and nowhere else: a place opened
-		// from a file is saved by nobody, so the merged instances would be gone
-		// the next time that Studio is relaunched
-		let (saved, save_reason) = save_main(&client, self.raw);
-
 		// The parked conflicts and the decisions belonged to this merge: a
 		// finished branch must not still look like one mid-conflict, or the
 		// next `finish` would take the resume path with nothing to resume
@@ -1143,8 +1138,6 @@ impl Finish {
 				"leftDirty": left_dirty,
 				"projectRestored": project_file,
 				"restored": restored,
-				"saved": saved,
-				"saveReason": save_reason,
 				"applied": replayed.get("applied").cloned().unwrap_or(Value::Null),
 				"skipped": replayed.get("skipped").cloned().unwrap_or(Value::Null),
 				"purged": self.purge,
@@ -1154,7 +1147,7 @@ impl Finish {
 		}
 
 		wsync_info!(
-			"Merged {} into main: {} file(s) by git, {} event(s) replayed into main's Studio, {}",
+			"Merged {} into main: {} file(s) by git, {} event(s) replayed into main's Studio",
 			record.name.bold(),
 			paths.len().to_string().bold(),
 			replayed
@@ -1163,11 +1156,6 @@ impl Finish {
 				.unwrap_or(0)
 				.to_string()
 				.bold(),
-			if saved {
-				"place saved".to_owned()
-			} else {
-				format!("{} — save it in Studio", "NOT saved".bold())
-			}
 		);
 
 		Ok(())
@@ -2218,37 +2206,6 @@ fn conflicts_of(replayed: &Value) -> Vec<Value> {
 		.unwrap_or_default()
 }
 
-/// Asks main's Studio to save the place it just replayed into. A place
-/// opened from a file has no other copy, so a merge nobody saves is a merge
-/// that disappears on the next relaunch.
-///
-/// A refusal is a warning, never a failure: by this point the merge commit is
-/// in and the instances are live. The plugin refuses on a branch clone, and
-/// answers `PLUGIN_ERROR` where `DataModel.Save()` does not exist — a cloud or
-/// Team Create place, which Studio saves through its own publish path
-fn save_main(client: &Client, raw: bool) -> (bool, String) {
-	let (reason, detail) = match client.request("save", json!({})) {
-		Ok(envelope) if envelope.ok => return (true, String::new()),
-		Ok(envelope) => (
-			format!("{} [{}]", envelope.error_message(), envelope.error_code()),
-			"A cloud or Team Create place is saved by Studio itself, not through the plugin",
-		),
-		Err(error) => (
-			error.to_string(),
-			"The merge is already committed and live in Studio; only the save did not happen",
-		),
-	};
-
-	if !raw {
-		wsync_warn!(
-			"Main's Studio did not save the replayed merge: {reason}. {detail} — save the place there, or the \
-			 replayed instances are lost when that Studio is relaunched"
-		);
-	}
-
-	(false, reason)
-}
-
 /// `POST /sync/resume` — best effort, because it runs on the failure path
 /// too and a paused daemon is worse than a noisy one
 fn resume(client: &Client) {
@@ -3070,4 +3027,22 @@ fn kill_tree(pid: u32) {
 
 	#[cfg(not(target_os = "windows"))]
 	crate::util::kill_process(pid);
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn detached_children_have_their_own_process_group() {
+		let mut command = Command::new("sh");
+		command.args(["-c", "ps -o pgid= -p $$"]).stdout(Stdio::piped());
+		detach(&mut command);
+		let child = command.spawn().expect("spawn detached child");
+		let pid = child.id();
+		let output = child.wait_with_output().expect("read process group");
+		assert!(output.status.success());
+		let group: u32 = String::from_utf8(output.stdout).unwrap().trim().parse().unwrap();
+		assert_eq!(group, pid);
+	}
 }

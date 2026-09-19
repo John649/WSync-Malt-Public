@@ -16,10 +16,9 @@
 --     then refuses anything below exact for a branch, so a clone that finds no
 --     daemon claiming its id never falls through to main.
 --
---   * Refusal — `game:Save()` on a clone would overwrite the real place file,
---     so the `save` op refuses on a branch (Handlers/Write). `branch finish`
---     is the only way a branch's work reaches main. Studio's own File > Save
---     and File > Publish are not reachable from a plugin and are NOT covered.
+--   * Persistence — the serialized clone and journal preserve branch state.
+--     `branch finish` merges it into main. Studio's native File > Save and
+--     File > Publish remain outside plugin control.
 --
 -- MARKER EXCLUSION: in `code` scope the marker is excluded structurally —
 -- `StringValue` is not in `SyncScope.CODE_CLASSES`, so it is never written to
@@ -53,10 +52,6 @@ Branch.MARKER_CLASS = "StringValue"
 Branch.GAME_ID_ATTRIBUTE = "GameId"
 Branch.DAEMON_PORT_ATTRIBUTE = "DaemonPort"
 Branch.PLACE_ID_ATTRIBUTE = "PlaceId"
-
---- The refusal every save/publish path on a branch clone answers with.
-Branch.SAVE_REFUSAL = "this is a branch clone — `wsync branch finish` merges it; "
-	.. "saving would overwrite the real place"
 
 export type Identity = {
 	name: string,

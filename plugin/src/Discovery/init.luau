@@ -138,6 +138,9 @@ end
 --- Probing concurrently turns that wall-clock cost from the SUM of the
 --- timeouts into the MAX of them.
 Discovery.SCAN_DEADLINE_SECONDS = 3
+-- Large clones can queue localhost requests behind Studio's asset loading.
+-- Their daemon already exists, so allow startup requests time to complete.
+Discovery.BRANCH_SCAN_DEADLINE_SECONDS = 30
 
 --- Probe the candidate list for a daemon matching the open place. Resolves a
 --- `Match` or nil; never rejects. `shouldContinue` aborts the scan early
@@ -214,7 +217,8 @@ function Discovery.scan(shouldContinue: (() -> boolean)?): Promise.TypedPromise<
 			return nil
 		end
 
-		local deadline = os.clock() + Discovery.SCAN_DEADLINE_SECONDS
+		local deadline = os.clock()
+			+ (if place.branch then Discovery.BRANCH_SCAN_DEADLINE_SECONDS else Discovery.SCAN_DEADLINE_SECONDS)
 
 		while outstanding > 0 do
 			if not continuing() then

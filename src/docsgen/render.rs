@@ -1050,7 +1050,7 @@ fn live_control(doc: &mut Doc, input: &DocsInput) {
 }
 
 fn history_and_health(doc: &mut Doc, registry: &RegistryFacts) {
-	let commands = ["status", "doctor", "ping", "version", "logs", "tail", "save"];
+	let commands = ["status", "doctor", "ping", "version", "logs", "tail"];
 	let history = ["waypoint", "undo", "redo"];
 
 	if registry.pick(&commands).is_empty() && registry.pick(&history).is_empty() {

@@ -82,10 +82,11 @@ discovery runs.
 
 > **A clone window points at the live place.** Because the ids are real,
 > Studio's own **File > Save** and **File > Publish** in a clone window would
-> overwrite the real place with a half-finished branch. The plugin refuses the
-> `save` op on a branch, but Studio's File menu is not reachable from a plugin
-> and is **not** covered. `wsync branch finish` is the only way a branch's work
-> is meant to reach main.
+> overwrite the real place with a half-finished branch. WSync has no programmatic
+> place-save operation; Studio's File menu remains outside plugin control.
+> `wsync branch finish` merges the branch into main. Branch persistence uses
+> the serialized clone and journal; use main Studio's native save controls
+> to save merged instance changes to Roblox or a main place file.
 
 ## Discovery: marker first, refuse rather than guess
 

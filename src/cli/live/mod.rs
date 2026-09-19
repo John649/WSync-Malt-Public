@@ -32,7 +32,7 @@ pub use backlog::Backlog;
 pub use capture::Capture;
 pub use clipboard::{Copy, Paste};
 pub use diagnostics::{Capabilities, Doctor, Ping, Status, Version};
-pub use history::{Redo, Save, Undo, Waypoint};
+pub use history::{Redo, Undo, Waypoint};
 pub use inspect::{Get, Ls, Props, Services, Tree};
 pub use pathtools::{Meta, Path, Where};
 pub use playtest::Playtest;

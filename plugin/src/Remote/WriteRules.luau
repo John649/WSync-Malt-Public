@@ -260,7 +260,7 @@ export type Audit = {
 --- The compact audit object attached to every mutating response's meta:
 --- `{op, target, class?, prop?, to?, count?}`. `target` is the instance path
 --- that best identifies the affected instance ("" for DataModel-scoped ops
---- like eval/save/undo). `prop` carries the property name for set, the
+--- like eval/undo). `prop` carries the property name for set, the
 --- attribute name for set_attr/rm_attr, the tag for add_tag/rm_tag, and the
 --- method name for call. `to` is mv's resulting path; `count` is set_batch's
 --- applied-write count.

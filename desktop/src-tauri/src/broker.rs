@@ -2776,7 +2776,7 @@ mod tests {
             (json!({"requestId": "abcdef01"}), "gameId"),
             (json!({"requestId": "not-hex-at-all", "gameId": 1}), "hex"),
             (json!({"requestId": "abc", "gameId": 1}), "hex"),
-            (json!({"requestId": "abcdef01", "gameId": 0}), "gameId"),
+            (json!({"requestId": "abcdef01", "gameId": 0, "placeId": 1}), "gameId"),
             (json!({"requestId": "abcdef01", "gameId": "one"}), "request"),
             // Design 11: no path ever enters this way.
             (

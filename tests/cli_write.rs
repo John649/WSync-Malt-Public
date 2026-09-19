@@ -1456,13 +1456,12 @@ fn eval_returns_values_and_fails_on_a_compile_error() {
 }
 
 #[test]
-fn save_waypoint_undo_and_redo_each_wrap_one_op() {
+fn waypoint_undo_and_redo_each_wrap_one_op() {
 	let daemon = start_daemon(None);
 	let journal = spawn_plugin(
 		&daemon,
 		"history-plugin",
 		table_responder(vec![
-			("save", json!({ "requested": true })),
 			("waypoint", json!({ "name": "before refactor" })),
 			("undo", json!({ "requested": true })),
 			("redo", json!({ "requested": true })),
@@ -1474,7 +1473,6 @@ fn save_waypoint_undo_and_redo_each_wrap_one_op() {
 	let port = daemon.port.to_string();
 
 	for args in [
-		vec!["save", "--project", &project, "--port", &port],
 		vec![
 			"waypoint",
 			"--project",
@@ -1494,12 +1492,7 @@ fn save_waypoint_undo_and_redo_each_wrap_one_op() {
 
 	assert_eq!(
 		ops(&journal),
-		vec![
-			"save".to_owned(),
-			"waypoint".to_owned(),
-			"undo".to_owned(),
-			"redo".to_owned()
-		]
+		vec!["waypoint".to_owned(), "undo".to_owned(), "redo".to_owned()]
 	);
 	assert_eq!(args_for(&journal, "waypoint")["name"], "before refactor");
 }
@@ -1523,7 +1516,7 @@ fn raw_write_output_leads_with_ok() {
 				"new",
 				json!({ "path": "Workspace/Box", "class": "Part", "name": "Box" }),
 			),
-			("save", json!({ "requested": true })),
+			("undo", json!({ "requested": true })),
 		]),
 	);
 
@@ -1577,10 +1570,10 @@ fn raw_write_output_leads_with_ok() {
 	assert_eq!(value["class"], "Part");
 
 	// An argument-less op still answers with the same discriminator
-	let saved = sandbox.run(&["save", "--project", &project, "--port", &port, "--raw"]);
+	let undone = sandbox.run(&["undo", "--project", &project, "--port", &port, "--raw"]);
 
-	assert!(saved.status.success(), "save --raw failed: {}", stderr(&saved));
-	assert_eq!(assert_leads_with_ok(&saved)["requested"], true);
+	assert!(undone.status.success(), "undo --raw failed: {}", stderr(&undone));
+	assert_eq!(assert_leads_with_ok(&undone)["requested"], true);
 }
 
 #[test]
@@ -1716,4 +1709,15 @@ fn status_reports_the_write_log_path_and_whether_it_exists() {
 	// A daemon that reports its own location is not pending; one that does
 	// not leaves the CLI's default flagged as a guess
 	assert_eq!(log["pending"], log["source"] == "state directory");
+}
+
+#[test]
+fn unsupported_save_command_is_not_advertised_or_dispatched() {
+	let sandbox = Sandbox::new();
+	let output = sandbox.run(&["save"]);
+	assert!(!output.status.success());
+	assert!(stderr(&output).contains("unrecognized subcommand"));
+	let registry = sandbox.run(&["commands", "--full"]);
+	assert!(registry.status.success());
+	assert!(!stdout(&registry).contains("\"name\": \"save\""));
 }

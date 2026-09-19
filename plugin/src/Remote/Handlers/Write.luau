@@ -1,8 +1,8 @@
 --!strict
 -- Mutating ops: `set`, `set_batch`, `new`, `rm`, `mv`, the attribute and tag
--- families, `call`, `eval`, `save`, plus the `open_in_editor` Studio-editor
+-- families, `call`, `eval`, plus the `open_in_editor` Studio-editor
 -- control (set.json, new.json, rm.json, mv.json, attr.json, tag.json,
--- call.json, eval.json, save.json, open.json; Design §5.4, §6.4, §10.6).
+-- call.json, eval.json, open.json; Design §5.4, §6.4, §10.6).
 --
 -- Safety framing (Design §10.6): these ops are user-initiated escape hatches
 -- routed through the daemon — never autonomous tools. Guardrails enforced
@@ -28,8 +28,6 @@ local CollectionService = game:GetService("CollectionService")
 
 local WSync = script:FindFirstAncestor("WSync")
 
-local Log = require(WSync.Log)
-local Branch = require(WSync.Branch)
 local Journal = require(WSync.Journal)
 
 local Error = require(script.Parent.Parent.Error)
@@ -896,45 +894,6 @@ function Write.ops.eval(args: Args, ctx)
 	end
 
 	return response
-end
-
---------------------------------------------------------------------------------
--- save
---------------------------------------------------------------------------------
-
---- `save` — ask Studio to save the current place. Per save.json the save is
---- asynchronous and the op acks when Studio accepts the request: DataModel
---- Save() can take seconds, which would blow the 5 s remote-op timeout, so
---- it runs detached and any failure surfaces in the Studio output.
-function Write.ops.save(_args: Args, ctx)
-	-- A branch Studio is open on a *clone*; saving it would write the clone
-	-- over the real place file (docs/branches.md). `wsync branch finish` is
-	-- the only way a branch's work reaches main.
-	if Branch.isBranch() then
-		error(Error.new(Error.PERMISSION_REQUIRED, Branch.SAVE_REFUSAL), 0)
-	end
-
-	local okLookup, saveFn = pcall(function()
-		return (game :: any).Save
-	end)
-
-	if not okLookup or type(saveFn) ~= "function" then
-		error(Error.new(Error.PLUGIN_ERROR, "this Studio build does not expose DataModel Save()"), 0)
-	end
-
-	task.spawn(function()
-		local ok, err = pcall(function()
-			(game :: any):Save()
-		end)
-
-		if not ok then
-			Log.warn("Async place save failed:", err)
-		end
-	end)
-
-	ctx.audit(WriteRules.shapeAudit("save", ""))
-
-	return { requested = true }
 end
 
 --------------------------------------------------------------------------------

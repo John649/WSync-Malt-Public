@@ -1,11 +1,5 @@
-//! Place and change-history control: `save`, `waypoint`, `undo`, `redo`
-//! (save.json, waypoint.json, undo.json, redo.json).
-//!
-//! Each wraps exactly one remote op with no arguments to validate beyond
-//! `waypoint --name`, so the whole family is discovery + one round trip. The
-//! ops acknowledge a *request*: Studio saves asynchronously (save.json) and
-//! ChangeHistoryService reports nothing about what an undo actually reversed
-//! (undo.json), so the human output says "asked", never "done".
+//! Change-history control: `waypoint`, `undo`, `redo`.
+//! Undo and redo acknowledge a request; inspect Studio to verify its result.
 
 use anyhow::Result;
 use clap::Parser;
@@ -16,36 +10,6 @@ use crate::{
 	cli::client::{field, print_ok, Client, Targeting},
 	wsync_info,
 };
-
-/// Ask Studio to save the current place
-#[derive(Parser)]
-pub struct Save {
-	#[command(flatten)]
-	targeting: Targeting,
-
-	/// Print machine-readable JSON
-	#[arg(long)]
-	raw: bool,
-}
-
-impl Save {
-	pub fn main(self) -> Result<()> {
-		let client = Client::connect(&self.targeting)?;
-		let value = client.value("save", json!({}), self.raw)?;
-
-		if self.raw {
-			print_ok(&value);
-
-			return Ok(());
-		}
-
-		// save.json: the op returns once Studio accepts the request; the save
-		// itself finishes later, and a failure surfaces in the Studio output
-		wsync_info!("Studio accepted the save request — the save itself completes asynchronously");
-
-		Ok(())
-	}
-}
 
 /// Create a named Studio change-history waypoint
 #[derive(Parser)]

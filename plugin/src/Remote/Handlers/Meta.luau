@@ -58,7 +58,6 @@ local CATALOG = {
 	"select_set",
 	"eval",
 	"logs",
-	"save",
 	"undo",
 	"redo",
 	"waypoint",
