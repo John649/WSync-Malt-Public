@@ -314,6 +314,20 @@ jobs:
           rojo --version
           wally --version
 
+      # `build.mjs` refuses to package without a wsync binary, and says so:
+      # the middleware it injects (src/Lib/Dom/database.msgpack and the
+      # wally.toml manifest node) comes from the engine, and rojo drops both
+      # silently. This job never built one, so it stopped at the manifest
+      # check on every commit and neither that check nor the build below has
+      # ever actually run. `cargo build` puts it at target/debug/wsync, which
+      # is the second place resolveWsync looks.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the engine that packages the plugin
+        run: cargo build
+
       # --check runs *before* the build, against the manifest exactly as
       # committed — run afterwards it would only compare the build to itself.
       # If this fails: `node plugin/scripts/build.mjs` and commit the manifest.
