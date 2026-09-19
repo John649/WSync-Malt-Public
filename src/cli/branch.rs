@@ -811,11 +811,17 @@ impl Finish {
 		// (1) the branch's own commit, scoped to its worktree and excluding the
 		// docs the daemon regenerates here on every connect — a branch that never
 		// commits them is a branch that cannot conflict on them
-		let excluded: Vec<String> = GENERATED_DOCS.iter().map(|doc| format!(":!{doc}")).collect();
-		let mut add = vec!["add", "-A", "--", "."];
+		// Everything is staged, then the generated docs are taken back out.
+		// Naming them as `:!` exclusions on the add looked cleaner, but git
+		// refuses any explicit pathspec that touches an ignored path (a
+		// project that ignores `.codex/` made `finish` die right here), and
+		// an unstage of a path that is not staged is simply a no-op
+		git_out(&worktree, &["add", "-A", "--", "."])?;
 
-		add.extend(excluded.iter().map(String::as_str));
-		git_out(&worktree, &add)?;
+		let mut unstage = vec!["reset", "-q", "--"];
+
+		unstage.extend(GENERATED_DOCS.iter().copied());
+		git_try(&worktree, &unstage).ok();
 
 		let committed = if git_out(&worktree, &["diff", "--cached", "--quiet"]).is_err() {
 			git_out(&worktree, &["commit", "-m", &format!("wsync branch {}", record.name)])?;
