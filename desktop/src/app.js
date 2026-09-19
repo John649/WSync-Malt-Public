@@ -762,6 +762,12 @@ async function pollBacklog() {
   conflictBadge.report(total);
 }
 
+/** How often the backlog count is refreshed while the app is open. */
+const CONFLICT_POLL_MS = 5000;
+
+/** The backlog poll handle; null until startBacklogPolling arms it. */
+let conflictTimer = null;
+
 function startBacklogPolling() {
   if (conflictTimer !== null) return;
   conflictTimer = setInterval(() => void pollBacklog(), CONFLICT_POLL_MS);
@@ -1196,6 +1202,9 @@ document.addEventListener("visibilitychange", () => {
 
 boot().catch((error) => {
   console.error("boot failed", error);
-  setStatus("WSync failed to start.", "err");
+  // The message travels into the status line: a release build has no console
+  // to read it from, and "failed to start" alone names nothing to fix
+  const detail = error instanceof Error ? error.message : String(error);
+  setStatus(`WSync failed to start: ${detail}`, "err");
   document.documentElement.classList.remove("theme-pending");
 });
