@@ -50,6 +50,10 @@ const MODULES = {
 	SyncScope: "SyncScope.luau",
 	Read: "Core/Processor/Read.luau",
 	Watcher: "Watcher.luau",
+	// Require-free by construction (no `script`, no Roblox APIs), so they load
+	// here exactly as they do in Studio.
+	Policy: "Discovery/Policy.luau",
+	Broker: "Broker.luau",
 };
 
 const SPEC = {
