@@ -23,7 +23,7 @@ use super::{
 };
 use crate::{
 	config::Config,
-	constants::{BLACKLISTED_PATHS, RUNTIME_DIRS},
+	constants::{BLACKLISTED_PATHS, RUNTIME_DIRS, WALKER_STACK_SIZE},
 	lock, logger,
 	project::{Project, ProjectDetails},
 	server, stats,
@@ -93,6 +93,9 @@ impl Processor {
 
 		Builder::new()
 			.name("processor".into())
+			// Same reason as the walker thread: every VFS event re-snapshots
+			// a subtree, and a deep one overflows a default stack
+			.stack_size(WALKER_STACK_SIZE)
 			.spawn(move || -> Result<()> {
 				let vfs_receiver = vfs.receiver();
 				let client_receiver = receiver;

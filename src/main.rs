@@ -8,9 +8,40 @@ use std::{
 	process::ExitCode,
 };
 
-use wsync::{cli::Cli, config::Config, crash_handler, logger, wsync_error};
+use wsync::{cli::Cli, config::Config, constants::WALKER_STACK_SIZE, crash_handler, logger, wsync_error};
 
 const PROFILER_ADDRESS: &str = "localhost:8888";
+
+/// Runs the command on a thread sized for the project walk.
+///
+/// Every command that touches a project recurses over its directory tree —
+/// the initial snapshot, the tree build, the divergence diff — and a real
+/// project nests deeper than the default main-thread stack survives. When it
+/// overflows, the process is aborted without unwinding: no panic message, no
+/// log line, and on Windows an exit code of 0, so a daemon that died this way
+/// looks exactly like one that shut down cleanly.
+///
+/// A failure to spawn is not a reason to refuse the command, so it falls back
+/// to the current thread; a panic inside is re-raised so the crash handler
+/// still sees it.
+fn run_on_walker_stack(cli: Cli) -> Result<(), anyhow::Error> {
+	let spawned = std::thread::Builder::new()
+		.name("wsync".into())
+		.stack_size(WALKER_STACK_SIZE)
+		.spawn(move || cli.main());
+
+	match spawned {
+		Ok(handle) => match handle.join() {
+			Ok(result) => result,
+			Err(panic) => std::panic::resume_unwind(panic),
+		},
+		Err(err) => {
+			error!("Failed to spawn the worker thread ({err}); running on the main thread");
+
+			Cli::new().main()
+		}
+	}
+}
 
 fn main() -> ExitCode {
 	crash_handler::hook();
@@ -67,7 +98,7 @@ fn main() -> ExitCode {
 		puffin::set_scopes_on(true);
 	}
 
-	let exit_code = match cli.main() {
+	let exit_code = match run_on_walker_stack(cli) {
 		Ok(()) => {
 			debug!("Successfully executed command!");
 			ExitCode::SUCCESS

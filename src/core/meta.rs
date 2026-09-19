@@ -1,3 +1,4 @@
+use log::debug;
 use serde::{Deserialize, Serialize};
 use std::{
 	fmt::Display,
@@ -6,7 +7,7 @@ use std::{
 
 use crate::{
 	config::Config,
-	constants::{default_sync_rules, RUNTIME_DIRS},
+	constants::{default_sync_rules, DEFAULT_IGNORE_DIRS, RUNTIME_DIRS},
 	ext::PathExt,
 	glob::Glob,
 	middleware::Middleware,
@@ -498,6 +499,18 @@ pub struct Meta {
 	pub mesh_source: Option<String>,
 }
 
+/// Whether any `$path` in the project file passes through a directory named
+/// `component`. This is the un-ignore for [`DEFAULT_IGNORE_DIRS`]: a default
+/// that a project can contradict simply by saying what it wants
+fn maps_through(node: &ProjectNode, component: &str) -> bool {
+	let mapped = node
+		.path
+		.as_ref()
+		.is_some_and(|path| path.path().components().any(|part| part.as_os_str() == component));
+
+	mapped || node.tree.values().any(|child| maps_through(child, component))
+}
+
 impl Meta {
 	// Creating new meta
 
@@ -528,12 +541,30 @@ impl Meta {
 		// sync pipeline or leak into snapshots (Design §12)
 		let mut ignore_globs = project.ignore_globs.clone();
 
-		for dir in RUNTIME_DIRS {
+		let mut ignore_dir = |dir: &str| {
 			for pattern in [format!("**/{dir}"), format!("**/{dir}/**")] {
 				if let Ok(glob) = Glob::new(&pattern) {
 					ignore_globs.push(glob);
 				}
 			}
+		};
+
+		for dir in RUNTIME_DIRS {
+			ignore_dir(dir);
+		}
+
+		// `.git`, `.claude` and `node_modules` are ignored on the same
+		// grounds but not on the same authority: they are not ours, so a
+		// project that deliberately maps a path through one keeps it. Nothing
+		// else reaches the walker — `.claude/` in particular holds a worktree
+		// per agent session, each a full copy of the project
+		for dir in DEFAULT_IGNORE_DIRS {
+			if maps_through(&project.node, dir) {
+				debug!("Not ignoring {dir}: the project maps a $path through it");
+				continue;
+			}
+
+			ignore_dir(dir);
 		}
 
 		let context = Context {

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use colored::Colorize;
-use log::trace;
+use log::{trace, warn};
 use rbx_dom_weak::{
 	types::{Enum, Variant},
 	ustr,
@@ -269,6 +269,17 @@ fn new_snapshot_file(path: &Path, context: &Context, vfs: &Vfs) -> Result<Option
 	}
 }
 
+/// Whether this path is itself a child source for its directory — an
+/// `init.*` a middleware would claim the parent through. Mirrors the
+/// condition [`new_snapshot_file_child`] uses to recurse, so exactly the
+/// entries that would come back here are the ones skipped
+fn is_child_source(path: &Path, context: &Context) -> bool {
+	context.sync_rules().iter().any(|rule| {
+		rule.resolve_child(path)
+			.is_some_and(|resolved| scope_allows_rule(context, &resolved.middleware, path))
+	})
+}
+
 /// Create a snapshot of a directory that has a child source or data,
 /// example: `foo/bar/init.luau`
 fn new_snapshot_file_child(path: &Path, context: &Context, vfs: &Vfs) -> Result<Option<Snapshot>> {
@@ -299,6 +310,26 @@ fn new_snapshot_file_child(path: &Path, context: &Context, vfs: &Vfs) -> Result<
 
 			for entry in vfs.read_dir(parent)? {
 				if entry == path {
+					continue;
+				}
+
+				// A directory has exactly one child script. A second `init.*`
+				// beside this one is not an instance *inside* it: descending
+				// into it lands straight back here with the two files
+				// swapped, each treating the other as its child, and the
+				// recursion never ends. Every level allocates a snapshot
+				// holding the file's whole source and a cloned context, so
+				// the process climbs until the stack overflows — which on
+				// Windows kills it without unwinding, with no panic message
+				// and an exit code of 0. Seen live on a directory carrying
+				// both `init.server.luau` and `init.runserver.luau`.
+				if is_child_source(&entry, context) {
+					warn!(
+						"{} and {} are both child scripts of the same directory; only the first is synced",
+						path.display(),
+						entry.display()
+					);
+
 					continue;
 				}
 

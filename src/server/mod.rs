@@ -17,7 +17,7 @@ use std::{
 use uuid::Uuid;
 
 use crate::{
-	constants::MAX_PAYLOAD_SIZE,
+	constants::{MAX_PAYLOAD_SIZE, WALKER_STACK_SIZE},
 	core::{changes::Changes, Core},
 	daemon::{self, DaemonLog},
 	project::ProjectDetails,
@@ -199,8 +199,19 @@ impl Server {
 	/// `/manager-close` or the managed watchdog). `ready` is invoked exactly
 	/// once with the actually bound port after the listener exists — the
 	/// `daemon start` machine handshake and runtime-record write hang off it
-	#[tokio::main]
-	pub async fn start(&self, ready: Option<Box<dyn FnOnce(u16) + Send>>) -> Result<()> {
+	/// Enters the Tokio runtime. The runtime is built by hand rather than
+	/// through `#[tokio::main]` for one reason: its workers run the request
+	/// handlers, and those walk the project tree, so they need the same stack
+	/// the walker thread has
+	pub fn start(&self, ready: Option<Box<dyn FnOnce(u16) + Send>>) -> Result<()> {
+		tokio::runtime::Builder::new_multi_thread()
+			.enable_all()
+			.thread_stack_size(WALKER_STACK_SIZE)
+			.build()?
+			.block_on(self.serve(ready))
+	}
+
+	async fn serve(&self, ready: Option<Box<dyn FnOnce(u16) + Send>>) -> Result<()> {
 		// WSync servers bind loopback interfaces only; browser-facing routes
 		// additionally require the owner capability once the app lands
 		let addresses: Vec<_> = (self.host.as_str(), self.port).to_socket_addrs()?.collect();

@@ -56,7 +56,15 @@ pub fn read_data(path: &Path, class: Option<&str>, vfs: &Vfs) -> Result<DataSnap
 
 	let mut properties = UstrMap::new();
 
-	let class = if let Some(class) = class.or(data.class_name.as_deref()) {
+	// The sidecar's own `className` wins over the class the caller inferred
+	// from the path. It has to: `Snapshot::apply_data` assigns that class to
+	// the instance, so resolving the properties against anything else reads
+	// them against a class the instance will not have. A directory carrying
+	// `init.meta.json` with `"className": "ScreenGui"` arrives here as a
+	// `Folder`, and every `ScreenGui` property in it — `Enabled`,
+	// `ScreenInsets` — was logged as `Unknown property Folder.*` and dropped.
+	// The caller's class is the fallback for a sidecar that names none
+	let class = if let Some(class) = data.class_name.as_deref().or(class) {
 		class.to_owned()
 	} else {
 		let name = path.get_name();

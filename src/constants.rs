@@ -122,6 +122,27 @@ pub const RUNTIME_DIRS: [&str; 4] = [
 	".wsync-branches",
 ];
 
+/// Directories the project walker ignores by default, on top of
+/// [`RUNTIME_DIRS`]. None of them is ever the content of a Roblox place, and
+/// each is routinely enormous: `.git` holds the object database, and
+/// `.claude/` holds this user's agent worktrees — DungeonDemo keeps 34 of
+/// them there, each a full second copy of `src`, so walking it snapshots the
+/// project 35 times over. A project that genuinely maps a path through one of
+/// these keeps it: the ignore is skipped for any directory the project file's
+/// own `$path`s pass through
+pub const DEFAULT_IGNORE_DIRS: [&str; 3] = [".git", ".claude", "node_modules"];
+
+/// Stack for the threads that walk the project: the CLI's own thread, the
+/// Tokio workers serving requests, and the processor.
+///
+/// The walk, the snapshot tree and the divergence diff all recurse over a
+/// directory tree, and a real project nests deep enough to exhaust the few
+/// megabytes a thread gets by default. When it does, the process dies without
+/// unwinding: no panic, no log line, and on Windows an exit code of 0 — a
+/// daemon that appears to have shut down cleanly. Raising the ceiling is the
+/// honest fix; making the walkers iterative would only move it
+pub const WALKER_STACK_SIZE: usize = 256 << 20;
+
 /// The per-workspace branch root (docs/branches.md): worktrees, clones and
 /// journals live here. It is a runtime directory for the same reason the
 /// others are — a branch worktree is a whole second checkout of the project,
