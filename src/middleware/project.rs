@@ -66,6 +66,16 @@ pub fn new_snapshot_node(
 
 	let class = if let Some(class_name) = &node.class_name {
 		class_name.to_owned()
+	} else if let Some(container) = super::dir_container_class(name) {
+		// A project node named after one of Studio's own containers *is* that
+		// container, for the same reason a directory with that name is: the
+		// project maps `StarterPlayer/StarterPlayerScripts` to a source
+		// directory called something else entirely (`src/Client`), so the
+		// directory's name never reveals it. Left as a Folder, the plugin has
+		// nothing to adopt — it would hang a second instance beside the real
+		// container, and the ref the daemon holds for the node is one the
+		// plugin never bound, so `read_subtree` on it answers NOT_FOUND
+		container.to_owned()
 	} else if under_datamodel && util::is_service(name) {
 		// A service class is inferred from the name only directly under the
 		// DataModel. Seen live: a plugin's `Packages` node became the

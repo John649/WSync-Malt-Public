@@ -496,6 +496,150 @@ fn overlay_unclaimed(live: &Path, stage: &Path) -> Result<(), String> {
 
 /// SHA-256 of every file under `dir`, keyed by relative path — the fence
 /// generation. Any difference between two captures means the disk moved
+/// Whether a filesystem error is the platform refusing to touch something
+/// because another handle is open on it, rather than a real fault.
+///
+/// Windows fails a directory rename with `ERROR_ACCESS_DENIED` (5) or
+/// `ERROR_SHARING_VIOLATION` (32) when *any* process holds a handle inside
+/// it: an editor, another tool, a search indexer, or a virus scanner still
+/// reading the files WSync wrote a millisecond ago. Nothing is wrong with the
+/// tree, and the handle is usually gone within a few tens of milliseconds
+fn is_locked(err: &std::io::Error) -> bool {
+	err.kind() == std::io::ErrorKind::PermissionDenied || matches!(err.raw_os_error(), Some(5) | Some(32))
+}
+
+/// A rename that gives a transient lock a few chances to clear. The total
+/// wait is under half a second, which a rare fallback can afford to spend on
+/// the worker thread; a lock that outlives it is not transient, and the
+/// caller falls back to the file-level path
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+	const ATTEMPTS: u32 = 5;
+
+	let mut delay = Duration::from_millis(25);
+
+	for attempt in 1..=ATTEMPTS {
+		match fs::rename(from, to) {
+			Ok(()) => return Ok(()),
+			Err(err) if attempt < ATTEMPTS && is_locked(&err) => {
+				debug!(
+					"Rename of {} refused ({err}); retrying in {}ms",
+					from.display(),
+					delay.as_millis()
+				);
+
+				std::thread::sleep(delay);
+				delay *= 2;
+			}
+			Err(err) => return Err(err),
+		}
+	}
+
+	unreachable!("the loop returns on its last attempt")
+}
+
+/// Copies a directory tree. Used when the live root cannot be *moved* into
+/// the backup but still has to be backed up before anything overwrites it
+fn copy_dir_all(from: &Path, to: &Path) -> std::io::Result<()> {
+	fs::create_dir_all(to)?;
+
+	for entry in fs::read_dir(from)? {
+		let entry = entry?;
+		let target = to.join(entry.file_name());
+
+		if entry.file_type()?.is_dir() {
+			copy_dir_all(&entry.path(), &target)?;
+		} else {
+			fs::copy(entry.path(), &target)?;
+		}
+	}
+
+	Ok(())
+}
+
+/// Makes `live` hold exactly what `stage` holds, one file at a time.
+///
+/// The fallback for a platform that will not move a directory while anything
+/// holds a handle inside it. Renaming a single *file* needs only that file's
+/// own handle, which WSync controls, so this path lands the same content
+/// without ever asking to move a directory. It is slower and it is not
+/// atomic — which is why it is the fallback and not the rule — but the
+/// per-file temp+rename still means no reader sees half a file.
+///
+/// Files whose bytes already match are left alone, so the work is
+/// proportional to what actually changed rather than to the size of the root
+fn sync_tree_in_place(stage: &Path, live: &Path) -> Result<(), String> {
+	let staged = fingerprint_dir(stage)?;
+	let current = fingerprint_dir(live).unwrap_or_default();
+
+	fs::create_dir_all(live).map_err(|err| format!("failed to create {}: {err}", live.display()))?;
+
+	for (relative, digest) in &staged {
+		if current.get(relative) == Some(digest) {
+			continue;
+		}
+
+		let from = stage.join(relative);
+		let to = live.join(relative);
+
+		if let Some(parent) = to.parent() {
+			fs::create_dir_all(parent).map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+		}
+
+		let temp = to.with_file_name(format!(
+			".{}.wsync-tmp",
+			to.file_name().unwrap_or_default().to_string_lossy()
+		));
+
+		fs::copy(&from, &temp).map_err(|err| format!("failed to stage {}: {err}", to.display()))?;
+
+		if let Err(err) = rename_with_retry(&temp, &to) {
+			fs::remove_file(&temp).ok();
+
+			return Err(format!("failed to replace {}: {err}", to.display()));
+		}
+	}
+
+	// Whatever the stage does not carry has left the projection
+	for relative in current.keys() {
+		if !staged.contains_key(relative) {
+			let path = live.join(relative);
+
+			if let Err(err) = fs::remove_file(&path) {
+				return Err(format!("failed to remove {}: {err}", path.display()));
+			}
+		}
+	}
+
+	prune_empty_dirs(live);
+
+	Ok(())
+}
+
+/// Removes directories the file-level apply emptied, bottom up. Best effort
+/// throughout: a directory that will not go is left alone, never reported as
+/// a failed apply
+fn prune_empty_dirs(dir: &Path) -> bool {
+	let Ok(entries) = fs::read_dir(dir) else {
+		return false;
+	};
+
+	let mut empty = true;
+
+	for entry in entries.flatten() {
+		let path = entry.path();
+
+		if path.is_dir() {
+			if !prune_empty_dirs(&path) {
+				empty = false;
+			}
+		} else {
+			empty = false;
+		}
+	}
+
+	empty && fs::remove_dir(dir).is_ok()
+}
+
 fn fingerprint_dir(dir: &Path) -> Result<BTreeMap<PathBuf, [u8; 32]>, String> {
 	let mut fingerprint = BTreeMap::new();
 
@@ -719,10 +863,15 @@ async fn apply_root(
 	let fence = fingerprint_dir(&target.live_dir)?;
 
 	// Pull structure
+	// The path rides along with the ref so the plugin has a second way to
+	// find the instance. A ref only resolves if the plugin bound it, and a
+	// node the plugin never adopted — a nested container, an instance created
+	// since the session started — has no binding to look up. The path is
+	// resolvable from `game` no matter what the session holds
 	let value = plugin_request(
 		state,
 		"read_subtree",
-		json!({ "ref": util::format_ref(target.id) }),
+		json!({ "ref": util::format_ref(target.id), "path": root_name }),
 		BULK_OP_TIMEOUT_MS,
 	)
 	.await
@@ -823,21 +972,77 @@ async fn apply_root(
 		}
 
 		// The watch must move off the directory before it is renamed away
-		// (inotify-style watchers follow inodes, not paths)
+		// (inotify-style watchers follow inodes, not paths, and on Windows the
+		// watcher's own handle is enough to refuse the rename outright)
 		vfs.unwatch(&target.live_dir).ok();
 
-		fs::rename(&target.live_dir, &backup_path)
-			.map_err(|err| format!("failed to move the live root into the backup: {err}"))?;
+		// Both moves give a transient lock a chance to clear, and either one
+		// still failing lands on the file-level path rather than failing the
+		// apply: the content is correct and already staged, and a handle
+		// somebody else holds is not a reason to refuse to deliver it
+		let backed_up = match rename_with_retry(&target.live_dir, &backup_path) {
+			Ok(()) => true,
+			Err(err) if is_locked(&err) => {
+				warn!(
+					"Could not move {} into the backup ({err}); copying it instead",
+					target.live_dir.display()
+				);
 
-		if let Err(err) = fs::rename(&stage_root, &target.live_dir) {
-			// A failed swap restores the backup (Design §7.4-A)
-			let restored = fs::rename(&backup_path, &target.live_dir).is_ok();
-			vfs.watch(&target.live_dir, true).ok();
+				// The backup must exist before anything is overwritten, so this
+				// copy is not optional and its failure is fatal
+				copy_dir_all(&target.live_dir, &backup_path)
+					.map_err(|err| format!("failed to copy the live root into the backup: {err}"))?;
 
-			return Err(format!(
-				"failed to swap the staged root into place: {err}; the backup was {}",
-				if restored { "restored" } else { "NOT restored" }
-			));
+				false
+			}
+			Err(err) => return Err(format!("failed to move the live root into the backup: {err}")),
+		};
+
+		let swapped = if backed_up {
+			// The live root is gone; the stage only has to take its place
+			rename_with_retry(&stage_root, &target.live_dir)
+		} else {
+			// The live root is still in place, with a copy of it in the backup,
+			// so the only way forward is the file-level one
+			Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+		};
+
+		if let Err(err) = swapped {
+			if !is_locked(&err) {
+				let restored = backed_up && fs::rename(&backup_path, &target.live_dir).is_ok();
+				vfs.watch(&target.live_dir, true).ok();
+
+				return Err(format!(
+					"failed to swap the staged root into place: {err}; the backup was {}",
+					if restored { "restored" } else { "NOT restored" }
+				));
+			}
+
+			if backed_up {
+				warn!(
+					"Could not move the stage into {} ({err}); applying it file by file instead",
+					target.live_dir.display()
+				);
+			}
+
+			if let Err(fallback) = sync_tree_in_place(&stage_root, &target.live_dir) {
+				// The file-level path is the last one there is. Put the original
+				// back so the root is whole, and say plainly that nothing landed
+				let restored = if backed_up {
+					fs::remove_dir_all(&target.live_dir).ok();
+					fs::rename(&backup_path, &target.live_dir).is_ok()
+				} else {
+					sync_tree_in_place(&backup_path, &target.live_dir).is_ok()
+				};
+
+				vfs.watch(&target.live_dir, true).ok();
+
+				return Err(format!(
+					"failed to swap the staged root into place: {err}; the file-level apply also failed ({fallback}); \
+					 the backup was {}",
+					if restored { "restored" } else { "NOT restored" }
+				));
+			}
 		}
 
 		vfs.watch(&target.live_dir, true).ok();

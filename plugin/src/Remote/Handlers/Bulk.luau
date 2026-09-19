@@ -137,6 +137,50 @@ local function validateRefArg(value: any): (string, buffer)
 	return (value :: string):lower(), decoded
 end
 
+--- Resolve a slash-separated instance path from `game`, the fallback for a
+--- ref this session never bound.
+---
+--- A ref is a binding, and a binding only exists for instances the session
+--- adopted. A nested container the daemon projects but the plugin never took
+--- ownership of has no binding to look up, so the daemon's ref for it is a
+--- name for nothing. The path is not a binding — it is where the instance
+--- lives — so it resolves whatever the session happens to hold.
+---
+--- Only the first segment may be a service: `game:GetService` is how a
+--- service is reached when it has never been touched (it is not always a
+--- findable child before then), and it throws on a name that is not one.
+local function resolveInstancePath(path: any): Instance?
+	if type(path) ~= "string" or path == "" then
+		return nil
+	end
+
+	local current: Instance = game
+	local depth = 0
+
+	for segment in string.gmatch(path :: string, "[^/]+") do
+		local child = current:FindFirstChild(segment)
+
+		if child == nil and current == game then
+			local ok, service = pcall(game.GetService, game, segment)
+
+			if ok then
+				child = service
+			end
+		end
+
+		if child == nil then
+			return nil
+		end
+
+		current = child
+		depth += 1
+	end
+
+	-- An empty walk lands on `game`, which is never a subtree root worth
+	-- answering with
+	return if depth > 0 then current else nil
+end
+
 --- Resolve a wire ref to a live instance: the tree first, then the pending
 --- divergence removals (Studio-only entries named by plugin-minted refs),
 --- then the transfer-local minted registry.
@@ -342,6 +386,15 @@ function Bulk.ops.read_subtree(args: Args, _ctx)
 	sweepMinted(now)
 
 	local instance = resolveRef(activeSession, refHex, ref, now)
+
+	if instance == nil then
+		-- The ref is unknown to this session. Before refusing, try the path
+		-- the daemon sent alongside it: seen live on a project that maps
+		-- `StarterPlayer/StarterPlayerScripts` to a source directory, where
+		-- the daemon holds a ref for a container the plugin never adopted and
+		-- every apply on that root failed with NOT_FOUND.
+		instance = resolveInstancePath(args.path)
+	end
 
 	if instance == nil then
 		error(Error.new(Error.NOT_FOUND, `no instance for ref {refHex}`), 0)

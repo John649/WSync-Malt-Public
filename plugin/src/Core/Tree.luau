@@ -12,9 +12,28 @@ function Tree.new()
 		instanceMap = {},
 		metaMap = {},
 		idMap = {},
+		-- The daemon boot this map was built against. Refs are minted per
+		-- boot, so a map stamped with a different one names instances the
+		-- daemon has never heard of (Core rebuilds rather than reusing).
+		bootId = nil :: string?,
 	}
 
 	return setmetatable(self, Tree)
+end
+
+--- Is this map empty? An empty map is always rebuilt, boot id or not.
+function Tree:isEmpty(): boolean
+	return next(self.instanceMap) == nil
+end
+
+--- Drop every ref. The tables are cleared in place because the processor and
+--- the bulk session both hold this same object.
+function Tree:clear()
+	table.clear(self.instanceMap)
+	table.clear(self.idMap)
+	table.clear(self.metaMap)
+
+	self.bootId = nil
 end
 
 function Tree:insertInstance(instance: Instance, id: Types.Ref, meta: Types.Meta)

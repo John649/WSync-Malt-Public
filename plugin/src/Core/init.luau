@@ -179,9 +179,25 @@ function Core:run(): Promise.Promise
 
 		local snapshot = transport:getSnapshot():expect()
 
+		-- Refs are minted per daemon boot. A map built against an earlier boot
+		-- names instances this daemon has never heard of, and the first thing
+		-- that notices is a bulk pull failing NOT_FOUND partway through the
+		-- initial sync (`read_subtree ... no instance for ref`). So the map is
+		-- rebuilt from THIS boot's snapshot before anything reads it, and refs
+		-- are never carried across a boot.
+		local bootId = transport.bootId
+
+		if self.tree.bootId ~= bootId or self.tree:isEmpty() then
+			self.tree:clear()
+		end
+
 		Log.trace("Initializing processor..")
 
 		local changes = self.processor:init(snapshot, initialSyncPriority)
+
+		self.tree.bootId = bootId
+
+		Log.stage(`tree map rebuilt for daemon boot {bootId or "unknown"}`)
 		local excluded = self.processor.read:excludedCount()
 
 		Log.stage(

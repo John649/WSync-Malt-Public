@@ -237,6 +237,9 @@ function WebSocket.new(host: string, port: number, https: boolean, scope: string
 	-- Sync scope (Design §7.0) — seeded from the `GET /hello` probe; the WS
 	-- server hello re-stamps it whenever it carries the field.
 	self.scope = scope
+	-- Stamped by Transport.detect from the `/hello` probe, and re-checked on
+	-- every handshake (see __probeBootId).
+	self.bootId = nil :: string?
 	self.clientId = Util.generateGUID()
 	self.placeName = Place.Name
 	self.host = host
@@ -816,6 +819,22 @@ function WebSocket:__connect(): Promise.Promise
 			return reject(Error.new(Error.HandshakeFailed, "hello carried invalid project details"))
 		end
 
+		-- A reconnect only reopens the socket: Core is never re-entered, so
+		-- nothing else would notice that the daemon behind it is a different
+		-- boot with freshly minted refs. The WS hello carries project details
+		-- but no boot id, so it is re-probed over HTTP against a port we have
+		-- just proven is listening.
+		local probedBoot = self:__probeBootId()
+
+		if probedBoot ~= nil and self.bootId ~= nil and probedBoot ~= self.bootId then
+			self:__fail("The daemon restarted — reconnect to resync", false)
+			return reject(Error.new(Error.HandshakeFailed, "daemon boot changed"))
+		end
+
+		if probedBoot ~= nil then
+			self.bootId = probedBoot
+		end
+
 		local fingerprint = rootRefsFingerprint(helloFrame)
 
 		if self.__detailsFingerprint and self.__detailsFingerprint ~= fingerprint then
@@ -876,6 +895,25 @@ function WebSocket:__startHeartbeat()
 			end
 		end
 	end)
+end
+
+--- The daemon's boot id, re-probed over HTTP. Returns nil when the probe
+--- cannot answer or the daemon names no boot, in which case the rootRefs
+--- fingerprint is the only guard left.
+function WebSocket:__probeBootId(): string?
+	local scheme = if self.https then "https" else "http"
+
+	local ok, hello = pcall(function()
+		return Http.getJson(`{scheme}://{self.host}:{self.port}/hello`):expect():decode()
+	end)
+
+	if not ok or type(hello) ~= "table" then
+		return nil
+	end
+
+	local bootId = (hello :: { [string]: any }).bootId
+
+	return if type(bootId) == "string" and bootId ~= "" then bootId else nil
 end
 
 --- Reconnect with exponential backoff, publishing a per-second countdown.

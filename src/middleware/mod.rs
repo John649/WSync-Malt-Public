@@ -363,7 +363,7 @@ fn new_snapshot_file_child(path: &Path, context: &Context, vfs: &Vfs) -> Result<
 /// containers are inferred — an ordinary directory is still a Folder, and true
 /// services are not, since a `Lighting` folder nested in code is a folder and
 /// could not be parented there as a service anyway.
-fn dir_container_class(name: &str) -> Option<&'static str> {
+pub(crate) fn dir_container_class(name: &str) -> Option<&'static str> {
 	match name {
 		"StarterPlayerScripts" => Some("StarterPlayerScripts"),
 		"StarterCharacterScripts" => Some("StarterCharacterScripts"),

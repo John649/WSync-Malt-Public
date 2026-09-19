@@ -53,6 +53,10 @@ export type Transport = {
 	isSubscribed: boolean,
 	protocol: number?,
 	scope: string?,
+	--- The daemon's boot id from `/hello`, when it names one. Everything
+	--- ref-shaped is minted per boot, so this is what says whether a map built
+	--- earlier still means anything.
+	bootId: string?,
 	fetchDetails: (self: Transport) -> any,
 	subscribe: (self: Transport) -> any,
 	unsubscribe: (self: Transport) -> any,
@@ -101,10 +105,20 @@ function Transport.detect(host: string, port: number, https: boolean): Promise.T
 	return Promise.new(function(resolve)
 		local hello = Transport.hello(host, port, https):expect()
 
+		--- Stamp the boot id the probe saw onto whatever transport we build,
+		--- so Core can tell a restarted daemon from the one it was talking to.
+		local function stamped(transport: any): any
+			if hello ~= nil and type(hello.bootId) == "string" and hello.bootId ~= "" then
+				transport.bootId = hello.bootId
+			end
+
+			return transport
+		end
+
 		if hello and hello.protocol >= 1 then
 			if WebSocket.isSupported() then
 				Log.info(`Using WebSocket transport (daemon protocol {hello.protocol})`)
-				return resolve(WebSocket.new(host, port, https, hello.scope))
+				return resolve(stamped(WebSocket.new(host, port, https, hello.scope)))
 			end
 
 			Log.warn(
@@ -116,13 +130,13 @@ function Transport.detect(host: string, port: number, https: boolean): Promise.T
 			-- already identified as wsync/1 via `/hello`, so the long-poll
 			-- path accepts it by protocol and Core treats the msgpack
 			-- `/details` version as informational.
-			return resolve(LongPoll.new(host, port, https, hello.protocol, hello.scope))
+			return resolve(stamped(LongPoll.new(host, port, https, hello.protocol, hello.scope)))
 		end
 
 		Log.info("Daemon did not answer the wsync/1 hello probe, using the long-poll transport")
 
 		-- No `/hello`: behavior unchanged — strict `/details` semver gating
-		return resolve(LongPoll.new(host, port, https))
+		return resolve(stamped(LongPoll.new(host, port, https)))
 	end)
 end
 
