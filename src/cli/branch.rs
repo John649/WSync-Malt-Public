@@ -77,7 +77,7 @@ use std::{
 	env, fs,
 	io::{BufReader, BufWriter, Write},
 	path::{Path, PathBuf},
-	process::{self, Child, Command, Stdio},
+	process::{self, Command, Stdio},
 	thread,
 	time::{Duration, Instant},
 };
@@ -144,7 +144,6 @@ const HEAVY_TIMEOUT_MS: u64 = 120_000;
 const PLUGIN_WAIT: Duration = Duration::from_secs(180);
 
 /// How long a spawned daemon has to print its `--raw` ready line
-const DAEMON_READY: Duration = Duration::from_secs(30);
 
 /// Work on a place in parallel with main: worktree, daemon, clone and Studio
 #[derive(Parser)]
@@ -1507,11 +1506,6 @@ fn disinherit_std_handles() {
 			}
 		}
 	}
-}
-
-fn stop_child(child: &mut Child) {
-	child.kill().ok();
-	child.wait().ok();
 }
 
 /// Launches Studio on a place and keeps the PID.

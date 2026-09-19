@@ -310,8 +310,28 @@ impl DaemonEntry {
 /// Probes run in parallel: a stale record costs a full probe timeout, and a
 /// machine with a branch or two open has several of them.
 pub fn registry() -> Result<Vec<DaemonEntry>> {
-	let state_dir = daemon::state_dir(None)?;
-	let records = read_records(&state_dir.join("daemons"));
+	// The CLI keeps its records under the local data dir; the desktop app
+	// keeps its own under the roaming one (it hands that dir to every daemon
+	// it spawns). Either kind of daemon serves a place, so both are read
+	let mut dirs = vec![daemon::state_dir(None)?];
+
+	if let Some(base) = directories::BaseDirs::new() {
+		let roaming = base.data_dir().join("WSync");
+
+		if !dirs.iter().any(|dir| dir == &roaming) {
+			dirs.push(roaming);
+		}
+	}
+
+	let mut records: Vec<RuntimeRecord> = Vec::new();
+
+	for dir in &dirs {
+		for record in read_records(&dir.join("daemons")) {
+			if !records.iter().any(|known| known.port == record.port && known.pid == record.pid) {
+				records.push(record);
+			}
+		}
+	}
 
 	let entries = thread::scope(|scope| {
 		let probes: Vec<_> = records
