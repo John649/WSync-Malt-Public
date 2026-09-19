@@ -28,6 +28,9 @@ use crate::{
 	sessions, util, wsync_info, wsync_warn,
 };
 
+/// How often a serving daemon checks that its runtime record still exists
+const RECORD_CHECK_INTERVAL: Duration = Duration::from_secs(20);
+
 /// How long lifecycle probes wait for `GET /hello`
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
@@ -563,6 +566,34 @@ impl Start {
 
 				if let Err(err) = daemon::write_record(&record_path, &record) {
 					wsync_warn!("Failed to write daemon runtime record: {}", err);
+				}
+
+				// The record is how everything else finds this daemon, and it
+				// is a file on disk like any other: a cleanup, a synced or
+				// roaming profile, or an interrupted write can take it away
+				// while the daemon serves on happily. Nothing else will put it
+				// back, so the daemon watches for its own absence and rewrites
+				// it — otherwise `wsync places` reports nothing running to
+				// someone looking straight at a working Studio
+				{
+					let record_path = record_path.clone();
+					let record = record.clone();
+
+					thread::spawn(move || loop {
+						thread::sleep(RECORD_CHECK_INTERVAL);
+
+						if record_path.exists() {
+							continue;
+						}
+
+						match daemon::write_record(&record_path, &record) {
+							Ok(()) => wsync_warn!(
+								"The daemon runtime record was missing and has been written again: {}",
+								record_path.to_string()
+							),
+							Err(err) => wsync_warn!("Failed to restore the daemon runtime record: {}", err),
+						}
+					});
 				}
 
 				sessions::add(None, Some(host.clone()), Some(actual_port), pid, true).ok();

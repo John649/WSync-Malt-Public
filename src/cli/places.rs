@@ -481,6 +481,13 @@ pub fn registry() -> Result<Vec<DaemonEntry>> {
 				continue;
 			};
 
+			// The desktop app's broker answers on this range too, and it is
+			// not a daemon: it serves no project and nothing can be addressed
+			// through it
+			if hello.canonical_project.trim().is_empty() {
+				continue;
+			}
+
 			let project = Project::load(Path::new(&hello.canonical_project))
 				.ok()
 				.map(|project| ProjectClaim {
