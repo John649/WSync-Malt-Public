@@ -1454,11 +1454,24 @@ fn studio_count() -> usize {
 
 	#[cfg(not(windows))]
 	{
-		let output = Command::new("pgrep").args(["-c", "-f", "RobloxStudio"]).output();
+		// Count the lines rather than asking for a count: `-c` is a Linux
+		// extension macOS's BSD `pgrep` does not have, and it answers a usage
+		// error with exit 2 and an empty stdout — which parses to nothing and
+		// silently reports zero Studios, so the cap would never fire on the
+		// one platform that cannot be checked from here.
+		//
+		// NOTE (unverified, needs a Mac): this counts PROCESSES. If macOS
+		// Studio hosts several open places in one process, eight branch
+		// windows there count as one and the cap still will not bite.
+		let output = Command::new("pgrep").args(["-f", "RobloxStudio"]).output();
 
 		output
-			.ok()
-			.and_then(|out| String::from_utf8_lossy(&out.stdout).trim().parse().ok())
+			.map(|out| {
+				String::from_utf8_lossy(&out.stdout)
+					.lines()
+					.filter(|line| !line.trim().is_empty())
+					.count()
+			})
 			.unwrap_or(0)
 	}
 }
@@ -1544,6 +1557,18 @@ fn detach(command: &mut Command) {
 
 		// DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
 		command.creation_flags(0x0000_0008 | 0x0000_0200);
+	}
+
+	// On unix the child inherits this process's process group and controlling
+	// terminal, so a Ctrl-C at the prompt SIGINTs the daemon we just started
+	// and closing the terminal SIGHUPs it. A group of its own is the whole
+	// point of the name `detach`, and Windows was the only side implementing
+	// it: `CREATE_NEW_PROCESS_GROUP` there, `setpgid(0, 0)` here.
+	#[cfg(unix)]
+	{
+		use std::os::unix::process::CommandExt;
+
+		command.process_group(0);
 	}
 }
 

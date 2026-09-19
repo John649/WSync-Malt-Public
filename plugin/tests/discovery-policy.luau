@@ -93,9 +93,13 @@ do
 		"an unmarked unpublished place still takes the first claimless daemon, weakly"
 	)
 
+	-- This used to be a weak match, and that was the bug: a keyed project
+	-- belongs to one unpublished place, and a place that carries no key is
+	-- not that place. Seen live — a brand-new baseplate adopted another
+	-- place's project and began writing into it.
 	expect(
-		Policy.rankHello({ placeKey = "anything" }, bare) == Policy.MATCH_WEAK,
-		"...and a daemon's key means nothing to a place that carries none"
+		Policy.rankHello({ placeKey = "anything" }, bare) == Policy.MATCH_NONE,
+		"...and a keyed daemon is refused by a place that carries no key"
 	)
 
 	expect(

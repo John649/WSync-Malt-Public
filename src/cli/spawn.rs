@@ -143,6 +143,18 @@ fn detach(command: &mut Command) {
 		// DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
 		command.creation_flags(0x0000_0008 | 0x0000_0200);
 	}
+
+	// On unix the child inherits this process's process group and controlling
+	// terminal, so a Ctrl-C at the prompt SIGINTs the daemon we just started
+	// and closing the terminal SIGHUPs it. A group of its own is the whole
+	// point of the name `detach`, and Windows was the only side implementing
+	// it: `CREATE_NEW_PROCESS_GROUP` there, `setpgid(0, 0)` here.
+	#[cfg(unix)]
+	{
+		use std::os::unix::process::CommandExt;
+
+		command.process_group(0);
+	}
 }
 
 /// Stops this process's own standard handles from reaching any child.
