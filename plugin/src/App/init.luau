@@ -546,6 +546,7 @@ function App:__runAttach(state)
 		-- scratch daemon claims no ids, so the port IS the identity, and it
 		-- must not outlive the window that asked for it (Policy.rankHello).
 		Discovery.setSessionPort(attached.port)
+		self.attachBroker = broker
 		self.attachNote:set(if attached.ephemeral == false then nil else Policy.temporaryNote({ ephemeral = true }))
 		self:__rememberPlace(attached.placeKey, attached.port)
 
@@ -875,6 +876,24 @@ function App:__connectTo(host: string, port: number, generation: number)
 			end
 		end
 	end)
+end
+
+--- The temporary card's "Make permanent": drop the scratch daemon and run
+--- the ordinary create-project flow against the same broker. The scratch
+--- daemon stops itself once this window has left it; the new project takes
+--- the place's key, so an unpublished place stays tied to it from here on.
+function App:makePermanent()
+	local broker = self.attachBroker
+
+	if broker == nil then
+		return
+	end
+
+	Discovery.setSessionPort(nil)
+	self.attachNote:set(nil)
+	self:disconnect(true)
+	self:dispatch({ kind = "offer-create", broker = broker, known = false })
+	self:dispatch({ kind = "create" })
 end
 
 function App:disconnect(cancel: boolean?)

@@ -165,6 +165,16 @@ return function(props: Props): { Instance }
 					HorizontalAlignment = Enum.HorizontalAlignment.Right,
 				},
 				TextButton {
+					Text = "Make permanent",
+					LayoutOrder = 1,
+					Visible = Computed(function(use)
+						return use(props.App.attachNote) ~= nil
+					end),
+					Activated = function()
+						props.App:makePermanent()
+					end,
+				},
+				TextButton {
 					Text = "Disconnect",
 					LayoutOrder = 2,
 					Solid = true,

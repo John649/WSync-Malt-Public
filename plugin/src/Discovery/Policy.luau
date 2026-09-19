@@ -451,6 +451,17 @@ function Policy.step(state: State, event: Event): (State, Effect?)
 		if state.name == "no-broker" or state.name == "error" then
 			return make("scanning", state.generation + 1), "scan"
 		end
+	elseif kind == "offer-create" then
+		-- The card's "Make permanent": a window attached temporarily asks for
+		-- a real project. The transport was dropped first, so the machine is
+		-- idle; the broker that attached it is what the create talks to
+		if state.name == "idle" then
+			return make("create-ready", state.generation + 1, {
+				broker = event.broker,
+				known = event.known == true,
+			}),
+				nil
+		end
 	elseif kind == "create" then
 		if state.name == "create-ready" then
 			-- A known game skips the confirm ceremony: the POST is an
