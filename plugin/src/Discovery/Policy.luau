@@ -211,6 +211,14 @@ function Policy.rankHello(hello: HelloClaim, place: PlaceIdentity, candidate: Ca
 			return Policy.MATCH_EXACT
 		end
 
+		-- A temporary daemon belongs to the one window it was made for. It is
+		-- reached only by the session hint or the marker key above; any other
+		-- window that scans past it (a second unpublished place, say) must
+		-- attach its own rather than knock on a bridge that is already owned.
+		if hello.ephemeral == true then
+			return Policy.MATCH_NONE
+		end
+
 		return Policy.rankStrict(hello, place)
 	end
 

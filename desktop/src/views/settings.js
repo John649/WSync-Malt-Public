@@ -75,6 +75,40 @@ export function mountSettings(root, api) {
   renderThemes();
   layout.append(section("Appearance", "Applies immediately and is remembered.", themeGrid));
 
+  // ---------------------------------------------------------------- studio --
+
+  const attachInput = el("input", {
+    type: "checkbox",
+    checked: api.getState().autoAttach !== false,
+    "aria-label": "Attach to any open place automatically",
+    on: {
+      change: (event) => {
+        const on = event.target.checked;
+        api.setState({ autoAttach: on });
+        api.setStatus(on ? "Auto-attach on: any open place gets a temporary daemon." : "Auto-attach off.", "ok");
+      },
+    },
+  });
+  const attachToggle = el(
+    "label",
+    { class: "toggle" },
+    attachInput,
+    el("span", { class: "toggle-track" }),
+    el("span", { class: "toggle-label", text: "Attach to any open place automatically" }),
+  );
+
+  function renderAttach() {
+    attachInput.checked = api.getState().autoAttach !== false;
+  }
+
+  layout.append(
+    section(
+      "Studio",
+      "A window whose place has no project gets a temporary daemon the moment it opens: nothing is written to disk in either direction, and it closes with the window. Branch clones are never attached.",
+      attachToggle,
+    ),
+  );
+
   // -------------------------------------------------------- projects folder --
   //
   // Design 8.4: authorizing a folder is not a preference, it is what turns the
@@ -851,6 +885,7 @@ export function mountSettings(root, api) {
         void refreshDaemonIdentity();
       }
       if ("appearanceTheme" in changed) renderThemes();
+      if ("autoAttach" in changed) renderAttach();
     }),
     // The broker can come up or go down without this view touching it: at boot
     // for a folder authorized in an earlier run, or when it loses its port.
