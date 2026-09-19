@@ -2757,7 +2757,24 @@ fn write_branch_project(main: &Path, out: &Path, name: &str, synthetic: u64) -> 
 	// Folder as Studio-only and deletes it (docs/branches.md)
 	fields.insert("initialSync".to_owned(), json!("keep"));
 	fields.insert("branch".to_owned(), json!(name));
-	fields.insert("placeIds".to_owned(), json!([synthetic]));
+
+	// The branch daemon claims the same real place as main: the clone boots
+	// with main's place id, and `--place <id> --branch <name>` has to find
+	// this daemon by it. Main's window can never bind here regardless —
+	// discovery refuses a branch daemon for an unmarked place — so the claim
+	// is safe. The name-derived number is the fallback for an unpublished main
+	let real: Vec<u64> = ["servePlaceIds", "placeIds"]
+		.iter()
+		.filter_map(|key| fields.get(*key).and_then(Value::as_array))
+		.flat_map(|ids| ids.iter().filter_map(Value::as_u64).collect::<Vec<_>>())
+		.collect();
+
+	if real.is_empty() {
+		fields.insert("placeIds".to_owned(), json!([synthetic]));
+	} else {
+		fields.insert("placeIds".to_owned(), json!(real));
+	}
+
 	// The legacy spelling would otherwise sit beside the new one and win
 	fields.remove("servePlaceIds");
 

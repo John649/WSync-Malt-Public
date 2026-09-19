@@ -16,6 +16,7 @@
 local HttpService = game:GetService("HttpService")
 
 local WSync = script:FindFirstAncestor("WSync")
+local Branch = require(WSync.Branch)
 
 local Promise = require(WSync.Packages.Promise)
 
@@ -548,6 +549,14 @@ function WebSocket:__handleFrame(frame: { [string]: any }, resolveHello: ((frame
 	elseif kind == "shutdown" then
 		local reason = tostring(frame.reason or "Server requested a disconnect")
 		local retryable = frame.retryable ~= false
+
+		-- A branch clone answers to exactly one daemon, on a port the marker
+		-- names; that daemon being stopped is a restart in progress (a binary
+		-- swap, `branch up`), never a reason to give up and wait for a click
+		if not retryable and Branch.current() ~= nil then
+			retryable = true
+			Log.info("Branch clone: treating the daemon stop as a restart and retrying")
+		end
 
 		Log.info(`Server shutdown [{tostring(frame.code)}]: {reason} (retryable: {tostring(retryable)})`)
 
