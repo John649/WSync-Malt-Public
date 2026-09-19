@@ -1,0 +1,20 @@
+# The plugin artifact is compared by sha256 (plugin/WSync.build.json, checked
+# in CI), and rojo embeds source bytes verbatim — so a checkout with CRLF
+# endings builds a different artifact than the Linux runner does, and the
+# committed manifest can only ever match one platform. Normalising the
+# working copy to LF everywhere makes the build reproducible across Windows,
+# macOS and Linux, and it is what the repository has always stored anyway.
+* text=auto eol=lf
+
+# Bytes, not text: never touch these.
+*.msgpack binary
+*.png binary
+*.ico binary
+*.icns binary
+*.rbxm binary
+*.rbxmx binary
+*.rbxl binary
+*.rbxlx binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
