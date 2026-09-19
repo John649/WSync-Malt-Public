@@ -1,5 +1,5 @@
 use colored::Colorize;
-use rbx_dom_weak::{ustr, HashMapExt, UstrMap};
+use rbx_dom_weak::{ustr, UstrMap};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -169,15 +169,18 @@ pub fn verify_path(path: &mut PathBuf, name: &mut String, meta: &mut Meta, vfs: 
 }
 
 pub fn validate_properties(properties: Properties, filter: &SyncbackFilter) -> Properties {
-	// Temporary solution for empty Luau maps being serialized as arrays
-	if properties.contains_key(&ustr("ArgonEmpty")) {
-		UstrMap::new()
-	} else {
-		properties
-			.into_iter()
-			.filter(|(property, _)| !filter.matches_property(property))
-			.collect()
-	}
+	// `ArgonEmpty` is the plugin's marker for "this map is empty", sent
+	// because an empty Luau map serializes as an array. It is a wire artefact
+	// and is stripped here exactly as every other decode path strips it
+	// (`server::bulk::to_snapshot`, `server::snapshot_json::strip_argon_empty`)
+	// — it is not an instruction to discard whatever else arrived with it.
+	// Returning an empty map on sight meant a push that happened to carry the
+	// marker blanked the instance in the tree *and* truncated its file,
+	// because `luau::write_luau` then found no `Source` to write
+	properties
+		.into_iter()
+		.filter(|(property, _)| *property != ustr("ArgonEmpty") && !filter.matches_property(property))
+		.collect()
 }
 
 pub fn serialize_properties(class: &str, properties: Properties) -> UstrMap<UnresolvedValue> {

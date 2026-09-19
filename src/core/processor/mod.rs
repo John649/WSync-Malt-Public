@@ -28,7 +28,6 @@ use crate::{
 	project::{Project, ProjectDetails},
 	server, stats,
 	vfs::{Vfs, VfsEvent},
-	wsync_error,
 };
 
 pub mod read;
@@ -163,6 +162,18 @@ impl Handler {
 
 		let engine_on = Config::new().conflict_engine;
 
+		// A project-file delete is a rewrite in progress (git and editors
+		// unlink then recreate), never a request to tear the tree down: the
+		// root's source is missing for a moment, and re-walking it then would
+		// queue a removal of the DataModel itself. The write that follows
+		// re-reads it
+		if let VfsEvent::Delete(_) = event {
+			if lock!(self.project).path == event.path() {
+				warn!("Project file removed from disk; waiting for it to be written again before syncing");
+				return;
+			}
+		}
+
 		let mut tree = lock!(self.tree);
 		let path = event.path();
 
@@ -247,7 +258,11 @@ impl Handler {
 		let mut project = lock!(self.project);
 
 		if project.path == path {
-			if let VfsEvent::Write(_) = event {
+			// A rewrite arrives as a write *or* as a create, because git and
+			// most editors unlink the old file and put a new one in its place.
+			// Only handling the write left the daemon holding the project it
+			// loaded at boot, with no way to notice it had been replaced
+			if matches!(event, VfsEvent::Write(_) | VfsEvent::Create(_)) {
 				debug!("Project file was modified. Reloading project..");
 
 				let old_details = ProjectDetails::from_project(&project, &tree);
@@ -255,6 +270,17 @@ impl Handler {
 				match project.reload() {
 					Ok(project) => {
 						info!("Project reloaded");
+
+						// The watch is re-armed on every reload. A walk that
+						// found the file missing calls `Vfs::unwatch` on it
+						// (`middleware::new_snapshot`), and a watch dropped
+						// during the unlink half of a rewrite would never come
+						// back — the daemon would go silently blind to every
+						// later project edit. Watching an already-watched path
+						// is a no-op
+						if let Err(err) = self.vfs.watch(&project.path, false) {
+							warn!("Failed to re-watch the project file: {err}");
+						}
 
 						let details = ProjectDetails::from_project(project, &tree);
 
@@ -269,9 +295,11 @@ impl Handler {
 					}
 					Err(err) => error!("Failed to reload project: {err}"),
 				}
-			} else if let VfsEvent::Delete(_) = event {
-				wsync_error!("Warning! Top level project file was deleted. This might cause unexpected behavior. Skipping processing of changes!");
 			}
+			// A delete of the project file never reaches here: it returns at
+			// the top of this function, before any tree walk, because the
+			// missing file is the unlink half of a rewrite and not a statement
+			// about the place
 		}
 	}
 

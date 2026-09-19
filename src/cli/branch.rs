@@ -802,6 +802,28 @@ impl Finish {
 			|| root.join("conflicts.json").exists()
 			|| root.join("decisions.json").exists();
 
+		// The branch's journal and blobs come out before main is touched at
+		// all: main's plugin cannot reach the branch daemon, so every `add`
+		// payload travels inline, drained from the branch's own plugin while
+		// its Studio is still up — and nothing below has to unwind if this
+		// part fails
+		let branch = Client::connect(&record.targeting(&main.project))?;
+		branch
+			.request_with_timeout("journal_flush", json!({}), HEAVY_TIMEOUT_MS)?
+			.into_value(self.raw)?;
+
+		let journal = fetch_journal(&branch, &record.checkpoint)?;
+		let decisions = read_decisions(&root);
+		let blobs = collect_blobs(&branch, &journal, true, self.raw)?;
+
+		// Main's daemon holds every disk push from here until the replay is
+		// done: the parking commit, the merge and the restore of main's own
+		// project file all rewrite files under its watcher, and re-walking a
+		// half-merged checkout — or the project file itself, which re-walks
+		// the whole tree — would push half-states straight into main's Studio
+		let client = Client::connect(&self.targeting)?;
+		client.post_endpoint("/sync/pause", &json!({}))?.json("/sync/pause")?;
+
 		let (parked, left_dirty) = if resuming {
 			(Vec::new(), 0)
 		} else {
@@ -809,7 +831,13 @@ impl Finish {
 			// every plugin connect, and the branch committed its own regenerated
 			// copies — so git refuses the merge before it starts unless that
 			// overlap is committed first
-			commit_blocking_work(&main.workspace, &record.git_branch, &record.name, &owned)?
+			match commit_blocking_work(&main.workspace, &record.git_branch, &record.name) {
+				Ok(parked) => parked,
+				Err(error) => {
+					resume(&client);
+					return Err(error);
+				}
+			}
 		};
 
 		if !parked.is_empty() && !self.raw {
@@ -828,19 +856,32 @@ impl Finish {
 		let refusal = if resuming {
 			None
 		} else {
-			let merge = git_try(
+			let merge = match git_try(
 				&main.workspace,
 				&["merge", "--no-ff", "--no-commit", &record.git_branch],
-			)?;
-
-			(!merge.0).then(|| {
-				if merge.2.trim().is_empty() {
-					merge.1.trim().to_owned()
-				} else {
-					merge.2.trim().to_owned()
+			) {
+				Ok(merge) => merge,
+				Err(error) => {
+					resume(&client);
+					return Err(error);
 				}
-			})
+			};
+
+			(!merge.0).then(|| git_message(&merge.1, &merge.2))
 		};
+
+		// A merge git refused to start (dirty overlap, unrelated histories…)
+		// touched nothing, and "restoring" main's owned files from HEAD would
+		// then only throw away main's uncommitted edits to them
+		let started = resuming || merge_in_progress(&main.workspace);
+
+		if !started {
+			let message = refusal.unwrap_or_else(|| "git did not start the merge".to_owned());
+
+			resume(&client);
+			print_merge_refusal(&record.name, &record.git_branch, &message, self.raw);
+			process::exit(CONFLICT_EXIT);
+		}
 
 		// Main's own copies go back before anything is called a conflict: these
 		// paths conflict on every single merge and resolving them by hand every
@@ -859,6 +900,7 @@ impl Finish {
 		let unmerged = unmerged_paths(&main.workspace);
 
 		if !unmerged.is_empty() {
+			resume(&client);
 			print_paths(
 				"git could not merge these files; resolve them in the worktree, then run `wsync branch finish` again",
 				&unmerged,
@@ -867,34 +909,7 @@ impl Finish {
 			process::exit(CONFLICT_EXIT);
 		}
 
-		// git exits non-zero for a merge it would not start AND for one it
-		// started and left conflicted. `MERGE_HEAD` tells them apart, and the
-		// conflicts may be ones just resolved above — only a merge that never
-		// began is a refusal, and then git's own message is the diagnosis
-		if let Some(message) = refusal {
-			if !merge_in_progress(&main.workspace) {
-				print_merge_refusal(&record.name, &record.git_branch, &message, self.raw);
-				process::exit(CONFLICT_EXIT);
-			}
-		}
-
 		// (3) the instance replay, into main's Studio
-		let branch = Client::connect(&record.targeting(&main.project))?;
-		branch
-			.request_with_timeout("journal_flush", json!({}), HEAVY_TIMEOUT_MS)?
-			.into_value(self.raw)?;
-
-		let journal = fetch_journal(&branch, &record.checkpoint)?;
-		let decisions = read_decisions(&root);
-
-		// Every `add` payload has to travel inline: main's plugin cannot reach
-		// the branch daemon, so the blobs are drained from the branch's own
-		// plugin here, while its Studio is still up
-		let blobs = collect_blobs(&branch, &journal, true, self.raw)?;
-
-		let client = Client::connect(&self.targeting)?;
-		client.post_endpoint("/sync/pause", &json!({}))?.json("/sync/pause")?;
-
 		let replayed = replay(
 			&client,
 			&record.checkpoint,
@@ -1979,16 +1994,14 @@ fn print_conflicts(name: &str, conflicts: &[Value], path: &Path, raw: bool) {
 /// committed here. Never `git add -A` — unrelated work in main stays exactly
 /// where it was. Returns what was committed and how many changed files were
 /// left alone
-fn commit_blocking_work(
-	workspace: &Path,
-	git_branch: &str,
-	name: &str,
-	exclude: &[String],
-) -> Result<(Vec<String>, usize)> {
+fn commit_blocking_work(workspace: &Path, git_branch: &str, name: &str) -> Result<(Vec<String>, usize)> {
+	// Main's own files (project file, generated docs) are parked like any
+	// other: the merge would otherwise refuse to start over them, and the
+	// restore from HEAD afterwards hands main exactly the copy parked here
 	let touched: HashSet<String> = git_out(workspace, &["diff", "--name-only", &format!("HEAD...{git_branch}")])
 		.unwrap_or_default()
 		.lines()
-		.filter(|line| !line.is_empty() && !exclude.iter().any(|owned| owned == line))
+		.filter(|line| !line.is_empty())
 		.map(str::to_owned)
 		.collect();
 
@@ -2024,6 +2037,28 @@ fn commit_blocking_work(
 /// project file, because the branch rewrote its own copy in `new`, and every
 /// doc the daemon regenerates, because those differ between any two worktrees
 /// by construction
+/// git's own words for a failure, stderr first, minus the line-ending
+/// warnings Windows checkouts print for every file the merge looked at
+fn git_message(stdout: &str, stderr: &str) -> String {
+	let meaningful = |text: &str| -> String {
+		text.lines()
+			.filter(|line| !line.starts_with("warning: in the working copy of") && !line.starts_with("warning: LF will be"))
+			.collect::<Vec<_>>()
+			.join("
+")
+			.trim()
+			.to_owned()
+	};
+
+	let err = meaningful(stderr);
+
+	if err.is_empty() {
+		meaningful(stdout)
+	} else {
+		err
+	}
+}
+
 fn main_owned_paths(project_file: &str) -> Vec<String> {
 	let mut owned = vec![project_file.to_owned()];
 

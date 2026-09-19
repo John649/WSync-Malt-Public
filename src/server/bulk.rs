@@ -30,7 +30,7 @@ use rbx_dom_weak::{types::Variant, ustr};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
-	collections::{BTreeMap, BTreeSet, HashMap},
+	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 	fs,
 	path::{Path, PathBuf},
 	time::Duration,
@@ -50,7 +50,8 @@ use crate::{
 		snapshot::Snapshot,
 		tree::Tree,
 	},
-	middleware::dir,
+	ext::PathExt,
+	middleware::{dir, Middleware},
 	server::{
 		ws::frames::{self, codes, OpError, ServerFrame},
 		AppState, DIRECTION_DISK_TO_STUDIO,
@@ -460,18 +461,110 @@ pub struct StudioFirstOptions {
 	pub preserve: HashMap<PathBuf, PathBuf>,
 }
 
+/// What an entry inside a directory stands for, as the walker reads it —
+/// which is what "claimed" has to mean, because a path is not an identity.
+#[derive(PartialEq, Eq, Hash, Debug)]
+enum Claim {
+	/// An `init.*` (or `init.meta.json`): this entry *is* its own directory
+	Own,
+	/// An ordinary instance inside the directory, by the name the walker
+	/// gives it — suffix stripped, so `Foo.client.luau`, `Foo.local.luau`,
+	/// `Foo.luau`, `Foo.meta.json` and the directory `Foo/` all claim `Foo`
+	Named(String),
+}
+
+/// The instance an entry claims inside its directory. Out-of-projection files
+/// fall back to their literal name, so they are only ever claimed by an entry
+/// spelled identically
+fn claim_of(path: &Path, is_dir: bool, context: &Context) -> Claim {
+	if is_dir {
+		return Claim::Named(path.get_name().to_owned());
+	}
+
+	let rules = context.sync_rules();
+
+	if rules.iter().any(|rule| rule.matches_child(path)) {
+		return Claim::Own;
+	}
+
+	if let Some(resolved) = rules.iter().find_map(|rule| rule.resolve(path)) {
+		return Claim::Named(resolved.name);
+	}
+
+	// `SyncRule::resolve`/`resolve_child` refuse `InstanceData` by design, so
+	// a sidecar is matched against its own rules here. A sidecar belongs to
+	// the instance it names: leaving `Foo.meta.json` behind when the stage
+	// replaced `Foo.client.luau` with `Foo.local.luau` would graft the old
+	// instance's attributes onto the new file
+	let name = path.get_name();
+
+	for rule in context.sync_rules_of_type(&Middleware::InstanceData, false) {
+		if let Some(child_pattern) = rule.child_pattern.as_ref() {
+			if name == child_pattern.as_str() {
+				return Claim::Own;
+			}
+		}
+
+		if let Some(pattern) = rule.pattern.as_ref() {
+			if let Some((prefix, suffix)) = pattern.as_str().split_once('*') {
+				if name.len() > prefix.len() + suffix.len() && name.starts_with(prefix) && name.ends_with(suffix) {
+					return Claim::Named(name[prefix.len()..name.len() - suffix.len()].to_owned());
+				}
+			}
+		}
+	}
+
+	Claim::Named(name.to_owned())
+}
+
+/// Every claim the staged directory already makes
+fn claims_in(stage: &Path, context: &Context) -> std::io::Result<HashSet<Claim>> {
+	let mut claims = HashSet::new();
+
+	if !stage.is_dir() {
+		return Ok(claims);
+	}
+
+	for entry in fs::read_dir(stage)? {
+		let entry = entry?;
+		claims.insert(claim_of(&entry.path(), entry.file_type()?.is_dir(), context));
+	}
+
+	Ok(claims)
+}
+
 /// Carries unclaimed live entries forward into the staged root (Design §7.0):
 /// any file or directory the staged projection does not claim — disk-only
 /// projection files and out-of-projection files alike — is copied in, so the
-/// swap cannot displace it into the backup. Claimed paths (same relative
-/// path exists in the stage) keep their staged Studio content
-fn overlay_unclaimed(live: &Path, stage: &Path) -> Result<(), String> {
-	fn walk(live: &Path, stage: &Path) -> std::io::Result<()> {
+/// swap cannot displace it into the backup.
+///
+/// "Claimed" is per *instance*, not per path. The writer's layout is not the
+/// one the previous tool used — a LocalScript is `Foo.local.luau` here and was
+/// `Foo.client.luau` there, a RunContext = Server script is `Foo.runserver.luau`
+/// and was `Foo.server.luau`, and an instance that gained children is promoted
+/// from `Foo.luau` to `Foo/init.luau`. Keyed by path, none of those old
+/// spellings looked claimed, so the swap carried them in beside the file that
+/// had just replaced them. The directory then held two candidates for one
+/// instance, and which one the walker read decided the instance's *class* —
+/// that is how `Client/Local/Emitter2D` and `InGameExplorer/.../
+/// InGameExplorerClient` came back as duplicate LocalScript subtrees
+fn overlay_unclaimed(live: &Path, stage: &Path, context: &Context) -> Result<(), String> {
+	fn walk(live: &Path, stage: &Path, context: &Context) -> std::io::Result<()> {
+		let claimed = claims_in(stage, context)?;
+
 		for entry in fs::read_dir(live)? {
 			let entry = entry?;
+			let is_dir = entry.file_type()?.is_dir();
 			let staged = stage.join(entry.file_name());
 
-			if entry.file_type()?.is_dir() {
+			// The stage already speaks for this instance, under whatever
+			// spelling it chose: the live entry is claimed away, not carried
+			// forward. An identical path is handled below as before
+			if !staged.exists() && claimed.contains(&claim_of(&entry.path(), is_dir, context)) {
+				continue;
+			}
+
+			if is_dir {
 				// The stage claims a file here (folder demoted to file):
 				// the live subtree is claimed-away, not carried forward
 				if staged.is_file() {
@@ -482,7 +575,7 @@ fn overlay_unclaimed(live: &Path, stage: &Path) -> Result<(), String> {
 					fs::create_dir_all(&staged)?;
 				}
 
-				walk(&entry.path(), &staged)?;
+				walk(&entry.path(), &staged, context)?;
 			} else if !staged.exists() {
 				fs::copy(entry.path(), &staged)?;
 			}
@@ -491,7 +584,7 @@ fn overlay_unclaimed(live: &Path, stage: &Path) -> Result<(), String> {
 		Ok(())
 	}
 
-	walk(live, stage).map_err(|err| format!("failed to overlay unclaimed disk files into the stage: {err}"))
+	walk(live, stage, context).map_err(|err| format!("failed to overlay unclaimed disk files into the stage: {err}"))
 }
 
 /// SHA-256 of every file under `dir`, keyed by relative path — the fence
@@ -830,6 +923,58 @@ fn resolve_root(state: &AppState, root_path: &str) -> Result<RootTarget, String>
 	})
 }
 
+/// Re-derives one root's subtree from what is on disk right now and stamps a
+/// baseline for everything under it. The changes are dropped: the caller has
+/// just put those bytes there on purpose, and replaying them at Studio would
+/// be an echo of its own content.
+///
+/// Callers hold the VFS pause, so nothing else re-reads these files
+fn refresh_root(state: &AppState, id: rbx_dom_weak::types::Ref, vfs: &crate::vfs::Vfs) {
+	let mut tree = state.core.tree();
+
+	if !tree.exists(id) {
+		return;
+	}
+
+	read::process_changes(id, &mut tree, vfs);
+
+	// Baselines stamp for every touched instance (Design §7.4): both sides
+	// provably agree on the content now on disk
+	let engine = state.core.conflicts();
+
+	for id in conflict::subtree_refs(&tree, id) {
+		if let Some(instance) = tree.get_instance(id) {
+			let content = ContentState::new(&instance.name, &instance.class, &instance.properties);
+
+			engine.stamp(id, content.hash);
+		}
+	}
+}
+
+/// Re-derives every named root after something moved files behind the tree's
+/// back — the backlog sweep at the end of a Studio-first apply removes the
+/// disk-only entries that lost to Studio while the VFS is paused, so those
+/// deletions reach no walker on their own.
+///
+/// Leaving that out is how the tree ended up still describing files that no
+/// longer existed: the next unrelated event re-walked the root and pushed the
+/// whole accumulated difference at Studio as one burst
+pub fn refresh_roots(state: &AppState, roots: &BTreeSet<String>) {
+	let vfs = state.core.vfs();
+
+	for root_name in roots {
+		let id = {
+			let tree = state.core.tree();
+			resolve_instance_path(&tree, root_name)
+		};
+
+		match id {
+			Some(id) => refresh_root(state, id, &vfs),
+			None => debug!("Not refreshing {root_name} after the sweep: it is no longer in the tree"),
+		}
+	}
+}
+
 /// Applies one root: pull → stage → fence → (preserve + overlay when
 /// studio-first) → swap → refresh tree → stamp baselines. Returns the backup
 /// name (`<transfer>/<root>`) on success
@@ -968,7 +1113,7 @@ async fn apply_root(
 			// Disk-only and out-of-projection files stay on the live disk:
 			// the stage is overlaid so the swap carries them forward instead
 			// of displacing them into the backup
-			overlay_unclaimed(&target.live_dir, &stage_root)?;
+			overlay_unclaimed(&target.live_dir, &stage_root, &target.context)?;
 		}
 
 		// The watch must move off the directory before it is renamed away
@@ -1058,23 +1203,7 @@ async fn apply_root(
 	// Refresh the daemon tree from the swapped root. The resulting changes
 	// are dropped deliberately — Studio already holds exactly this state
 	// (it is where the bytes came from), so replaying them would be an echo
-	{
-		let mut tree = state.core.tree();
-
-		read::process_changes(target.id, &mut tree, &vfs);
-
-		// Baselines stamp for every touched instance (Design §7.4): both
-		// sides provably agree on the swapped content
-		let engine = state.core.conflicts();
-
-		for id in conflict::subtree_refs(&tree, target.id) {
-			if let Some(instance) = tree.get_instance(id) {
-				let content = ContentState::new(&instance.name, &instance.class, &instance.properties);
-
-				engine.stamp(id, content.hash);
-			}
-		}
-	}
+	refresh_root(state, target.id, &vfs);
 
 	vfs.resume();
 

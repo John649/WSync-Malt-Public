@@ -435,6 +435,16 @@ pub fn apply_update(snapshot: UpdatedSnapshot, tree: &mut Tree, vfs: &Vfs) -> Re
 
 		let mut properties = validate_properties(properties, filter);
 
+		// What the instance holds, kept before the middleware consumes
+		// anything out of the map. `Middleware::from_class` *removes*
+		// RunContext — the suffix carries it instead — so storing the map it
+		// leaves behind left the tree holding a `Script` with no RunContext,
+		// while `luau::read_luau` puts one back on every read. The two never
+		// agreed again: each full re-walk diffed that one property and queued
+		// an update for the script. `apply_addition` already clones first
+		// (see `write_instance`); this is the same thing, on the update path
+		let tree_properties = properties.clone();
+
 		// Properties always ride along: for a `Script` the middleware consumes
 		// RunContext and encodes it in the file suffix
 		if let Some(middleware) = Middleware::from_class(&instance.class, Some(&mut properties)) {
@@ -496,7 +506,7 @@ pub fn apply_update(snapshot: UpdatedSnapshot, tree: &mut Tree, vfs: &Vfs) -> Re
 			}
 		}
 
-		instance.properties = properties;
+		instance.properties = tree_properties;
 
 		Ok(())
 	}

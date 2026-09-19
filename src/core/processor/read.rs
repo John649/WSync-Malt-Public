@@ -67,6 +67,14 @@ pub fn process_changes(id: Ref, tree: &mut Tree, vfs: &Vfs) -> Option<Changes> {
 	// Handle additions, modifications and child removals
 	if let Some(snapshot) = snapshot {
 		process_child_changes(id, snapshot, &mut changes, tree);
+	// The root's source is the project file, and that file is missing for a
+	// moment every time git or an editor rewrites it (unlink, then create).
+	// Reading that moment as "the DataModel is gone" queued a removal of the
+	// root itself and pushed it to Studio — `Tree::remove_instance` refuses
+	// the root, so the removal was never even true of our own tree. The
+	// write that follows re-reads the project
+	} else if id == tree.root_ref() {
+		error!("Project source disappeared; keeping the tree until it is written again");
 	// Handle regular removals
 	} else {
 		tree.remove_instance(id);
@@ -80,12 +88,17 @@ fn process_child_changes(id: Ref, mut snapshot: Snapshot, changes: &mut Changes,
 	// Process instance changes
 	let mut updated_snapshot = UpdatedSnapshot::new(id);
 
-	updated_snapshot.meta = if snapshot.meta != *tree.get_meta(id).expect("Instance meta not found") {
-		tree.update_meta(id, snapshot.meta.clone());
-		Some(snapshot.meta)
-	} else {
-		None
-	};
+	// The context is refreshed either way — the tree must hold the rules the
+	// project file currently states — but only the parts of the meta a client
+	// can observe decide whether this is a change worth reporting. See
+	// `Meta::matches_ignoring_context`
+	let meta_changed = !snapshot
+		.meta
+		.matches_ignoring_context(tree.get_meta(id).expect("Instance meta not found"));
+
+	tree.update_meta(id, snapshot.meta.clone());
+
+	updated_snapshot.meta = if meta_changed { Some(snapshot.meta) } else { None };
 
 	let instance = tree.get_instance_mut(id).unwrap();
 

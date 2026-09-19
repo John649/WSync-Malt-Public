@@ -630,6 +630,16 @@ async fn studio_first_commit(state: &AppState, items: Vec<Item>, accepted: u64, 
 		}
 	}
 
+	// The sweep above moved files out of the workspace while the watcher was
+	// held, so those deletions reached nobody. Re-deriving the roots here, on
+	// the same pause, is what keeps the tree describing the disk it actually
+	// has: without it the tree still named the files the sweep took, and the
+	// next unrelated event — a project-file rewrite two minutes later — walked
+	// the root and pushed the whole accumulated difference at Studio in one
+	// burst. The changes are dropped, not queued: Studio is where this content
+	// came from
+	bulk::refresh_roots(state, &staged_roots);
+
 	vfs.resume();
 
 	// Baselines stamp as today: the tree now holds exactly the applied state

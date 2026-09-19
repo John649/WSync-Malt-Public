@@ -33,17 +33,24 @@ pub async fn pause(State(state): State<AppState>) -> Json<Value> {
 	Json(json!({ "ok": true, "paused": true, "changed": changed }))
 }
 
-/// `POST /sync/resume` — release the hold and rescan. The rescan runs
-/// whether or not this call is the one that unpaused: a caller asking to
-/// resume wants the tree to match disk, and answering "it was already
-/// running" without checking would be exactly the lie this endpoint exists
-/// to prevent
+/// `POST /sync/resume` — release the hold and rescan.
+///
+/// The rescan runs when this call is the one that unpaused, because that is
+/// the window in which disk events were dropped and the tree may be stale. A
+/// resume on a daemon that was never paused has nothing to catch up on: the
+/// watcher has been delivering every event all along, and re-walking the
+/// whole project there only costs a full walk — and, for a retried `branch
+/// finish`, does it twice
 pub async fn resume(State(state): State<AppState>) -> Json<Value> {
 	let changed = state.core.set_sync_paused(false);
 
-	let rescanned = state.core.rescan();
+	let rescanned = if changed { state.core.rescan() } else { 0 };
 
-	info!("Sync resumed: the rescan queued {rescanned} change(s) for Studio");
+	if changed {
+		info!("Sync resumed: the rescan queued {rescanned} change(s) for Studio");
+	} else {
+		info!("Sync was already running; nothing to rescan");
+	}
 
 	Json(json!({
 		"ok": true,

@@ -626,4 +626,24 @@ impl Meta {
 	pub fn set_mesh_source(&mut self, mesh_source: Option<String>) {
 		self.mesh_source = mesh_source;
 	}
+
+	/// Whether two metas describe the same instance *as far as anything
+	/// outside this process can tell* — everything except [`Context`].
+	///
+	/// The context is the project's rule set (ignore globs, sync rules, the
+	/// syncback filter, the scope) and every node carries a clone of the same
+	/// one. It is `#[serde(skip)]` precisely because no client ever sees it, so
+	/// a difference in it is not a change to an instance. Comparing whole
+	/// `Meta`s made one `ignoreGlobs` edit queue an update for *every* node in
+	/// the tree — 3229 of them on DungeonDemo, not one of which carried a
+	/// changed property — and `POST /sync/resume` took the same path, so a
+	/// `branch finish` across a commit that touched `ignoreGlobs` pushed the
+	/// whole place. The stored context is still refreshed by the caller; it
+	/// just no longer counts as a change to report
+	pub fn matches_ignoring_context(&self, other: &Self) -> bool {
+		self.source == other.source
+			&& self.keep_unknowns == other.keep_unknowns
+			&& self.original_name == other.original_name
+			&& self.mesh_source == other.mesh_source
+	}
 }

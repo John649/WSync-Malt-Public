@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use anyhow::Result;
 use colored::Colorize;
 use log::{trace, warn};
@@ -229,14 +230,99 @@ pub fn new_snapshot(path: &Path, context: &Context, vfs: &Vfs) -> Result<Option<
 			Ok(None)
 		}
 	} else {
-		for path in vfs.read_dir(path)? {
-			if let Some(snapshot) = new_snapshot_file_child(&path, context, vfs)? {
+		// A directory has exactly one child script, and which one must not
+		// depend on enumeration order: the OS hands entries back in whatever
+		// order it likes and the staged in-memory tree in another, so a
+		// directory holding both a legacy `init.server.luau` and the native
+		// `init.runserver.luau` would flip between walks — and every flip
+		// re-derives the whole subtree under a new node, which Studio sees as
+		// a removal plus an addition of a duplicate. The candidate whose sync
+		// rule comes first wins, then the name, always
+		if let Some(chosen) = child_source_of(path, context, vfs)? {
+			if let Some(snapshot) = new_snapshot_file_child(&chosen, context, vfs)? {
 				return Ok(Some(snapshot));
 			}
 		}
 
 		new_snapshot_dir(path, context, vfs)
 	}
+}
+
+/// How much a child script's suffix looks like something *this* fork's
+/// writer produced, lower being preferred.
+///
+/// Ranking by sync-rule order alone is not enough, because the default rules
+/// list `.server` and `.client` before `.local` and `.runserver`
+/// (`constants::default_sync_rules`). Those first two are also the spellings
+/// the previous tool used for the two classes this fork spells differently:
+/// its LocalScript was `init.client.luau`, ours is `init.local.luau`; its
+/// RunContext = Server script was `init.server.luau`, ours is
+/// `init.runserver.luau`. A converted directory therefore holds both for as
+/// long as the old file survives the conversion, and picking by rule order
+/// would pick the file the writer has just replaced — reading the directory
+/// back as the *old* class, which Studio then sees as a removal plus a
+/// duplicate addition of the whole subtree. Seen live on
+/// `Client/Local/Emitter2D` and `InGameExplorer/.../InGameExplorerClient`.
+///
+/// So the suffix the writer would emit wins over the one it migrated away
+/// from, and everything else keeps the rules' own order below that
+fn child_source_rank(middleware: &Middleware) -> u8 {
+	match middleware {
+		// The two this fork writes for classes the old layout spelled
+		// differently — these must outrank their legacy twins
+		Middleware::LocalScript => 0,
+		Middleware::RunServerScript => 1,
+		Middleware::ModuleScript => 2,
+		// Also native (a `Script` with RunContext Client / Legacy), but they
+		// double as the old layout's LocalScript and RunContext = Server
+		Middleware::ClientScript => 3,
+		Middleware::ServerScript => 4,
+		_ => 5,
+	}
+}
+
+/// The one child script a directory is read through, chosen the same way on
+/// every walk: the suffix this fork's writer would emit first
+/// ([`child_source_rank`]), then the sync rule's own order, then the lexically
+/// smallest name. Any other candidate is reported once per walk and never
+/// synced
+fn child_source_of(dir: &Path, context: &Context, vfs: &Vfs) -> Result<Option<PathBuf>> {
+	let rules = context.sync_rules();
+	let mut candidates: Vec<(u8, usize, PathBuf)> = Vec::new();
+
+	for entry in vfs.read_dir(dir)? {
+		if !vfs.is_file(&entry) {
+			continue;
+		}
+
+		let matched = rules.iter().enumerate().find_map(|(index, rule)| {
+			rule.resolve_child(&entry)
+				.filter(|resolved| scope_allows_rule(context, &resolved.middleware, &entry))
+				.map(|resolved| (child_source_rank(&resolved.middleware), index))
+		});
+
+		if let Some((rank, index)) = matched {
+			candidates.push((rank, index, entry));
+		}
+	}
+
+	candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
+
+	let mut chosen = candidates.into_iter();
+	let first = chosen.next().map(|(_, _, path)| path);
+
+	if let Some(first) = &first {
+		for (_, _, other) in chosen {
+			warn!(
+				"{} and {} are both child scripts of the same directory; only {} is synced",
+				first.display(),
+				other.display(),
+				first.get_name()
+			);
+		}
+	}
+
+	Ok(first)
 }
 
 /// Create a snapshot of a regular file,
