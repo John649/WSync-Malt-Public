@@ -37,12 +37,12 @@ use std::{
 };
 
 use crate::{
+	config::Config,
 	constants::{
 		BACKUPS_DIR, BACKUP_COMPLETE_MARKER, BACKUP_KEEP_COUNT, BACKUP_KEEP_DAYS, BULK_OP_TIMEOUT_MS,
 		BULK_ROOT_MAX_BYTES, BULK_SCRIPT_MAX_BYTES, BULK_TRANSFER_MAX_BYTES, REQUEST_DEFAULT_TIMEOUT_MS,
 		SOURCE_READ_CHUNK_BYTES,
 	},
-	config::Config,
 	core::{
 		changes::Changes,
 		conflict::{self, ContentState},
@@ -1802,7 +1802,11 @@ pub async fn apply_roots(
 
 		info!(
 			"{}: disk already matches, {} files unchanged",
-			if studio_first.is_some() { "Studio-first" } else { "Keep-Studio" },
+			if studio_first.is_some() {
+				"Studio-first"
+			} else {
+				"Keep-Studio"
+			},
 			outcome.unchanged
 		);
 	} else {
@@ -2039,13 +2043,21 @@ mod tests {
 				continue;
 			}
 
-			assert_eq!(before[relative], after[relative], "{} must not be rewritten", relative.display());
+			assert_eq!(
+				before[relative],
+				after[relative],
+				"{} must not be rewritten",
+				relative.display()
+			);
 		}
 
 		// The backup batch holds that one displaced original, nothing else
 		let backed_up = index_tree(&backup).unwrap();
 
-		assert_eq!(backed_up.files.keys().collect::<Vec<_>>(), vec![&PathBuf::from("ModA.luau")]);
+		assert_eq!(
+			backed_up.files.keys().collect::<Vec<_>>(),
+			vec![&PathBuf::from("ModA.luau")]
+		);
 		assert_eq!(
 			fs::read_to_string(backup.join("ModA.luau")).unwrap(),
 			"return \"mod-a\"\n"
@@ -2085,14 +2097,22 @@ mod tests {
 		let after = mtimes(&live);
 
 		for relative in [PathBuf::from("ModA.luau"), PathBuf::from("Nested").join("Deep.luau")] {
-			assert_eq!(before[&relative], after[&relative], "{} must not be rewritten", relative.display());
+			assert_eq!(
+				before[&relative],
+				after[&relative],
+				"{} must not be rewritten",
+				relative.display()
+			);
 		}
 
 		// A removed file is displaced and backed up; a created one displaces
 		// nothing, so it has no original to keep
 		let backed_up = index_tree(&backup).unwrap();
 
-		assert_eq!(backed_up.files.keys().collect::<Vec<_>>(), vec![&PathBuf::from("Hello.luau")]);
+		assert_eq!(
+			backed_up.files.keys().collect::<Vec<_>>(),
+			vec![&PathBuf::from("Hello.luau")]
+		);
 	}
 
 	#[test]
@@ -2162,7 +2182,10 @@ mod tests {
 		assert!(error.contains("failed to back up"), "error: {error}");
 
 		// Nothing was written: the backup runs before the first write
-		assert_eq!(fs::read_to_string(live.join("ModA.luau")).unwrap(), "return \"mod-a\"\n");
+		assert_eq!(
+			fs::read_to_string(live.join("ModA.luau")).unwrap(),
+			"return \"mod-a\"\n"
+		);
 		assert!(!live.join("Extra.luau").exists());
 
 		// A failure *inside* the run — here a file the stage wants under a
@@ -2175,7 +2198,10 @@ mod tests {
 
 		assert!(error.contains("rolled back"), "error: {error}");
 		assert!(error.contains("was restored"), "error: {error}");
-		assert_eq!(fs::read_to_string(live.join("ModA.luau")).unwrap(), "return \"mod-a\"\n");
+		assert_eq!(
+			fs::read_to_string(live.join("ModA.luau")).unwrap(),
+			"return \"mod-a\"\n"
+		);
 		assert!(!live.join("Extra.luau").exists(), "a created file is removed again");
 	}
 

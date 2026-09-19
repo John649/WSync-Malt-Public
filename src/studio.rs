@@ -73,7 +73,7 @@ fn shell_open(url: &str) -> Result<u32> {
 			.stderr(Stdio::null())
 			.spawn()?;
 
-		return Ok(child.id());
+		Ok(child.id())
 	}
 
 	#[cfg(target_os = "macos")]

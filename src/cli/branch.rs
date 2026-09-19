@@ -148,8 +148,6 @@ const HEAVY_TIMEOUT_MS: u64 = 120_000;
 /// How long `new`/`up` wait for a freshly launched Studio's plugin to connect
 const PLUGIN_WAIT: Duration = Duration::from_secs(180);
 
-/// How long a spawned daemon has to print its `--raw` ready line
-
 /// Work on a place in parallel with main: worktree, daemon, clone and Studio
 #[derive(Parser)]
 pub struct Branch {
@@ -1444,14 +1442,14 @@ fn studio_count() -> usize {
 			.args(["/FI", "IMAGENAME eq RobloxStudioBeta.exe", "/NH", "/FO", "CSV"])
 			.output();
 
-		return output
+		output
 			.map(|out| {
 				String::from_utf8_lossy(&out.stdout)
 					.lines()
 					.filter(|line| line.contains("RobloxStudioBeta.exe"))
 					.count()
 			})
-			.unwrap_or(0);
+			.unwrap_or(0)
 	}
 
 	#[cfg(not(windows))]
@@ -2323,10 +2321,14 @@ fn commit_blocking_work(workspace: &Path, git_branch: &str, name: &str) -> Resul
 fn git_message(stdout: &str, stderr: &str) -> String {
 	let meaningful = |text: &str| -> String {
 		text.lines()
-			.filter(|line| !line.starts_with("warning: in the working copy of") && !line.starts_with("warning: LF will be"))
+			.filter(|line| {
+				!line.starts_with("warning: in the working copy of") && !line.starts_with("warning: LF will be")
+			})
 			.collect::<Vec<_>>()
-			.join("
-")
+			.join(
+				"
+",
+			)
 			.trim()
 			.to_owned()
 	};
@@ -2400,7 +2402,10 @@ fn stage_resolved(workspace: &Path) -> Vec<String> {
 			continue;
 		}
 
-		if git_try(workspace, &["add", "--", &path]).map(|result| result.0).unwrap_or(false) {
+		if git_try(workspace, &["add", "--", &path])
+			.map(|result| result.0)
+			.unwrap_or(false)
+		{
 			staged.push(path);
 		}
 	}

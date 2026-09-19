@@ -424,7 +424,10 @@ async fn a_reconnect_that_finds_the_disk_already_matching_writes_nothing() {
 
 	assert_eq!(backups.len(), 1, "{receipt}");
 	assert!(backups[0].as_str().unwrap().ends_with("/ReplicatedStorage"));
-	assert!(receipt["written"].as_u64().unwrap() >= 4, "first connect writes: {receipt}");
+	assert!(
+		receipt["written"].as_u64().unwrap() >= 4,
+		"first connect writes: {receipt}"
+	);
 
 	// The state the second connect meets: Studio's content on disk
 	tokio::time::sleep(SETTLE).await;

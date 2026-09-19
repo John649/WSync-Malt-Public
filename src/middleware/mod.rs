@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use anyhow::Result;
 use colored::Colorize;
 use log::{trace, warn};
@@ -7,6 +6,7 @@ use rbx_dom_weak::{
 	ustr,
 };
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::{
 	fmt::{self, Display, Formatter},
 	path::Path,

@@ -57,7 +57,6 @@ pub struct RuntimeRecord {
 	pub ephemeral: bool,
 }
 
-
 impl RuntimeRecord {
 	/// A stand-in for a daemon that answered on its port but has no record on
 	/// disk — a cleanup removed it, or whatever started it keeps its records

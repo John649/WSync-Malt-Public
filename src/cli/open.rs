@@ -120,10 +120,20 @@ impl Open {
 	fn write_attach_project(self, place_id: Option<u64>) -> Result<()> {
 		let workspace = self.into.clone().expect("--attach-only requires --into");
 
-		std::fs::create_dir_all(&workspace)
-			.with_context(|| format!("Failed to create the attach project directory {}", workspace.to_string()))?;
+		std::fs::create_dir_all(&workspace).with_context(|| {
+			format!(
+				"Failed to create the attach project directory {}",
+				workspace.to_string()
+			)
+		})?;
 
-		let project = places::write_scratch_project(&workspace, place_id, self.universe, self.place_key.as_deref(), self.name.as_deref())?;
+		let project = places::write_scratch_project(
+			&workspace,
+			place_id,
+			self.universe,
+			self.place_key.as_deref(),
+			self.name.as_deref(),
+		)?;
 		// Whether the auto-delete rules would own this directory. The caller
 		// decides on `--ephemeral` from this, rather than guessing at the
 		// scratch roots from outside
@@ -212,7 +222,7 @@ impl Open {
 			bail!(
 				"Studio needs the universe that owns place {place_id}. Pass `{}`, or run this against a project \
 				 whose `gameId` is set",
-				format!("--universe <gameId>").bold()
+				"--universe <gameId>".to_string().bold()
 			);
 		};
 

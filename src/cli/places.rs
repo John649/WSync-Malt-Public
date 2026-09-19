@@ -104,8 +104,7 @@ impl std::fmt::Display for Selector {
 
 /// Records the parsed `--place`/`--branch`. Called once, from `Cli::main`
 pub fn set_selector(place: Option<String>, branch: Option<String>) {
-	*SELECTOR.lock().unwrap_or_else(|error| error.into_inner()) =
-		place.map(|place| (Selector::parse(&place), branch));
+	*SELECTOR.lock().unwrap_or_else(|error| error.into_inner()) = place.map(|place| (Selector::parse(&place), branch));
 }
 
 /// The place selector this invocation carries, if any
@@ -443,7 +442,10 @@ pub fn registry() -> Result<Vec<DaemonEntry>> {
 
 	for dir in &dirs {
 		for record in read_records(&dir.join("daemons")) {
-			if !records.iter().any(|known| known.port == record.port && known.pid == record.pid) {
+			if !records
+				.iter()
+				.any(|known| known.port == record.port && known.pid == record.pid)
+			{
 				records.push(record);
 			}
 		}
@@ -953,7 +955,11 @@ fn learn_titles(entries: &[DaemonEntry]) {
 	let mut changed = false;
 
 	for entry in entries {
-		let Some(title) = entry.hello.as_ref().and_then(|hello| hello.plugin.as_ref()).map(|plugin| plugin.name.clone())
+		let Some(title) = entry
+			.hello
+			.as_ref()
+			.and_then(|hello| hello.plugin.as_ref())
+			.map(|plugin| plugin.name.clone())
 		else {
 			continue;
 		};
@@ -979,7 +985,11 @@ fn learn_titles(entries: &[DaemonEntry]) {
 			fs::create_dir_all(parent).ok();
 		}
 
-		fs::write(path, serde_json::to_string_pretty(&Value::Object(titles)).unwrap_or_default()).ok();
+		fs::write(
+			path,
+			serde_json::to_string_pretty(&Value::Object(titles)).unwrap_or_default(),
+		)
+		.ok();
 	}
 }
 
@@ -1198,7 +1208,10 @@ mod tests {
 	fn a_selector_reads_digits_as_an_id_and_everything_else_as_a_key() {
 		assert_eq!(Selector::parse("128374926"), Selector::Id(128_374_926));
 		assert_eq!(Selector::parse("  42 "), Selector::Id(42));
-		assert_eq!(Selector::parse("my-level-ab12cd34"), Selector::Key(String::from("my-level-ab12cd34")));
+		assert_eq!(
+			Selector::parse("my-level-ab12cd34"),
+			Selector::Key(String::from("my-level-ab12cd34"))
+		);
 		// Too long to be a u64: a key, not a silently truncated id
 		assert_eq!(
 			Selector::parse("99999999999999999999999"),

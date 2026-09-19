@@ -662,7 +662,7 @@ impl Start {
 		if self.ephemeral {
 			let workspace = project_path.get_parent();
 
-			match places::remove_scratch_dir(&workspace) {
+			match places::remove_scratch_dir(workspace) {
 				Ok(()) => journal.note(&format!("Removed the scratch place project {}", workspace.to_string())),
 				Err(err) => wsync_warn!("{}", err),
 			}
