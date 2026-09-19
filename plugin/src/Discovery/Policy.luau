@@ -211,6 +211,16 @@ function Policy.rankHello(hello: HelloClaim, place: PlaceIdentity, candidate: Ca
 			return Policy.MATCH_EXACT
 		end
 
+		-- A project keyed to one place is that place's alone. Such a project
+		-- has no ids to be told apart by — an unpublished place has none to
+		-- give it — so without this every OTHER unpublished place would rank
+		-- it a weak match below and the first one opened would adopt it.
+		-- Seen live: a brand-new baseplate connected to another place's
+		-- project and started writing into it
+		if hello.placeKey ~= nil and hello.placeKey ~= "" and hello.placeKey ~= place.placeKey then
+			return Policy.MATCH_NONE
+		end
+
 		-- A temporary daemon belongs to the one window it was made for. It is
 		-- reached only by the session hint or the marker key above; any other
 		-- window that scans past it (a second unpublished place, say) must

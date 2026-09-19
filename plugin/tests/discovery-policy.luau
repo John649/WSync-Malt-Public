@@ -53,8 +53,18 @@ do
 	)
 
 	expect(
-		Policy.rankHello({ placeKey = "somebody-elses-key" }, marked) == Policy.MATCH_WEAK,
-		"a daemon naming a different key falls back to the claimless rule, never to exact"
+		Policy.rankHello({ placeKey = "somebody-elses-key" }, marked) == Policy.MATCH_NONE,
+		"a daemon keyed to another place is refused, not taken as a claimless fallback"
+	)
+
+	expect(
+		Policy.rankHello({ placeKey = "my-level-ab12cd34" }, place({})) == Policy.MATCH_NONE,
+		"a place with no marker never adopts a keyed project — every unpublished place would match it"
+	)
+
+	expect(
+		Policy.rankHello({}, place({})) == Policy.MATCH_WEAK,
+		"an unkeyed claimless daemon still takes an unpublished place, which is how `wsync init` is reached"
 	)
 
 	expect(
