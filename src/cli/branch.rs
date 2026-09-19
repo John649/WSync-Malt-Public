@@ -409,12 +409,31 @@ impl New {
 		let root = main.branches().join(&name);
 
 		if root.exists() {
-			bail!(
-				"Branch `{name}` already exists at {} — reopen it with `{}` or remove it with `{}`",
-				root.to_string(),
-				format!("wsync branch up {name}").bold(),
-				format!("wsync branch rm {name} --purge").bold()
-			);
+			// A directory with no record is not a branch: it is what an
+			// interrupted `new` leaves behind (the clone's blobs, downloaded
+			// before anything was registered). Nothing in it was authored
+			// here and all of it is re-fetched below, so the name is freed
+			// rather than spent — otherwise a create that died halfway makes
+			// its own name unusable, and the advice to `branch up` cannot
+			// work either, because `up` needs the record that is missing
+			if root.join("branch.json").exists() {
+				bail!(
+					"Branch `{name}` already exists at {} — reopen it with `{}` or remove it with `{}`",
+					root.to_string(),
+					format!("wsync branch up {name}").bold(),
+					format!("wsync branch rm {name} --purge").bold()
+				);
+			}
+
+			if !self.raw {
+				wsync_info!(
+					"Clearing {}, left by an interrupted `{}`",
+					root.to_string().bold(),
+					format!("wsync branch new {name}").bold()
+				);
+			}
+
+			remove_partial(&main.workspace, &name, &root)?;
 		}
 
 		enforce_budget(&main.workspace, self.budget.unwrap_or(DEFAULT_BUDGET), &name)?;
@@ -1367,6 +1386,25 @@ fn branch_roots(workspace: &Path) -> Vec<PathBuf> {
 
 	roots.sort();
 	roots
+}
+
+/// Clear what an interrupted `branch new` left: the directory, plus the git
+/// worktree registration and branch if it got that far. Anything git still
+/// knows about is pruned first, or the next `worktree add` refuses the path
+fn remove_partial(workspace: &Path, name: &str, root: &Path) -> Result<()> {
+	let tree = root.join("tree");
+
+	if tree.exists() {
+		git_try(workspace, &["worktree", "remove", "--force", &tree.to_string()]).ok();
+	}
+
+	fs::remove_dir_all(root)
+		.with_context(|| format!("Failed to clear the partial branch directory {}", root.to_string()))?;
+
+	git_try(workspace, &["worktree", "prune"]).ok();
+	git_try(workspace, &["branch", "-D", &format!("wsync/{name}")]).ok();
+
+	Ok(())
 }
 
 fn enforce_budget(workspace: &Path, budget: usize, wanted: &str) -> Result<()> {
