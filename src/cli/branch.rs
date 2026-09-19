@@ -935,12 +935,24 @@ impl Finish {
 			);
 		}
 
+		// A path resolved by hand is still "unmerged" to git until it is
+		// staged, and the person who just edited the markers out of a file
+		// should not have to know that: anything git lists as conflicted whose
+		// working copy carries no markers any more is staged here
+		let staged = stage_resolved(&main.workspace);
+
+		if !staged.is_empty() && !self.raw {
+			wsync_info!("Staged {} resolved file(s)", staged.len().to_string().bold());
+		}
+
 		let unmerged = unmerged_paths(&main.workspace);
 
 		if !unmerged.is_empty() {
-			resume(&client);
+			// Main's sync stays PAUSED: resuming would rescan and push the
+			// conflicted files, markers and all, into main's Studio. The rerun
+			// after the resolution resumes it (or `POST /sync/resume` by hand)
 			print_paths(
-				"git could not merge these files; resolve them in the worktree, then run `wsync branch finish` again",
+				"git could not merge these files; resolve them in the worktree, then run `wsync branch finish` again 				 (main's sync is held until then)",
 				&unmerged,
 				self.raw,
 			);
@@ -2165,6 +2177,32 @@ fn merge_in_progress(workspace: &Path) -> bool {
 }
 
 /// The paths git left with conflict markers
+/// Stages every conflicted path whose working copy no longer carries a
+/// conflict marker at the start of a line, and returns what it staged
+fn stage_resolved(workspace: &Path) -> Vec<String> {
+	let mut staged = Vec::new();
+
+	for path in unmerged_paths(workspace) {
+		let Ok(contents) = fs::read_to_string(workspace.join(&path)) else {
+			continue;
+		};
+
+		let has_markers = contents
+			.lines()
+			.any(|line| line.starts_with("<<<<<<< ") || line.starts_with(">>>>>>> ") || line == "=======");
+
+		if has_markers {
+			continue;
+		}
+
+		if git_try(workspace, &["add", "--", &path]).map(|result| result.0).unwrap_or(false) {
+			staged.push(path);
+		}
+	}
+
+	staged
+}
+
 fn unmerged_paths(workspace: &Path) -> Vec<String> {
 	git_out(workspace, &["diff", "--name-only", "--diff-filter=U"])
 		.unwrap_or_default()
