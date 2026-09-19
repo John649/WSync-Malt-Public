@@ -559,31 +559,10 @@ fn materialize_stage(
 	Ok(())
 }
 
-/// Everything needed to apply one root, resolved from the live tree up front
-/// so no lock is held across plugin awaits
-struct RootTarget {
-	id: rbx_dom_weak::types::Ref,
-	class: String,
-	live_dir: PathBuf,
-	context: Context,
-}
-
-fn resolve_root(state: &AppState, root_name: &str) -> Result<RootTarget, String> {
-	let tree = state.core.tree();
-
-	let id = tree
-		.root()
-		.children()
-		.iter()
-		.copied()
-		.find(|child| tree.get_instance(*child).is_some_and(|child| child.name == root_name))
-		.ok_or_else(|| format!("{root_name} is not a served root"))?;
-
-	let meta = tree
-		.get_meta(id)
-		.ok_or_else(|| format!("{root_name} has no sync metadata"))?;
-
-	let live_dir = match meta.source.get() {
+/// The directory an instance's metadata puts behind it, if any: an explicit
+/// `$path`, a path source, or a folder among its relevant source entries
+fn directory_backing(meta: &Meta) -> Option<PathBuf> {
+	match meta.source.get() {
 		SourceKind::Project(_, project_path, node, _) => node
 			.path
 			.as_ref()
@@ -597,17 +576,113 @@ fn resolve_root(state: &AppState, root_name: &str) -> Result<RootTarget, String>
 			_ => None,
 		})
 	})
-	.ok_or_else(|| {
-		format!("{root_name} has no directory backing ($path); only directory-backed roots support the fenced apply")
+}
+
+/// Walks a slash-separated instance path down from the tree root, returning
+/// the instance it names
+fn resolve_instance_path(tree: &Tree, instance_path: &str) -> Option<rbx_dom_weak::types::Ref> {
+	let mut current = tree.root_ref();
+
+	for segment in instance_path.split('/').filter(|segment| !segment.is_empty()) {
+		let next = tree
+			.get_instance(current)?
+			.children()
+			.iter()
+			.copied()
+			.find(|child| tree.get_instance(*child).is_some_and(|child| child.name == segment))?;
+
+		current = next;
+	}
+
+	Some(current)
+}
+
+/// The apply unit for one divergence entry: the topmost instance on its path
+/// that has a directory behind it, as an instance path.
+///
+/// A service does not have to be mapped itself. `StarterPlayer` routinely has
+/// no `$path` of its own while `StarterPlayer/StarterPlayerScripts` maps a
+/// directory — the service is a container the project file names on the way
+/// to the thing it actually syncs, and a project that nests this way cannot
+/// always be restructured to flatten it. Walking down from the top is the
+/// same rule a mapped top-level root already follows; for a virtual container
+/// it simply stops one level deeper, at the first real directory.
+///
+/// `None` means nothing along this path is directory-backed, so there is no
+/// fenced apply to run for it and nothing of it may be written.
+pub fn staged_root_for(tree: &Tree, instance_path: &str) -> Option<String> {
+	let mut current = tree.root_ref();
+	let mut prefix = String::new();
+
+	for segment in instance_path.split('/').filter(|segment| !segment.is_empty()) {
+		let next = tree
+			.get_instance(current)?
+			.children()
+			.iter()
+			.copied()
+			.find(|child| tree.get_instance(*child).is_some_and(|child| child.name == segment))?;
+
+		current = next;
+
+		if !prefix.is_empty() {
+			prefix.push('/');
+		}
+
+		prefix.push_str(segment);
+
+		if tree.get_meta(current).and_then(directory_backing).is_some() {
+			return Some(prefix);
+		}
+	}
+
+	None
+}
+
+/// Everything needed to apply one root, resolved from the live tree up front
+/// so no lock is held across plugin awaits
+struct RootTarget {
+	id: rbx_dom_weak::types::Ref,
+	/// The instance's own name — what the staged snapshot is called. For a
+	/// nested root this is the leaf (`StarterPlayerScripts`), not the path
+	name: String,
+	/// Filesystem-safe form of the root's instance path, used for the staging
+	/// and backup directory names. A nested root would otherwise ask for a
+	/// directory inside a directory nobody created
+	key: String,
+	class: String,
+	live_dir: PathBuf,
+	context: Context,
+}
+
+fn resolve_root(state: &AppState, root_path: &str) -> Result<RootTarget, String> {
+	let tree = state.core.tree();
+
+	let id = resolve_instance_path(&tree, root_path).ok_or_else(|| format!("{root_path} is not a served root"))?;
+
+	let meta = tree
+		.get_meta(id)
+		.ok_or_else(|| format!("{root_path} has no sync metadata"))?;
+
+	let live_dir = directory_backing(meta).ok_or_else(|| {
+		format!(
+			"{root_path} has no directory backing ($path), and neither does anything above it; only 			 directory-backed roots support the fenced apply"
+		)
 	})?;
 
-	let class = tree
-		.get_instance(id)
+	let instance = tree.get_instance(id);
+
+	let name = instance
+		.map(|instance| instance.name.clone())
+		.unwrap_or_else(|| root_path.rsplit('/').next().unwrap_or(root_path).to_owned());
+
+	let class = instance
 		.map(|instance| instance.class.to_string())
-		.unwrap_or_else(|| root_name.to_owned());
+		.unwrap_or_else(|| name.clone());
 
 	Ok(RootTarget {
 		id,
+		name,
+		key: root_path.replace('/', "."),
 		class,
 		live_dir,
 		context: meta.context.clone(),
@@ -692,14 +767,14 @@ async fn apply_root(
 	}
 
 	// Stage the complete same-volume copy
-	let stage_root = transfer_dir.join(STAGE_DIR).join(root_name);
+	let stage_root = transfer_dir.join(STAGE_DIR).join(&target.key);
 
 	fs::create_dir_all(transfer_dir.join(STAGE_DIR))
 		.map_err(|err| format!("failed to create the staging directory: {err}"))?;
 
 	materialize_stage(
 		&stage_root,
-		root_name,
+		&target.name,
 		&target.class,
 		&pulled,
 		&sources,
@@ -707,7 +782,7 @@ async fn apply_root(
 	)?;
 
 	// Fence, swap and refresh — synchronous, VFS paused throughout
-	let backup_path = transfer_dir.join(root_name);
+	let backup_path = transfer_dir.join(&target.key);
 	let vfs = state.core.vfs();
 
 	vfs.pause();
@@ -801,9 +876,12 @@ async fn apply_root(
 
 	vfs.resume();
 
-	info!("Keep-Studio apply committed root {root_name} (backup {transfer_name}/{root_name})");
+	info!(
+		"Keep-Studio apply committed root {root_name} (backup {transfer_name}/{})",
+		target.key
+	);
 
-	Ok(format!("{transfer_name}/{root_name}"))
+	Ok(format!("{transfer_name}/{}", target.key))
 }
 
 /// Runs the fenced per-root apply for every staged root in sequence. Returns

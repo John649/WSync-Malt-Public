@@ -567,20 +567,22 @@ async fn studio_first_commit(state: &AppState, items: Vec<Item>, accepted: u64, 
 	// Roots carrying Studio-side content (differs / missing-on-disk) are
 	// pulled and swapped whole; roots with only disk-only entries have nothing
 	// to pull and are handled by the backlog sweep below
-	let staged_roots: BTreeSet<String> = items
-		.iter()
-		.filter(|item| item.state != "only-on-disk")
-		.filter_map(|item| item.instance_path.split('/').next())
-		.filter(|root| !root.is_empty())
-		.map(str::to_owned)
-		.collect();
+	let (staged_roots, unmapped) = stage_targets(state, &items);
 
 	info!(
-		"Studio-first apply {transfer_id}: {} staged root(s), {} replaced, {} disk-only",
+		"Studio-first apply {transfer_id}: {} staged root(s), {} replaced, {} disk-only, {} unmapped",
 		staged_roots.len(),
 		differs.len(),
-		disk_only.len()
+		disk_only.len(),
+		unmapped.len()
 	);
+
+	if !unmapped.is_empty() {
+		info!(
+			"Nothing on disk stands behind {}; their entries are left untouched",
+			unmapped.iter().cloned().collect::<Vec<_>>().join(", ")
+		);
+	}
 
 	let options = bulk::StudioFirstOptions { preserve };
 
@@ -652,8 +654,50 @@ async fn studio_first_commit(state: &AppState, items: Vec<Item>, accepted: u64, 
 		"transferId": transfer_id,
 		"backups": backups,
 		"backlogged": backlogged,
+		// Named, never silently dropped: these entries had no directory
+		// anywhere above them, so the apply had nowhere to put them
+		"unmapped": unmapped.iter().collect::<Vec<_>>(),
 	}))
 	.into_response()
+}
+
+/// Splits a frozen set into the roots a fenced apply can stage and the
+/// top-level names it cannot.
+///
+/// The staging unit is the topmost *directory-backed* instance on an entry's
+/// path, not its first path segment. Those differ whenever a service is only
+/// a container: `StarterPlayer` with no `$path` of its own, carrying a
+/// `StarterPlayerScripts` that maps `src/Client`. Keying on the first segment
+/// asked for a root the project never mapped, which failed the whole
+/// divergence upload — and the plugin drops the connection on a receipt that
+/// is not ok, so such a project could not complete a single connect.
+///
+/// An entry with no directory-backed ancestor at all is not an error and does
+/// not fail its neighbours: it is returned in the second set, and the caller
+/// reports it. Nothing of it is written, which is the honest outcome — the
+/// project does not say where it would go.
+fn stage_targets(state: &AppState, items: &[Item]) -> (BTreeSet<String>, BTreeSet<String>) {
+	let tree = state.core.tree();
+
+	let mut staged = BTreeSet::new();
+	let mut unmapped = BTreeSet::new();
+
+	for item in items.iter().filter(|item| item.state != "only-on-disk") {
+		match bulk::staged_root_for(&tree, &item.instance_path) {
+			Some(root) => {
+				staged.insert(root);
+			}
+			None => {
+				let top = item.instance_path.split('/').next().unwrap_or_default();
+
+				if !top.is_empty() {
+					unmapped.insert(top.to_owned());
+				}
+			}
+		}
+	}
+
+	(staged, unmapped)
 }
 
 /// Classifies entries, projects disk paths through the tree/`Meta`, assigns
@@ -1035,12 +1079,14 @@ pub async fn choice_post(State(state): State<AppState>, Json(request): Json<Choi
 		Decision::Studio { choice_id, staged } => {
 			// The apply operates per synced root: every root that carries at
 			// least one staged entry is pulled and swapped whole
-			let staged_roots: BTreeSet<String> = staged
-				.iter()
-				.filter_map(|item| item.instance_path.split('/').next())
-				.filter(|root| !root.is_empty())
-				.map(str::to_owned)
-				.collect();
+			let (staged_roots, unmapped) = stage_targets(&state, &staged);
+
+			if !unmapped.is_empty() {
+				info!(
+					"Nothing on disk stands behind {}; their entries stay as they are",
+					unmapped.iter().cloned().collect::<Vec<_>>().join(", ")
+				);
+			}
 
 			state.ws.emit(Event::ChoiceMade {
 				choice_id: choice_id.clone(),

@@ -83,9 +83,27 @@ local function candidates(): { Policy.Candidate }
 	})
 end
 
+--- How long the whole concurrent probe pass may take. On Windows every probe
+--- of a CLOSED localhost port costs about two seconds (HttpService reports
+--- ConnectFail only after its own connect timeout), so a sequential walk of
+--- the thirteen candidates cost 24 s or more whenever nothing ranked exact
+--- early — which is every unpublished place, because `gameId == 0` can rank
+--- no higher than MATCH_WEAK unless a daemon claims the placeId outright.
+--- Probing concurrently turns that wall-clock cost from the SUM of the
+--- timeouts into the MAX of them.
+Discovery.SCAN_DEADLINE_SECONDS = 3
+
 --- Probe the candidate list for a daemon matching the open place. Resolves a
 --- `Match` or nil; never rejects. `shouldContinue` aborts the scan early
 --- (e.g. on cancel).
+---
+--- Every candidate is probed at once and the results are ranked together, ties
+--- going to the earlier candidate (`Policy.bestIndex`), so the ordering the
+--- candidate list encodes — a branch's own daemon port first, then the
+--- Settings address, then the scan range — still decides between equals. The
+--- pass ends early the moment an exact match is certain: as soon as an
+--- unbroken prefix of the list has answered and one of those answers ranks
+--- exact, nothing later can beat it and nothing earlier is outstanding.
 function Discovery.scan(shouldContinue: (() -> boolean)?): Promise.TypedPromise<Match?>
 	local function continuing(): boolean
 		return not shouldContinue or shouldContinue()
@@ -104,40 +122,87 @@ function Discovery.scan(shouldContinue: (() -> boolean)?): Promise.TypedPromise<
 			branchName = if identity ~= nil then identity.name else nil,
 		}
 
-		local best: Match? = nil
-		local bestRank = Policy.MATCH_NONE
+		local list = candidates()
+		local total = #list
 
-		for _, candidate in candidates() do
+		local hellos: { [number]: Types.DaemonHello? } = {}
+		local answered: { [number]: boolean } = {}
+		local outstanding = total
+
+		local function matchAt(index: number): Match
+			local candidate = list[index]
+
+			return {
+				host = candidate.host,
+				port = candidate.port,
+				hello = hellos[index] :: Types.DaemonHello,
+			}
+		end
+
+		for index, candidate in list do
+			task.spawn(function()
+				local ok, hello = pcall(function()
+					return Transport.hello(candidate.host, candidate.port, candidate.https):expect()
+				end)
+
+				if ok and hello ~= nil then
+					hellos[index] = hello
+
+					Log.debug(`Discovery: daemon '{hello.project or hello.name}' on {candidate.host}:{candidate.port}`)
+				end
+
+				answered[index] = true
+				outstanding -= 1
+			end)
+		end
+
+		--- The first candidate that is certainly the winner: an exact match
+		--- inside the answered prefix. Anything after it ranks no higher, and
+		--- anything before it has already been seen.
+		local function settledExact(): number?
+			for index = 1, total do
+				if not answered[index] then
+					return nil
+				end
+
+				local hello = hellos[index]
+
+				if hello ~= nil and Policy.rankHello(hello, place) >= Policy.MATCH_EXACT then
+					return index
+				end
+			end
+
+			return nil
+		end
+
+		local deadline = os.clock() + Discovery.SCAN_DEADLINE_SECONDS
+
+		while outstanding > 0 do
 			if not continuing() then
 				return resolve(nil)
 			end
 
-			local hello = Transport.hello(candidate.host, candidate.port, candidate.https):expect()
+			local early = settledExact()
 
-			if not hello then
-				continue
+			if early ~= nil then
+				return resolve(matchAt(early))
 			end
 
-			Log.debug(`Discovery: daemon '{hello.project or hello.name}' on {candidate.host}:{candidate.port}`)
-
-			local rank = Policy.rankHello(hello, place)
-
-			if rank > bestRank then
-				best = {
-					host = candidate.host,
-					port = candidate.port,
-					hello = hello,
-				}
-				bestRank = rank
-			end
-
-			if rank >= Policy.MATCH_EXACT then
-				-- Exact GameId + PlaceId match; no better candidate exists
+			if os.clock() >= deadline then
+				Log.debug(`Discovery: {outstanding} of {total} probes still outstanding at the deadline`)
 				break
 			end
+
+			task.wait()
 		end
 
-		return resolve(best)
+		if not continuing() then
+			return resolve(nil)
+		end
+
+		local bestIndex = Policy.bestIndex(hellos, total, place)
+
+		return resolve(if bestIndex ~= nil then matchAt(bestIndex) else nil)
 	end)
 end
 

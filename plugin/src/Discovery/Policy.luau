@@ -196,6 +196,34 @@ function Policy.rankStrict(hello: HelloClaim, place: PlaceIdentity): number
 	return Policy.MATCH_NONE
 end
 
+--- The index of the best-ranked hello in a batch of probe results, and its
+--- rank. Ties go to the earlier candidate, which is what keeps the candidate
+--- ordering meaningful once the probes run concurrently: among equally weak
+--- matches the Settings address still wins, and a branch's own daemon port
+--- still wins over everything, because both are first in the list.
+---
+--- `hellos` is sparse — a candidate that did not answer has no entry — so the
+--- walk is driven by `count` rather than by `#hellos`.
+function Policy.bestIndex(hellos: { [number]: HelloClaim? }, count: number, place: PlaceIdentity): (number?, number)
+	local bestIndex: number? = nil
+	local bestRank = Policy.MATCH_NONE
+
+	for index = 1, count do
+		local hello = hellos[index]
+
+		if hello ~= nil then
+			local rank = Policy.rankHello(hello, place)
+
+			if rank > bestRank then
+				bestIndex = index
+				bestRank = rank
+			end
+		end
+	end
+
+	return bestIndex, bestRank
+end
+
 --------------------------------------------------------------------------------
 -- Connection state machine
 --------------------------------------------------------------------------------
