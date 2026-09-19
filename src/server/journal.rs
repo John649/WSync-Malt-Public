@@ -21,6 +21,22 @@
 //! events it is handed. What an event means is the plugin's and the merge
 //! planner's business; what this module guarantees is that a line that was
 //! accepted is on disk, whole, in the order it arrived.
+//!
+//! TWO OR MORE LIVE BRANCHES. Main's plugin keeps ONE event stream for the
+//! whole session, named after the first checkpoint it took, because restarting
+//! the stream at a second branch's checkpoint cut the first branch off from
+//! every edit main made afterwards. Each live branch still needs its own
+//! complete "main since my mark", so an append to main's daemon is fanned out:
+//! the named stream, plus every OTHER checkpoint that has a mark in
+//! `marks.json`. A branch daemon has no marks file, so a clone's stream is
+//! written exactly as before; and an older plugin — which names the newest
+//! checkpoint rather than the session's — is carried by the same fan-out with
+//! nothing to change on its side.
+//!
+//! A mark is removed by `POST /journal/unmark` when a branch is finished or
+//! purged, which is the only thing that ever stops the fan-out. Streams are
+//! never deleted here: `<checkpoint>.jsonl` is one branch's view of main and
+//! no other branch's, and nothing that removes one branch may touch another's.
 
 use axum::{
 	body::Bytes,
@@ -107,15 +123,32 @@ impl JournalStore {
 		self.dir.join(BLOBS_DIR).join(id)
 	}
 
-	/// Appends every event as its own line and returns `(appended, total)`.
-	/// One `write_all` per batch, so a batch lands whole or reports why not
+	/// Every stream one append has to reach: the one it names, then every
+	/// other checkpoint that has a mark. Main's daemon holds a mark per live
+	/// branch and each of those branches needs main's events from its own mark
+	/// on, so one push lands in each of their streams; a branch daemon has no
+	/// marks and gets the named stream alone
+	fn fan_out(&self, checkpoint: &str) -> Vec<String> {
+		let mut streams = vec![checkpoint.to_owned()];
+
+		for mark in self.marks() {
+			if mark.checkpoint != checkpoint && safe_name(&mark.checkpoint) && !streams.contains(&mark.checkpoint) {
+				streams.push(mark.checkpoint);
+			}
+		}
+
+		streams
+	}
+
+	/// Appends every event as its own line and returns `(appended, total,
+	/// streams)` — `total` being the named stream's line count. One
+	/// `write_all` per stream, so a batch lands whole or reports why not
 	/// rather than tearing a line in half
-	fn append(&self, checkpoint: &str, events: &[Value]) -> Result<(usize, usize), String> {
+	fn append(&self, checkpoint: &str, events: &[Value]) -> Result<(usize, usize, Vec<String>), String> {
 		let _guard = lock!(self.write);
 
 		fs::create_dir_all(&self.dir).map_err(|err| format!("Failed to create the journal directory: {err}"))?;
 
-		let path = self.stream_path(checkpoint);
 		let mut batch = String::new();
 
 		for event in events {
@@ -123,16 +156,22 @@ impl JournalStore {
 			batch.push('\n');
 		}
 
-		let mut file = OpenOptions::new()
-			.create(true)
-			.append(true)
-			.open(&path)
-			.map_err(|err| format!("Failed to open the journal: {err}"))?;
+		let streams = self.fan_out(checkpoint);
 
-		file.write_all(batch.as_bytes())
-			.map_err(|err| format!("Failed to append to the journal: {err}"))?;
+		for stream in &streams {
+			let path = self.stream_path(stream);
 
-		Ok((events.len(), count_lines(&path)))
+			let mut file = OpenOptions::new()
+				.create(true)
+				.append(true)
+				.open(&path)
+				.map_err(|err| format!("Failed to open the journal: {err}"))?;
+
+			file.write_all(batch.as_bytes())
+				.map_err(|err| format!("Failed to append to the journal: {err}"))?;
+		}
+
+		Ok((events.len(), count_lines(&self.stream_path(checkpoint)), streams))
 	}
 
 	/// Every event after `after` lines, in order. A missing stream is an
@@ -207,6 +246,39 @@ impl JournalStore {
 		Ok(marks)
 	}
 
+	/// Drops a branch's mark. Its stream file stays: `<checkpoint>.jsonl` is
+	/// that branch's own view of main and no other branch's, so removing one
+	/// branch must never take a file with it — what stops here is only the
+	/// fan-out, which has nobody left to serve. Returns the marks that remain,
+	/// and whether one was actually removed
+	fn unmark(&self, branch: &str) -> Result<(Vec<Mark>, bool), String> {
+		let _guard = lock!(self.write);
+
+		let mut marks = self.marks();
+		let before = marks.len();
+
+		marks.retain(|existing| existing.branch != branch);
+
+		let removed = marks.len() != before;
+
+		if !removed {
+			return Ok((marks, false));
+		}
+
+		fs::create_dir_all(&self.dir).map_err(|err| format!("Failed to create the journal directory: {err}"))?;
+
+		let path = self.marks_path();
+		let temp = path.with_extension("tmp");
+
+		let contents =
+			serde_json::to_string_pretty(&marks).map_err(|err| format!("Failed to serialize the marks: {err}"))?;
+
+		fs::write(&temp, contents).map_err(|err| format!("Failed to write the marks: {err}"))?;
+		fs::rename(&temp, &path).map_err(|err| format!("Failed to move the marks into place: {err}"))?;
+
+		Ok((marks, true))
+	}
+
 	fn put_blob(&self, id: &str, bytes: &[u8]) -> Result<(), String> {
 		let _guard = lock!(self.write);
 
@@ -270,10 +342,11 @@ pub async fn append(State(state): State<AppState>, Json(request): Json<AppendReq
 	}
 
 	match state.journal.append(&request.checkpoint, &request.events) {
-		Ok((appended, total)) => {
+		Ok((appended, total, streams)) => {
 			debug!(
-				"Journal {}: appended {appended} event(s), {total} total",
-				request.checkpoint
+				"Journal {}: appended {appended} event(s) to {} stream(s), {total} total",
+				request.checkpoint,
+				streams.len()
 			);
 
 			Json(json!({
@@ -281,6 +354,7 @@ pub async fn append(State(state): State<AppState>, Json(request): Json<AppendReq
 				"checkpoint": request.checkpoint,
 				"appended": appended,
 				"total": total,
+				"streams": streams,
 			}))
 			.into_response()
 		}
@@ -361,6 +435,40 @@ pub async fn mark(State(state): State<AppState>, Json(request): Json<MarkRequest
 	}
 }
 
+// POST /journal/unmark
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UnmarkRequest {
+	branch: String,
+}
+
+/// `POST /journal/unmark` — a branch that has been merged or purged stops
+/// being one of the streams an append fans out to. Nothing is deleted: the
+/// branch's own `<checkpoint>.jsonl` is not another branch's to remove, and a
+/// mark that is not there any more is not an error
+pub async fn unmark(State(state): State<AppState>, Json(request): Json<UnmarkRequest>) -> Response {
+	trace!("Received request: journal unmark");
+
+	if !safe_name(&request.branch) {
+		return error(StatusCode::BAD_REQUEST, "branch must be a plain name");
+	}
+
+	match state.journal.unmark(&request.branch) {
+		Ok((marks, removed)) => {
+			debug!(
+				"Journal unmark: branch {} {}, {} mark(s) left",
+				request.branch,
+				if removed { "dropped" } else { "was not marked" },
+				marks.len()
+			);
+
+			Json(json!({ "ok": true, "branch": request.branch, "removed": removed, "marks": marks })).into_response()
+		}
+		Err(message) => error(StatusCode::INTERNAL_SERVER_ERROR, &message),
+	}
+}
+
 /// `GET /journal/marks` — every branch's cut point
 pub async fn marks(State(state): State<AppState>) -> Response {
 	trace!("Received request: journal marks");
@@ -404,5 +512,135 @@ pub async fn get_blob(State(state): State<AppState>, RoutePath(id): RoutePath<St
 	match state.journal.blob(&id) {
 		Some(bytes) => ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response(),
 		None => error(StatusCode::NOT_FOUND, "Unknown blob id"),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn store() -> (tempfile::TempDir, JournalStore) {
+		let dir = tempfile::tempdir().expect("a temp workspace");
+		let store = JournalStore::new(dir.path());
+
+		(dir, store)
+	}
+
+	fn mark_of(checkpoint: &str, branch: &str) -> Mark {
+		Mark {
+			checkpoint: checkpoint.to_owned(),
+			branch: branch.to_owned(),
+			at: "2026-09-18T00:00:00Z".to_owned(),
+		}
+	}
+
+	fn events(count: usize) -> Vec<Value> {
+		(0..count).map(|n| json!({ "seq": n, "op": "set" })).collect()
+	}
+
+	/// No marks — a branch daemon — writes the named stream and nothing else
+	#[test]
+	fn an_unmarked_append_writes_one_stream() {
+		let (_dir, store) = store();
+
+		let (appended, total, streams) = store.append("alpha", &events(3)).expect("the append lands");
+
+		assert_eq!(appended, 3);
+		assert_eq!(total, 3);
+		assert_eq!(streams, vec!["alpha".to_owned()]);
+	}
+
+	/// Main with two live branches: one push, both branches' streams
+	#[test]
+	fn an_append_fans_out_to_every_marked_checkpoint() {
+		let (_dir, store) = store();
+
+		store.mark(mark_of("alpha", "alpha")).expect("alpha is marked");
+		store.mark(mark_of("beta", "beta")).expect("beta is marked");
+
+		// The plugin names its session stream, which is alpha's checkpoint
+		let (_, _, streams) = store.append("alpha", &events(2)).expect("the append lands");
+
+		assert_eq!(streams, vec!["alpha".to_owned(), "beta".to_owned()]);
+		assert_eq!(store.read("alpha", 0).expect("alpha reads").len(), 2);
+		assert_eq!(store.read("beta", 0).expect("beta reads").len(), 2);
+	}
+
+	/// An older plugin names the NEWEST checkpoint rather than the session's.
+	/// The fan-out carries the older branch either way, and nothing is written
+	/// twice
+	#[test]
+	fn an_append_naming_a_marked_checkpoint_is_not_written_twice() {
+		let (_dir, store) = store();
+
+		store.mark(mark_of("alpha", "alpha")).expect("alpha is marked");
+		store.mark(mark_of("beta", "beta")).expect("beta is marked");
+
+		let (_, total, streams) = store.append("beta", &events(4)).expect("the append lands");
+
+		assert_eq!(total, 4);
+		assert_eq!(streams, vec!["beta".to_owned(), "alpha".to_owned()]);
+		assert_eq!(store.read("beta", 0).expect("beta reads").len(), 4);
+		assert_eq!(store.read("alpha", 0).expect("alpha reads").len(), 4);
+	}
+
+	/// Finishing or purging one branch stops its fan-out and leaves every
+	/// other branch's stream exactly where it was
+	#[test]
+	fn unmark_drops_one_branch_and_keeps_the_others_stream() {
+		let (_dir, store) = store();
+
+		store.mark(mark_of("alpha", "alpha")).expect("alpha is marked");
+		store.mark(mark_of("beta", "beta")).expect("beta is marked");
+		store.append("alpha", &events(2)).expect("the first append lands");
+
+		let (left, removed) = store.unmark("alpha").expect("alpha is unmarked");
+
+		assert!(removed);
+		assert_eq!(left.len(), 1);
+		assert_eq!(left[0].branch, "beta");
+
+		// alpha's own stream is untouched by its unmark
+		assert_eq!(store.read("alpha", 0).expect("alpha reads").len(), 2);
+
+		let (_, _, streams) = store.append("beta", &events(1)).expect("the second append lands");
+
+		assert_eq!(streams, vec!["beta".to_owned()]);
+		assert_eq!(store.read("beta", 0).expect("beta reads").len(), 3);
+		assert_eq!(store.read("alpha", 0).expect("alpha reads").len(), 2);
+	}
+
+	/// A branch that was never marked, or was unmarked already, is not an error
+	#[test]
+	fn unmark_is_idempotent() {
+		let (_dir, store) = store();
+
+		store.mark(mark_of("alpha", "alpha")).expect("alpha is marked");
+
+		assert!(store.unmark("alpha").expect("the first unmark").1);
+		assert!(!store.unmark("alpha").expect("the second unmark").1);
+		assert!(!store.unmark("never").expect("an unknown branch").1);
+	}
+
+	/// A mark whose checkpoint would escape the journal directory is not a
+	/// stream anything appends to
+	#[test]
+	fn a_mark_with_an_unsafe_checkpoint_is_not_fanned_out_to() {
+		let (_dir, store) = store();
+
+		store.mark(mark_of("alpha", "alpha")).expect("alpha is marked");
+
+		// Written straight into the file: `POST /journal/mark` would refuse it
+		let marks = vec![mark_of("alpha", "alpha"), mark_of("../escape", "bad")];
+		fs::create_dir_all(&store.dir).expect("the journal directory");
+		fs::write(
+			store.marks_path(),
+			serde_json::to_string(&marks).expect("marks serialize"),
+		)
+		.expect("the marks are written");
+
+		let (_, _, streams) = store.append("session", &events(1)).expect("the append lands");
+
+		assert_eq!(streams, vec!["session".to_owned(), "alpha".to_owned()]);
 	}
 }

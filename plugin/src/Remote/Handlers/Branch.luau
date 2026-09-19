@@ -44,6 +44,15 @@
 -- `journal_replay` takes blobs the other way round, as
 -- `{[blobId] = <base64 rbxm>}` in the request, because main's plugin has
 -- nowhere to pull a branch daemon's artifact from.
+--
+-- A SECOND LIVE BRANCH. `branch_checkpoint` run while branch A is still open
+-- numbers only what is not numbered yet and joins main's existing stream with
+-- another mark. Renumbering would have repointed every id in A's journal, and
+-- restarting the stream would have hidden main's later edits from A's conflict
+-- detection. The shape it pins therefore states each node's id
+-- (SHAPE_VERSION 2) rather than leaving it to the node's position, and
+-- `branch_adopt` still reads a v1 positional shape so a clone cut against an
+-- older main adopts unchanged.
 
 local HttpService = game:GetService("HttpService")
 
@@ -186,16 +195,23 @@ function BranchOps.ops.branch_checkpoint(args: Args, _ctx)
 
 	local checkpoint = HttpService:GenerateGUID(false)
 
-	-- Main records its own stream from here, with a mark this branch's merge
-	-- reads back ("Main keeps one journal with a checkpoint mark per branch").
+	-- Main records ONE stream, with a mark per branch that its merge reads
+	-- back ("Main keeps one journal with a checkpoint mark per branch"). A
+	-- second checkpoint — a second live branch — joins that stream rather than
+	-- replacing it, so the first branch keeps seeing main's later edits.
 	Journal.start(checkpoint, services)
 	Journal.mark(checkpoint)
 
-	Log.stage(`Branch checkpoint '{name}': {numbered.count} instances, {checkpoint}`)
+	Log.stage(
+		`Branch checkpoint '{name}': {numbered.count} instances `
+			.. `({numbered.numbered} newly numbered), {checkpoint}`
+	)
 
 	return {
 		checkpoint = checkpoint,
 		count = numbered.count,
+		numbered = numbered.numbered,
+		shapeVersion = Journal.SHAPE_VERSION,
 		blobs = blobs,
 		blobIds = blobIds,
 		shape = encoded,
@@ -245,6 +261,17 @@ function BranchOps.ops.branch_adopt(args: Args, _ctx)
 
 	local services = Journal.services()
 
+	-- Everything this clone mints for itself carries the branch name, so two
+	-- clones cut from the same main cannot hand the same `new:` id to two
+	-- different instances and a merge cannot mistake one for the other. Set
+	-- before any numbering, because the alignment mints ids for Studio's own
+	-- migration additions as it goes.
+	local identity = Branch.current()
+
+	if identity ~= nil then
+		Journal.setOrigin(identity.name)
+	end
+
 	if args.shapeBlob == nil then
 		local numbered = Journal.checkpoint(services)
 
@@ -273,8 +300,16 @@ function BranchOps.ops.branch_adopt(args: Args, _ctx)
 		invalid(`the checkpoint shape in {args.shapeBlob} is not a readable shape document`)
 	end
 
-	if shape.v ~= Journal.SHAPE_VERSION then
-		invalid(`the checkpoint shape is version {tostring(shape.v)}; this plugin speaks {Journal.SHAPE_VERSION}`)
+	-- Two shapes are adoptable: v2, where every node states its id, and v1,
+	-- where the id is the node's pre-order position plus the service base. v1
+	-- is what a main running an older plugin writes, and it still aligns
+	-- exactly as it did — a clone cut against one simply cannot be told apart
+	-- from today's.
+	if shape.v ~= Journal.SHAPE_VERSION and shape.v ~= Journal.SHAPE_VERSION_LEGACY then
+		invalid(
+			`the checkpoint shape is version {tostring(shape.v)}; this plugin speaks `
+				.. `{Journal.SHAPE_VERSION} and reads {Journal.SHAPE_VERSION_LEGACY}`
+		)
 	end
 
 	if type(shape.count) ~= "number" then
@@ -295,7 +330,7 @@ function BranchOps.ops.branch_adopt(args: Args, _ctx)
 	Journal.start(checkpoint, services)
 
 	Log.stage(
-		`Branch adopt {checkpoint}: matched {result.matched}/{result.shapeCount}, `
+		`Branch adopt {checkpoint} (shape v{tostring(shape.v)}): matched {result.matched}/{result.shapeCount}, `
 			.. `{result.extras} extras, {result.missing} missing`
 	)
 

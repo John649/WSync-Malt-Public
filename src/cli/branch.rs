@@ -28,6 +28,27 @@
 //!
 //! Still unverified here: the daemon routes `POST /journal/mark`,
 //! `GET /journal?checkpoint=`, `POST /sync/pause` and `POST /sync/resume`.
+//!
+//! MORE THAN ONE LIVE BRANCH. Nothing here assumes a single branch, and the
+//! three places that could have are each pinned down:
+//!
+//!   * `enforce_budget` counts live branch Studios against `DEFAULT_BUDGET`
+//!     (3), so a second and a third branch open normally; the budget is about
+//!     Roblox's window cap, not about the merge.
+//!   * `marks.json` holds one mark per branch and main's daemon fans every
+//!     push from main's plugin out to each marked checkpoint's stream, so each
+//!     live branch keeps a complete record of main since its own mark.
+//!     `finish` and `rm --purge` drop only their OWN branch's mark
+//!     (`POST /journal/unmark`), and no command ever deletes a checkpoint's
+//!     stream — one branch's file is not another's to remove.
+//!   * `journal_replay`'s `checkpoint` is always this branch's own, which is
+//!     what keys main's conflict window (`marks`) and the replay's
+//!     per-checkpoint ledgers. Two branches replaying into main therefore
+//!     never read each other's ledger.
+//!
+//! What still has one owner is the merge itself: `finish` pauses main's sync,
+//! merges, replays and commits, and a second `finish` started underneath it
+//! would meet a checkout already mid-merge.
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -70,6 +91,10 @@ const GAME_ID_ATTRIBUTE: &str = "GameId";
 /// Number attribute on the marker naming the branch daemon's port, so the
 /// plugin's discovery tries it before it ranks anything
 const DAEMON_PORT_ATTRIBUTE: &str = "DaemonPort";
+/// The real place id, so the clone can claim it on boot (`SetPlaceId`) and
+/// DataStores, MessagingService and every place-keyed API behave as on main.
+/// The branch is told apart by the marker's Value alone
+const PLACE_ID_ATTRIBUTE: &str = "PlaceId";
 
 /// What the daemon regenerates in every worktree the moment a plugin
 /// connects. Main's copies and a branch's therefore always differ, so every
@@ -411,6 +436,7 @@ impl New {
 		// The clone is an `.rbxl`, so `game.GameId` boots as 0 and the plugin
 		// reads the real universe id off the marker instead
 		let game_id = main_game_id(&main.project, &client);
+		let place_id = main_place_id(&main.project, &client);
 
 		clock.mark("checkpoint", &format!("{count} instances"));
 
@@ -515,7 +541,7 @@ impl New {
 		clock.mark("daemon", &format!("port {port}"));
 
 		// (7) the clone, then Studio on it the moment the file is there
-		assemble_place(&services, &name, game_id, Some(port), &place, raw)?;
+		assemble_place(&services, &name, game_id, place_id, Some(port), &place, raw)?;
 		clock.mark("assemble", "");
 
 		let studio_pid = launch_studio(&place)?;
@@ -728,6 +754,18 @@ impl Rm {
 
 		if self.purge {
 			purge(&record, &root, &main.workspace, self.force)?;
+
+			// A purged branch is not coming back, so main's daemon stops
+			// fanning its plugin's pushes into that branch's stream. A branch
+			// merely closed keeps its mark: `branch up` reopens it and its
+			// merge still needs every edit main made in between.
+			//
+			// Best effort, and deliberately last: main's daemon may not be
+			// running, and a mark that outlives its branch costs a file, while
+			// failing here would strand a branch that is already gone
+			if let Ok(client) = Client::connect(&self.targeting) {
+				unmark(&client, &record.name, self.raw);
+			}
 		}
 
 		if self.raw {
@@ -998,6 +1036,12 @@ impl Finish {
 		// next `finish` would take the resume path with nothing to resume
 		fs::remove_file(root.join("conflicts.json")).ok();
 		fs::remove_file(root.join("decisions.json")).ok();
+
+		// Main's daemon fans every push from main's plugin out to one stream
+		// per marked branch. This one has landed, so it stops being one of
+		// them — and only this one: another live branch's mark, and its
+		// stream, are untouched
+		unmark(&client, &record.name, self.raw);
 
 		// (5) the branch is done
 		close(&mut record, &root, &main.project)?;
@@ -1794,6 +1838,26 @@ fn fetch_journal(client: &Client, checkpoint: &str) -> Result<Value> {
 	client.get_endpoint(&path)?.json(&path).cloned()
 }
 
+/// `POST /journal/unmark` — one branch stops being a stream main's daemon
+/// fans its plugin's pushes out to. Best effort: a mark that outlives its
+/// branch costs one file and no correctness, while failing a `finish` that
+/// has already landed in main's Studio would cost the merge
+fn unmark(client: &Client, name: &str, raw: bool) {
+	let sent = client
+		.post_endpoint("/journal/unmark", &json!({ "branch": name }))
+		.and_then(|endpoint| endpoint.json("/journal/unmark").cloned());
+
+	if let Err(error) = sent {
+		if !raw {
+			wsync_warn!(
+				"Main's daemon did not drop branch {}'s journal mark ({error}) — harmless, but it will keep a copy of \
+				 main's events under that checkpoint",
+				name.bold()
+			);
+		}
+	}
+}
+
 fn read_decisions(root: &Path) -> Vec<Value> {
 	fs::read_to_string(root.join("decisions.json"))
 		.ok()
@@ -2402,6 +2466,22 @@ fn rbx_binary_version() -> &'static str {
 /// The universe id the clone has to report. A place opened from an `.rbxl`
 /// boots with `game.GameId == 0`, so the id travels on the marker and the
 /// plugin calls `SetUniverseId` with it
+/// The real place id main serves: the project's first `servePlaceIds` entry,
+/// else the first place main's daemon claims in its hello. None for an
+/// unpublished place, and then the clone keeps whatever it booted with
+fn main_place_id(project: &Path, client: &Client) -> Option<u64> {
+	fs::read_to_string(project)
+		.ok()
+		.and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
+		.and_then(|project| {
+			project
+				.get("servePlaceIds")
+				.and_then(Value::as_array)
+				.and_then(|ids| ids.first().and_then(Value::as_u64))
+		})
+		.or_else(|| client.hello.place_ids.first().copied())
+}
+
 fn main_game_id(project: &Path, client: &Client) -> Option<u64> {
 	fs::read_to_string(project)
 		.ok()
@@ -2422,6 +2502,7 @@ fn assemble_place(
 	services: &[(String, PathBuf)],
 	name: &str,
 	game_id: Option<u64>,
+	place_id: Option<u64>,
 	daemon_port: Option<u16>,
 	out: &Path,
 	raw: bool,
@@ -2465,6 +2546,10 @@ fn assemble_place(
 
 	if let Some(game_id) = game_id {
 		attributes.insert(GAME_ID_ATTRIBUTE.to_owned(), Variant::Float64(game_id as f64));
+	}
+
+	if let Some(place_id) = place_id {
+		attributes.insert(PLACE_ID_ATTRIBUTE.to_owned(), Variant::Float64(place_id as f64));
 	}
 
 	if let Some(port) = daemon_port {

@@ -52,6 +52,7 @@ Branch.MARKER_NAME = "WSyncBranch"
 Branch.MARKER_CLASS = "StringValue"
 Branch.GAME_ID_ATTRIBUTE = "GameId"
 Branch.DAEMON_PORT_ATTRIBUTE = "DaemonPort"
+Branch.PLACE_ID_ATTRIBUTE = "PlaceId"
 
 --- The refusal every save/publish path on a branch clone answers with.
 Branch.SAVE_REFUSAL = "this is a branch clone — `wsync branch finish` merges it; "
@@ -214,8 +215,26 @@ function Branch.apply(identity: Identity?): Identity?
 		end
 	end
 
+	-- The REAL place id, stamped on the marker by the assembler: the clone
+	-- then answers to the same place as main, so DataStores, MessagingService
+	-- and every place-keyed API behave exactly as they do there, and the branch
+	-- is told apart by the marker's Value alone. A marker without it (a clone
+	-- assembled by an older CLI) keeps the synthetic id. NOTE: with the real
+	-- id, File > Publish from a clone window targets the live place.
+	local placeId = identity.syntheticPlaceId
+
+	if marker ~= nil then
+		local okPlaceAttr, stampedPlace = pcall(function()
+			return marker:GetAttribute(Branch.PLACE_ID_ATTRIBUTE)
+		end)
+
+		if okPlaceAttr and type(stampedPlace) == "number" and stampedPlace > 0 then
+			placeId = stampedPlace
+		end
+	end
+
 	local okPlace, placeErr = pcall(function()
-		(game :: any):SetPlaceId(identity.syntheticPlaceId)
+		(game :: any):SetPlaceId(placeId)
 	end)
 
 	if not okPlace then
@@ -224,7 +243,7 @@ function Branch.apply(identity: Identity?): Identity?
 
 	local universe = if universeId > 0 then tostring(universeId) else "unset (local file)"
 
-	Log.stage(`Branch '{identity.name}': placeId {identity.syntheticPlaceId}, universe {universe}`)
+	Log.stage(`Branch '{identity.name}': placeId {placeId}, universe {universe}`)
 
 	return applied
 end

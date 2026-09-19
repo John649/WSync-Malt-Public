@@ -145,14 +145,25 @@ end
 --- the refusal below would then refuse them all.
 function Policy.rankHello(hello: HelloClaim, place: PlaceIdentity): number
 	if place.branch ~= true then
+		-- The mirror rule: a window without a marker never binds to a daemon
+		-- that serves a branch, not even when main's own daemon is down —
+		-- that would sync the live place against a branch worktree
+		if hello.branch ~= nil and hello.branch ~= "" then
+			return Policy.MATCH_NONE
+		end
+
 		return Policy.rankStrict(hello, place)
 	end
 
+	-- A clone answers ONLY to the daemon that names its branch. It now boots
+	-- with main's real place id, so main's own daemon would rank exact by ids
+	-- alone — and a clone whose daemon is down must refuse, never fall
+	-- through to main and journal a branch's edits into the live place.
 	if place.branchName ~= nil and place.branchName ~= "" and hello.branch == place.branchName then
 		return Policy.MATCH_EXACT
 	end
 
-	return if Policy.rankStrict(hello, place) >= Policy.MATCH_EXACT then Policy.MATCH_EXACT else Policy.MATCH_NONE
+	return Policy.MATCH_NONE
 end
 
 --- Does this hello explicitly claim `placeId`?

@@ -18,14 +18,38 @@
 --   * any `Camera` directly under `Workspace`
 --   * the branch marker (`ServerStorage/WSyncBranch`)
 --
--- Both Studios hold identical trees at the checkpoint, so both produce
+-- Both Studios hold identical trees at the FIRST checkpoint, so both produce
 -- identical numbering. Instances created afterwards get `"new:<m>"`, m a
--- per-session counter. The eleven services themselves are not numbered (they
--- exist in every place); they are addressable as `"svc:<Name>"` so an event
--- about a top-level instance has a parent to name. `id -> Instance` and
--- `Instance -> id` are held strongly for the Studio's lifetime, exactly as the
--- contract requires: an id must keep meaning something after the instance
--- leaves the tree.
+-- per-session counter — `"new:<tag>:<m>"` on a branch clone, where `tag` is
+-- the branch name (`Journal.setOrigin`), so two clones cut from the same main
+-- cannot mint the same id for two different instances and a merge cannot
+-- mistake one branch's add for another's. The eleven services themselves are
+-- not numbered (they exist in every place); they are addressable as
+-- `"svc:<Name>"` so an event about a top-level instance has a parent to name.
+-- `id -> Instance` and `Instance -> id` are held strongly for the Studio's
+-- lifetime, exactly as the contract requires: an id must keep meaning
+-- something after the instance leaves the tree.
+--
+-- STABLE IDS ACROSS CHECKPOINTS (two or more live branches). A second
+-- checkpoint — `wsync branch new B` while branch A is still live — does NOT
+-- renumber main. Numbering is incremental: every instance that already has an
+-- id keeps it, and only instances without one are numbered, continuing the
+-- counter so an id is never reused. Renumbering silently repointed every id in
+-- A's journal at a different instance, which is the one thing this design
+-- cannot survive. It follows that the checkpoint shape cannot be positional
+-- any more: SHAPE_VERSION 2 carries each node's id explicitly. v1's
+-- `base + pre-order index` is still read, so a clone cut by an older plugin
+-- adopts exactly as it did before.
+--
+-- ONE STREAM, MANY MARKS. Main records ONE event stream for the whole
+-- session, named by the first checkpoint it took, and a mark per branch
+-- (`Journal.mark`) fixes where in that stream the branch was cut.
+-- `Journal.start` on an already-recording Studio therefore adds the mark and
+-- leaves the stream alone — restarting it cut every older branch off from
+-- main's later edits, which is what its conflict detection is made of. The
+-- daemon fans one `/journal/append` out to every marked checkpoint's file
+-- (src/server/journal.rs), so each live branch's `<checkpoint>.jsonl` stays a
+-- complete record of main since its own mark.
 --
 -- EVENTS (wire contract). `{ t = <unix ms>, seq = <n>, id, op, ... }` with
 --
@@ -128,6 +152,17 @@ local byId: { [string]: Instance } = {}
 local parentOf: { [Instance]: string } = {}
 local newCounter = 0
 
+-- The high-water mark of the plain numeric id space (`"<n>"`). A checkpoint
+-- numbers only what has no id yet and continues from here, so a second
+-- checkpoint taken while a branch is live adds ids without disturbing one.
+local numberCounter = 0
+
+-- What this Studio stamps into the ids it mints itself: nil on main
+-- (`new:<m>`), the branch name on a clone (`new:<name>:<m>`). Two clones cut
+-- from the same main number their migration extras identically, so without
+-- this their first added instances collide on one id in main at merge time.
+local idTag: string? = nil
+
 local seq = 0
 
 -- Bumped by every emit. A pending add is only re-captured when this moved
@@ -179,9 +214,14 @@ local observing = false
 -- must not emit a second `remove`.
 local removedOnce: { [Instance]: boolean } = {}
 
--- Assigned below; declared here because `checkpoint` and `adoptShape` clear the
--- id maps and must drop the connections that went with them.
+-- Assigned below; declared here because `adoptShape` clears the id maps and
+-- must drop the connections that went with them.
 local disconnectInstances: () -> () = function() end
+
+-- Assigned below: a checkpoint taken while the recorder is already running
+-- numbers instances that were not there before, and those have to be observed
+-- from the moment they get an id rather than at the next `Journal.start`.
+local watchInstance: (Instance) -> () = function() end
 
 -- Assigned below: handling a `Parent` change needs `settleParent` and the
 -- removal batch, both of which are defined further down.
@@ -190,6 +230,17 @@ local onParentChanged: (Instance) -> () = function() end
 type AddedRoot = { instance: Instance, parent: string, name: string, class: string, capturedAt: number, capturedTick: number }
 
 local addedRoots: { [string]: AddedRoot } = {}
+
+-- Ids this Studio handed to instances that appeared DURING the session, as
+-- opposed to instances that were already there when it numbered. An add whose
+-- parent is one of these travels inside that parent's blob and is not
+-- serialized again; anything else is an added root of its own.
+--
+-- This used to be read off the id — `new:` meant "added since the checkpoint"
+-- — and that stopped being true the moment a checkpoint could hand over ids
+-- main had minted after an earlier one, or a clone could carry `new:` ids for
+-- Studio's own migration extras. Both are instances that were there first.
+local sessionAdded: { [string]: boolean } = {}
 local blobs = Transfers.newOutStore({ ttl = Journal.BLOB_TTL_SECONDS, dropOnEof = false })
 
 local endpoint: { host: string, port: string, https: boolean }? = nil
@@ -208,6 +259,17 @@ local looping = false
 -- those changes ARE the journal — recording them again would duplicate every
 -- event the next flush pushes.
 local muted = false
+
+-- The id a replay is about to parent an instance under, consumed by the very
+-- next `DescendantAdded`. A replay creates instances that ALREADY have an id —
+-- the branch's — and the recorder must adopt that id instead of minting one of
+-- its own and journalling main's own duplicate `add` for it.
+local adoptingId: string? = nil
+
+-- Set by `adoptShape`, which drops every watcher along with the ids they went
+-- with. `Journal.start` no longer restarts a running recorder, so this is what
+-- tells it the one case where it still has to re-observe.
+local observationStale = false
 
 --------------------------------------------------------------------------------
 -- Services, exclusion and the walk
@@ -286,41 +348,100 @@ local function assign(instance: Instance, id: string)
 	parentOf[instance] = parentIdOf(instance)
 end
 
---- The compact tree shape a branch aligns against (SHAPE_VERSION 1):
+--- Where this Studio's minted ids come from. A branch clone passes its branch
+--- name, so its `new:` ids are `new:<name>:<m>` and cannot collide with
+--- another clone's or with main's. Main passes nothing.
+function Journal.setOrigin(tag: string?)
+	if tag == nil or tag == "" then
+		idTag = nil
+		return
+	end
+
+	-- Only what a branch name may hold, and nothing that could be read as a
+	-- second separator.
+	idTag = (string.gsub(tag, "[^%w%-%._]", "_"))
+end
+
+--- The next id for an instance nobody has numbered: `new:<m>`, tagged with
+--- this Studio's origin when it has one.
+local function mintNewId(): string
+	newCounter += 1
+
+	return if idTag == nil then `new:{newCounter}` else `new:{idTag}:{newCounter}`
+end
+
+--- The counter value inside a `new:` id, whichever form it takes, so a replay
+--- can push this session's counter past an id it did not mint. nil for a
+--- checkpoint id.
+local function newIdNumber(id: string): number?
+	return tonumber(string.match(id, "^new:(%d+)$") or string.match(id, "^new:[%w%-%._]+:(%d+)$"))
+end
+
+--- Raise the counters so neither space can ever hand out an id that is
+--- already in use. Fed by a shape's explicit ids and by a replay.
+local function reserveId(id: string)
+	local plain = tonumber(string.match(id, "^%d+$"))
+
+	if plain ~= nil then
+		if plain > numberCounter then
+			numberCounter = plain
+		end
+
+		return
+	end
+
+	local minted = newIdNumber(id)
+
+	if minted ~= nil and minted > newCounter then
+		newCounter = minted
+	end
+end
+
+--- The compact tree shape a branch aligns against (SHAPE_VERSION 2):
 ---
----   { v = 1, count = <total>, services = {
+---   { v = 2, count = <total>, services = {
 ---       { service = "Workspace", base = <ids before this service>,
----         nodes = { {name, class, childCount}, ... } }, ... } }
+---         nodes = { {name, class, childCount, id}, ... } }, ... } }
 ---
---- `nodes` is the service's walk in numbering order, so the node at index `k`
---- carries the id `base + k`, and `childCount` is what makes the flat array
---- reconstructible into a tree (pre-order: a node is followed by its whole
---- first subtree, then the next). Written by main in `branch_checkpoint` and
---- read by a clone in `branch_adopt`; the engine only moves the bytes.
-Journal.SHAPE_VERSION = 1
+--- `nodes` is the service's walk in tree order, and `childCount` is what makes
+--- the flat array reconstructible into a tree (pre-order: a node is followed
+--- by its whole first subtree, then the next). Written by main in
+--- `branch_checkpoint` and read by a clone in `branch_adopt`; the engine only
+--- moves the bytes.
+---
+--- v1 carried `{name, class, childCount}` and left the id implicit: the node
+--- at index `k` was id `base + k`. That only held while a checkpoint
+--- renumbered main from scratch, which a second live branch made impossible —
+--- main's ids are now stable and arbitrary, so every node states its own.
+--- `adoptShape` still reads a v1 shape positionally, so a clone cut by an
+--- older plugin adopts exactly as it did before.
+Journal.SHAPE_VERSION = 2
+
+--- The positional shape this plugin can still adopt.
+Journal.SHAPE_VERSION_LEGACY = 1
 
 export type ShapeService = { service: string, base: number, nodes: { { any } } }
 export type Shape = { v: number, count: number, services: { ShapeService } }
 
---- Number the tree. Every previous id is dropped: a checkpoint is the new
---- origin, and two Studios that number the same tree agree by construction.
---- Returns `{count}`, plus `shape` when `withShape` asks for it — built by
---- the SAME walk that numbers, so the two can never describe different trees.
-function Journal.checkpoint(services: { Instance }?, withShape: boolean?): { count: number, shape: Shape? }
+--- Number the tree, incrementally. An instance that already has an id KEEPS
+--- it — a checkpoint taken while a branch is live must not repoint a single id
+--- in that branch's journal — and only instances without one are numbered,
+--- continuing the counter so nothing is ever reused. Nothing else is dropped
+--- either: the added roots, the replay ledgers and the `new:` counter all
+--- belong to the session, not to one checkpoint.
+---
+--- Returns `{count, numbered}` — the size of the numbered tree and how many
+--- ids this pass had to hand out — plus `shape` when `withShape` asks for it,
+--- built by the SAME walk that numbers, so the two can never describe
+--- different trees.
+function Journal.checkpoint(
+	services: { Instance }?,
+	withShape: boolean?
+): { count: number, numbered: number, shape: Shape? }
 	local list = services or Journal.services()
 
-	disconnectInstances()
-
-	table.clear(idOf)
-	table.clear(byId)
-	table.clear(parentOf)
-	table.clear(addedRoots)
-	table.clear(replayApplied)
-	table.clear(replayCreated)
-
-	newCounter = 0
-
 	local n = 0
+	local numbered = 0
 	local shape: Shape? = if withShape then { v = Journal.SHAPE_VERSION, count = 0, services = {} } else nil
 
 	--- Number `instance`'s children, recording them into `nodes` when asked.
@@ -335,16 +456,38 @@ function Journal.checkpoint(services: { Instance }?, withShape: boolean?): { cou
 
 			children += 1
 			n += 1
-			assign(child, tostring(n))
+
+			local existing = idOf[child]
+			local id: string
+
+			if existing ~= nil then
+				id = existing
+			else
+				numberCounter += 1
+				numbered += 1
+				id = tostring(numberCounter)
+				assign(child, id)
+
+				-- A checkpoint on a Studio that is ALREADY recording adds ids
+				-- mid-stream, and those instances are observed from here —
+				-- `Journal.start` no longer restarts, so nothing else would
+				-- connect them. The first checkpoint deliberately does not:
+				-- connecting two signals on every instance of a 157k-instance
+				-- place synchronously is what `observeAll` chunks away from
+				-- the remote op's deadline.
+				if active then
+					watchInstance(child)
+				end
+			end
 
 			if nodes == nil then
 				collect(child, service, nil)
 				continue
 			end
 
-			-- Appended before the recursion, so the index IS the pre-order
-			-- position, and patched after it, once the count is known.
-			local entry = { child.Name, child.ClassName, 0 }
+			-- Appended before the recursion, so a node is followed by its whole
+			-- subtree, and patched after it, once the count is known.
+			local entry = { child.Name, child.ClassName, 0, id }
 			table.insert(nodes, entry)
 			entry[3] = collect(child, service, nodes)
 		end
@@ -372,7 +515,7 @@ function Journal.checkpoint(services: { Instance }?, withShape: boolean?): { cou
 		(shape :: Shape).count = n
 	end
 
-	return { count = n, shape = shape }
+	return { count = n, numbered = numbered, shape = shape }
 end
 
 --------------------------------------------------------------------------------
@@ -390,21 +533,32 @@ Journal.ALIGN_WINDOW = 32
 --- required — but a tree that matches only loosely is not the same tree.
 Journal.ALIGN_MIN_RATIO = 0.99
 
-type ShapeNode = { index: number, name: string, class: string, size: number, children: { ShapeNode } }
+type ShapeNode = {
+	index: number,
+	name: string,
+	class: string,
+	size: number,
+	--- v2's explicit id. nil in a v1 shape, where the id is `base + index`.
+	id: string?,
+	children: { ShapeNode },
+}
 
 --- Rebuild a service's flat pre-order array into a forest. Each node keeps its
---- flat index (its id, once `base` is added) and its subtree size (what a
---- skipped node costs in unused ids).
+--- flat index (its id, once `base` is added, in a v1 shape), its explicit id
+--- when the shape carries one, and its subtree size (what a skipped node
+--- costs in unused ids).
 local function parseShapeNodes(nodes: { { any } }): { ShapeNode }
 	local cursor = 1
 
 	local function parseNode(): ShapeNode
 		local entry = nodes[cursor]
+		local carried = entry[4]
 		local node: ShapeNode = {
 			index = cursor,
 			name = tostring(entry[1]),
 			class = tostring(entry[2]),
 			size = 1,
+			id = if type(carried) == "string" and carried ~= "" then carried else nil,
 			children = {},
 		}
 
@@ -452,8 +606,7 @@ type AlignStats = { matched: number, extras: number, missing: number }
 --- under it goes the same way — but it is NEVER journalled as an `add`, it
 --- simply exists on this side.
 local function markExtra(instance: Instance, service: Instance, stats: AlignStats)
-	newCounter += 1
-	assign(instance, `new:{newCounter}`)
+	assign(instance, mintNewId())
 	stats.extras += 1
 
 	for _, child in liveChildrenOf(instance, service) do
@@ -479,7 +632,10 @@ local function align(
 		local node = shapeList[j]
 
 		if live.Name == node.name and live.ClassName == node.class then
-			assign(live, tostring(base + node.index))
+			-- v2 states the id main actually holds; v1 left it implicit in the
+			-- node's pre-order position, which only ever worked because a
+			-- checkpoint renumbered main from 1.
+			assign(live, node.id or tostring(base + node.index))
 			stats.matched += 1
 
 			align(liveChildrenOf(live, service), node.children, base, service, stats)
@@ -549,20 +705,40 @@ function Journal.adoptShape(shape: Shape, services: { Instance }?): { [string]: 
 	local list = services or Journal.services()
 
 	disconnectInstances()
+	observationStale = true
 
 	table.clear(idOf)
 	table.clear(byId)
 	table.clear(parentOf)
 	table.clear(addedRoots)
+	table.clear(sessionAdded)
 	table.clear(replayApplied)
 	table.clear(replayCreated)
 
 	newCounter = 0
+	numberCounter = 0
 
 	local byService: { [string]: ShapeService } = {}
 
 	for _, entry in shape.services do
 		byService[entry.service] = entry
+
+		-- Every id main is handing over is spoken for before a single extra is
+		-- minted: main's ids are no longer `1..count`, so the only safe
+		-- high-water marks are the ones the shape itself states.
+		for _, node in entry.nodes do
+			local carried = node[4]
+
+			if type(carried) == "string" then
+				reserveId(carried)
+			end
+		end
+	end
+
+	if shape.v == Journal.SHAPE_VERSION_LEGACY then
+		-- A positional shape hands out `base + index`, so the whole range it
+		-- covers is taken whether or not this clone matched every node.
+		reserveId(tostring(shape.count))
 	end
 
 	local stats: AlignStats = { matched = 0, extras = 0, missing = 0 }
@@ -618,6 +794,7 @@ function Journal.adoptShape(shape: Shape, services: { Instance }?): { [string]: 
 		table.clear(parentOf)
 
 		newCounter = 0
+		numberCounter = 0
 		result.unmatchedServices = starved
 
 		return result
@@ -1224,6 +1401,10 @@ local function watch(instance: Instance)
 	observed += 1
 end
 
+watchInstance = function(instance: Instance)
+	watch(instance)
+end
+
 --- Drop an instance's connections. The id mapping is deliberately KEPT: events
 --- already in the stream name it, and a merge has to be able to resolve them.
 local function unwatch(instance: Instance)
@@ -1486,6 +1667,25 @@ local function onDescendantAdded(instance: Instance, service: Instance)
 		return
 	end
 
+	if adoptingId ~= nil and idOf[instance] == nil then
+		-- The root a replay is parenting right now. It already HAS an id — the
+		-- one the branch's journal gave it — so minting a second one for it and
+		-- journalling an `add` would put main's own duplicate of the branch's
+		-- instance into main's stream, and leave `byId` holding two ids for one
+		-- instance.
+		local id = adoptingId :: string
+		adoptingId = nil
+
+		assign(instance, id)
+		watch(instance)
+
+		-- It did appear in this session, so everything the replay puts under
+		-- it belongs to its subtree rather than being a root of its own.
+		sessionAdded[id] = true
+
+		return
+	end
+
 	local existing = idOf[instance]
 
 	if existing ~= nil then
@@ -1506,18 +1706,17 @@ local function onDescendantAdded(instance: Instance, service: Instance)
 		return
 	end
 
-	newCounter += 1
-
-	local id = `new:{newCounter}`
+	local id = mintNewId()
 	assign(instance, id)
 	watch(instance)
+	sessionAdded[id] = true
 
 	local class = instance.ClassName
 
-	-- An *added root* is one whose parent already had an id before this add:
-	-- everything under it travels inside its blob, so only the root is
-	-- serialized and re-serialized.
-	local isRoot = string.sub(parent, 1, 4) ~= "new:"
+	-- An *added root* is one whose parent was already there when this Studio
+	-- numbered: everything under it travels inside its blob, so only the root
+	-- is serialized and re-serialized.
+	local isRoot = not sessionAdded[parent]
 
 	local blobId: string? = nil
 
@@ -1631,9 +1830,31 @@ local function disconnectAll()
 end
 
 --- Start recording against a checkpoint. The tree must already be numbered
---- (`Journal.checkpoint`). Idempotent per checkpoint.
+--- (`Journal.checkpoint`).
+---
+--- A Studio that is ALREADY recording keeps the stream it has. Main takes a
+--- checkpoint per branch, and restarting the stream at the second one cut the
+--- first branch off from every edit main made afterwards — which is precisely
+--- what that branch's conflict detection reads. So the stream, its ids, its
+--- history and its `new:` counter all belong to the session, and a later
+--- checkpoint only adds a mark into the one stream (`Journal.mark`).
 function Journal.start(checkpoint: string, services: { Instance }?)
-	if active and checkpointId == checkpoint then
+	if active then
+		if observationStale then
+			-- An `adoptShape` dropped every watcher with the ids they went
+			-- with. Nothing but a re-adopt on a live clone gets here, and it
+			-- must not leave the tree unobserved.
+			observationStale = false
+			observeAll()
+		end
+
+		if checkpointId ~= checkpoint then
+			Log.stage(
+				`Journal: checkpoint {checkpoint} joins the session stream {tostring(checkpointId)} `
+					.. `({checkpointCount} instances numbered)`
+			)
+		end
+
 		return
 	end
 
@@ -1675,8 +1896,27 @@ end
 
 --- Main's side: remember where this checkpoint sits in main's own stream, so
 --- `Journal.replay` knows which of main's events are "since the checkpoint".
+--- There is one stream and one mark per live branch; a mark is never moved,
+--- because the events before it are exactly the ones that branch already has.
 function Journal.mark(checkpoint: string)
 	marks[checkpoint] = #history
+end
+
+--- Every checkpoint main has marked in this session, with how many of main's
+--- own events it has seen since. `journal_status` reports it so two live
+--- branches can be told apart without reading the journal.
+function Journal.marks(): { { checkpoint: string, since: number } }
+	local list: { { checkpoint: string, since: number } } = {}
+
+	for checkpoint, at in marks do
+		table.insert(list, { checkpoint = checkpoint, since = #history - at })
+	end
+
+	table.sort(list, function(a, b)
+		return a.checkpoint < b.checkpoint
+	end)
+
+	return list
 end
 
 function Journal.status(): { [string]: any }
@@ -1699,6 +1939,11 @@ function Journal.status(): { [string]: any }
 		seq = seq,
 		lastFlushAt = lastFlushAt,
 		connected = endpoint ~= nil,
+		origin = idTag,
+		shapeVersion = Journal.SHAPE_VERSION,
+		numbered = numberCounter,
+		minted = newCounter,
+		marks = Journal.marks(),
 	}
 end
 
@@ -1948,10 +2193,17 @@ local function applyEvent(
 
 		local added: Instance = subject
 
+		-- Claimed before the parenting, because `DescendantAdded` fires inside
+		-- it: the recorder adopts this id rather than minting one of its own
+		-- and journalling main's own duplicate `add`.
+		adoptingId = event.id
+
 		local ok = pcall(function()
 			added.Name = event.name
 			added.Parent = parent
 		end)
+
+		adoptingId = nil
 
 		if not ok then
 			return false
@@ -1960,15 +2212,10 @@ local function applyEvent(
 		created[event.id] = added
 
 		-- Registered under the id the journal gave it, so every later event in
-		-- the same stream resolves. The session counter is pushed past it so a
-		-- live add after the replay cannot reuse the number.
+		-- the same stream resolves. The session counters are pushed past it so
+		-- a live add after the replay cannot reuse the number.
 		assign(added, event.id)
-
-		local replayed = tonumber(string.match(event.id, "^new:(%d+)$"))
-
-		if replayed ~= nil and replayed > newCounter then
-			newCounter = replayed
-		end
+		reserveId(event.id)
 
 		return true
 	end

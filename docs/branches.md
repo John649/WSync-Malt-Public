@@ -41,10 +41,12 @@ wsync branch finish <name>     git merge, Studio replay into main, close
    `placeIds: [<synthetic id>]` (see Discovery).
 4. Start a daemon on the worktree (`wsync daemon start --project`), launch
    Studio on the clone, keep the pid.
-5. When the plugin connects, both plugins take the checkpoint: walk the tree in
-   `GetChildren` order and number every instance `<n>`. The trees are
-   identical, so the numbering is identical. Main's plugin records the
-   checkpoint under the branch name; the branch plugin starts its journal.
+5. When the plugin connects, both plugins take the checkpoint: main walks the
+   tree in `GetChildren` order and numbers every instance that has no id yet,
+   and hands the clone a *shape* that states each node's id. The clone aligns
+   its own tree against that shape and takes the ids it names. Main's plugin
+   records the checkpoint under the branch name; the branch plugin starts its
+   journal.
 
 ## Discovery
 
@@ -113,6 +115,61 @@ its journal: `branch up` reopens the clone, renumbers, and replays.
 
 Main keeps one journal with a checkpoint mark per branch. A branch's merge reads
 main's events after its mark.
+
+## Two or more live branches
+
+`wsync branch new B` while branch A is still open is ordinary, and three
+invariants are what make it so. All three exist because the first cut of this
+design assumed exactly one branch at a time, and each of them was a way for A's
+merge to land on the wrong instances.
+
+**Ids in main are stable for the session, not for a checkpoint.** A checkpoint
+numbers only instances that have no id yet, continues the counter, and never
+reuses a number. It clears nothing: not the ids, not the `new:` counter, not
+the added roots, not the per-checkpoint replay ledgers. A checkpoint that
+renumbered main from 1 would silently repoint every id in A's journal at a
+different instance, and A's merge would then edit whatever now stood where its
+own work used to. Instances a replay creates in main are numbered too — they
+are ordinary instances from the moment they land, and a branch cut afterwards
+addresses them like any other.
+
+**The checkpoint shape states its ids.** Version 1 of the shape was positional:
+`{name, class, childCount}` per node, id = the service's base plus the node's
+pre-order index. That only worked while main renumbered from 1. Version 2 adds
+the id to each entry, and the clone assigns the id it is given rather than
+counting. The alignment itself is unchanged — same two-pointer walk by
+`(name, class)`, same `ALIGN_WINDOW`, same `ALIGN_MIN_RATIO`, same accounting
+for skipped nodes — so a clone still adopts a tree Studio has added its own
+instances to. A v1 shape is still read positionally, so a clone cut against a
+main running an older plugin adopts exactly as it did before.
+
+**Ids a clone mints carry its branch name.** Two clones of the same place
+number Studio's own migration additions identically, so both would mint `new:1`
+for the first instance their user adds, and main would then have one id meaning
+two different instances. A clone's ids are `new:<branch>:<m>`; main's own stay
+`new:<m>`.
+
+**Main records one stream and marks it per branch.** `Journal.start` on a
+Studio that is already recording adds the mark and leaves the stream alone.
+Restarting it at B's checkpoint sent main's later edits to a stream A does not
+read, and A's conflict detection — which is exactly "main's events after A's
+mark" — went blind to every edit main made after B was cut. On disk the daemon
+fans one `POST /journal/append` out to the stream it names plus every other
+checkpoint with a mark in `marks.json`, so each live branch's
+`<checkpoint>.jsonl` stays a complete record of main since its own mark. A
+branch daemon has no marks file and writes one stream, as before.
+
+`branch finish` and `branch rm --purge` drop their own branch's mark
+(`POST /journal/unmark`) and nothing else. No command deletes a checkpoint's
+stream: that file is one branch's view of main, and removing one branch must
+never take another's with it. A branch that is merely closed keeps its mark,
+because `branch up` reopens it and its merge still needs everything main did in
+between.
+
+What is still one-at-a-time is the merge, not the branch: `branch finish`
+pauses main's sync, merges, replays and commits, and a second `finish` started
+underneath it would meet a checkout already mid-merge. The budget on live
+branch Studios (default 3) is about Roblox's window cap and nothing else.
 
 ## Merge in Studio
 

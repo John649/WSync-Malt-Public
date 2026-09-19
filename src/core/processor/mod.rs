@@ -185,8 +185,15 @@ impl Handler {
 
 			// Events inside WSync's runtime directories (backups, staging,
 			// artifacts) never concern the projection — skip before any
-			// tree walk so bulk staging churn stays free (Design §12)
-			if path
+			// tree walk so bulk staging churn stays free (Design §12).
+			// Judged relative to THIS workspace: a branch worktree lives at
+			// `<main>/.wsync-branches/<name>/tree`, so testing the absolute
+			// path would drop every edit made inside a branch, and its Studio
+			// would never see a script change until the merge
+			let workspace_dir = lock!(self.project).workspace_dir.clone();
+			let relative = path.strip_prefix(&workspace_dir).unwrap_or(path);
+
+			if relative
 				.components()
 				.any(|component| RUNTIME_DIRS.iter().any(|dir| component.as_os_str() == *dir))
 			{
