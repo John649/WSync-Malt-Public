@@ -19,7 +19,7 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use colored::Colorize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::{
 	fs,
 	path::{Path, PathBuf},
@@ -344,6 +344,33 @@ impl DaemonEntry {
 
 	/// The `placeKey` this daemon claims, its own live answer first
 	/// (docs/places.md — "Unpublished places")
+	/// The keys this daemon's place is remembered under: its ids, and its
+	/// `placeKey` when it has no ids to be found by
+	fn title_keys(&self) -> Vec<String> {
+		let mut keys: Vec<String> = self.place_ids().iter().map(u64::to_string).collect();
+
+		if let Some(key) = self.place_key() {
+			keys.push(key);
+		}
+
+		keys
+	}
+
+	/// What this daemon's place is called: the connected Studio's answer
+	/// first, then what it was called when we last saw it, then nothing —
+	/// the project's own name is a separate column and not a place title
+	pub fn place_title(&self, titles: &Map<String, Value>) -> Option<String> {
+		if let Some(plugin) = self.hello.as_ref().and_then(|hello| hello.plugin.as_ref()) {
+			if !plugin.name.trim().is_empty() {
+				return Some(plugin.name.clone());
+			}
+		}
+
+		self.title_keys()
+			.into_iter()
+			.find_map(|key| titles.get(&key).and_then(Value::as_str).map(str::to_owned))
+	}
+
 	pub fn place_key(&self) -> Option<String> {
 		match &self.hello {
 			Some(hello) => hello.place_key.clone(),
@@ -507,6 +534,8 @@ pub fn registry() -> Result<Vec<DaemonEntry>> {
 
 		entries
 	});
+
+	learn_titles(&entries);
 
 	Ok(entries)
 }
@@ -842,8 +871,10 @@ impl Places {
 			return Ok(());
 		}
 
-		let rows: Vec<[String; 9]> = entries.iter().map(row_cells).collect();
+		let titles = read_titles();
+		let rows: Vec<[String; 10]> = entries.iter().map(|entry| row_cells(entry, &titles)).collect();
 		let headers = [
+			"PLACE",
 			"PROJECT",
 			"PORT",
 			"GAME",
@@ -872,7 +903,7 @@ impl Places {
 	}
 }
 
-fn render(cells: &[String; 9], widths: &[usize; 9]) -> String {
+fn render(cells: &[String; 10], widths: &[usize; 10]) -> String {
 	cells
 		.iter()
 		.enumerate()
@@ -899,6 +930,59 @@ fn kind(entry: &DaemonEntry) -> String {
 	}
 }
 
+/// Where the titles of places we have seen are kept, so a row can name its
+/// place even when no Studio is attached to it right now
+fn titles_path() -> Option<PathBuf> {
+	daemon::state_dir(None).ok().map(|dir| dir.join("place-titles.json"))
+}
+
+fn read_titles() -> Map<String, Value> {
+	titles_path()
+		.and_then(|path| fs::read_to_string(path).ok())
+		.and_then(|text| serde_json::from_str::<Value>(&text).ok())
+		.and_then(|value| value.as_object().cloned())
+		.unwrap_or_default()
+}
+
+/// Remember what a connected Studio calls its place. The plugin resolves the
+/// published title (Studio's own `game.Name` is the place *file's* name, not
+/// what the creator titled it), so this is the only place that knows it —
+/// and a place is worth naming after its Studio has gone
+fn learn_titles(entries: &[DaemonEntry]) {
+	let mut titles = read_titles();
+	let mut changed = false;
+
+	for entry in entries {
+		let Some(title) = entry.hello.as_ref().and_then(|hello| hello.plugin.as_ref()).map(|plugin| plugin.name.clone())
+		else {
+			continue;
+		};
+
+		if title.trim().is_empty() {
+			continue;
+		}
+
+		for key in entry.title_keys() {
+			if titles.get(&key).and_then(Value::as_str) != Some(title.as_str()) {
+				titles.insert(key, Value::String(title.clone()));
+				changed = true;
+			}
+		}
+	}
+
+	if !changed {
+		return;
+	}
+
+	if let Some(path) = titles_path() {
+		if let Some(parent) = path.parent() {
+			fs::create_dir_all(parent).ok();
+		}
+
+		fs::write(path, serde_json::to_string_pretty(&Value::Object(titles)).unwrap_or_default()).ok();
+	}
+}
+
 fn plugin_cell(entry: &DaemonEntry) -> String {
 	match &entry.hello {
 		None => String::from("unreachable"),
@@ -919,8 +1003,9 @@ fn places_cell(entry: &DaemonEntry) -> String {
 	ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",")
 }
 
-fn row_cells(entry: &DaemonEntry) -> [String; 9] {
+fn row_cells(entry: &DaemonEntry, titles: &Map<String, Value>) -> [String; 10] {
 	[
+		entry.place_title(titles).unwrap_or_else(|| String::from("-")),
 		entry.name(),
 		entry.record.port.to_string(),
 		entry.game_id().map_or_else(|| String::from("-"), |id| id.to_string()),
@@ -935,6 +1020,7 @@ fn row_cells(entry: &DaemonEntry) -> [String; 9] {
 
 fn row_json(entry: &DaemonEntry) -> Value {
 	json!({
+		"placeName": entry.place_title(&read_titles()),
 		"name": entry.name(),
 		"project": entry.record.project,
 		"canonicalProject": entry.record.canonical_project,
