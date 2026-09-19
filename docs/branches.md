@@ -37,8 +37,13 @@ wsync branch finish <name>     git merge, Studio replay into main, close
    path that already exists), assembled into `<name>.rbxl` beside the worktree
    with rbx_binary. Studio migrates a place as it opens, so the checkpoint is
    taken from the branch Studio after it loads, never from this file.
-3. Write the branch's project file: main's tree, `initialSync: "keep"`, and
-   `placeIds: [<synthetic id>]` (see Discovery).
+   The marker is written into this file here, before Studio ever opens it
+   (see Identity) — never added to a running place afterwards.
+3. Write the branch's project file: main's tree, `initialSync: "keep"`,
+   `branch: <name>` — which is what `/hello` reports and what a clone matches
+   on — and a name-derived `placeIds` claim. That claim identifies nothing to
+   Roblox and is not the clone's place id; it survives only so a branch daemon
+   cannot rank exact for main's own window.
 4. Start a daemon on the worktree (`wsync daemon start --project`), launch
    Studio on the clone, keep the pid.
 5. When the plugin connects, both plugins take the checkpoint: main walks the
@@ -48,18 +53,64 @@ wsync branch finish <name>     git merge, Studio replay into main, close
    records the checkpoint under the branch name; the branch plugin starts its
    journal.
 
-## Discovery
+## Identity: the marker is the branch
 
-A branch Studio must find the daemon on its worktree, not main's, and the
-plugin ranks daemons by `gameId`/`placeId`. Branches get a synthetic `placeId`
-(a hash of the name): the plugin calls `SetPlaceId` on the clone at boot and the
-branch's project file claims that id, so main's daemon ranks weak and the
-branch's ranks exact. Main's Studio is untouched. A clone that finds no daemon
-claiming its id refuses to connect rather than falling through to main.
+A clone boots with the place's **real** `placeId` and **real** `gameId`. It is a
+copy of the game, so every Roblox API a script reaches — DataStores,
+MessagingService, anything keyed on the place or the universe — behaves in a
+clone exactly as it does in main. Nothing about the ids says "branch".
 
-The clone carries one marker, a `StringValue` under `ServerStorage` with the
-branch name, so the plugin knows it is a branch before discovery runs. It is the
-only instance the plugin adds to a place and it is excluded from the journal.
+What says "branch" is one instance. The clone carries a `StringValue` named
+`WSyncBranch` directly under `ServerStorage` whose `Value` **is** the branch
+name. That is the whole identity; there is no second id to keep in step. It is
+the only instance wsync adds to a place, and it is excluded from the journal
+numbering and from disk sync.
+
+The assembler bakes it into the `.rbxl` before Studio is ever spawned, so the
+plugin reads it at boot rather than being told later:
+
+| on `ServerStorage/WSyncBranch` | |
+| --- | --- |
+| `Value` | the branch name — the identity |
+| attribute `GameId` | the real universe id |
+| attribute `PlaceId` | the real place id |
+| attribute `DaemonPort` | the branch daemon's port |
+
+A place opened from a local `.rbxl` reports `0` for both ids, so the plugin
+calls `SetUniverseId` and `SetPlaceId` with the marker's values first, before
+discovery runs.
+
+> **A clone window points at the live place.** Because the ids are real,
+> Studio's own **File > Save** and **File > Publish** in a clone window would
+> overwrite the real place with a half-finished branch. The plugin refuses the
+> `save` op on a branch, but Studio's File menu is not reachable from a plugin
+> and is **not** covered. `wsync branch finish` is the only way a branch's work
+> is meant to reach main.
+
+## Discovery: marker first, refuse rather than guess
+
+Main and every clone now share the same `gameId` and `placeId`, so the ids can
+no longer tell them apart and the marker decides first:
+
+- A Studio **carrying** the marker binds only to the daemon whose `/hello`
+  `branch` equals the marker's `Value`. Nothing else ranks, at any strength — a
+  clone whose own daemon is down refuses to connect rather than falling through
+  to main and journalling a branch's edits into the live place. The
+  `DaemonPort` attribute is probed first as a shortcut; it is not an override,
+  and the daemon it reaches still has to name the right branch.
+- A Studio **without** the marker never binds to a branch daemon, however well
+  the ids line up. Otherwise main's own window would attach to a branch's
+  worktree whenever main's daemon happened not to answer.
+
+Everything else keeps the ordinary strict-`gameId` ranking.
+
+One consequence is worth stating, because it costs an afternoon to rediscover:
+a place file carries the universe id it was copied from. A project whose file
+claims no `gameId` serves a claimless `/hello`, and under strict-`gameId`
+ranking a *published* place — which is what a copied place file still looks
+like — never matches a claimless daemon. Such a Studio finds nothing and reports
+no broker, and no amount of retrying changes that. If a Studio will not attach,
+check that its project file claims the universe id its place file was cut from.
 
 ## Sync on a branch
 
@@ -118,8 +169,8 @@ main's events after its mark.
 
 ## Two or more live branches
 
-`wsync branch new B` while branch A is still open is ordinary, and three
-invariants are what make it so. All three exist because the first cut of this
+`wsync branch new B` while branch A is still open is ordinary, and four
+invariants are what make it so. All four exist because the first cut of this
 design assumed exactly one branch at a time, and each of them was a way for A's
 merge to land on the wrong instances.
 
@@ -149,6 +200,12 @@ for the first instance their user adds, and main would then have one id meaning
 two different instances. A clone's ids are `new:<branch>:<m>`; main's own stay
 `new:<m>`.
 
+**Each clone binds to its own daemon, by marker.** Three live clones of one
+place are three Studios with identical `gameId` and `placeId`; only the marker
+separates them, which is why discovery consults it before anything else (see
+"Discovery"). Nothing here is quieter than a mis-binding: a clone that attached
+to main's daemon would write a branch's tree straight into the live checkout.
+
 **Main records one stream and marks it per branch.** `Journal.start` on a
 Studio that is already recording adds the mark and leaves the stream alone.
 Restarting it at B's checkpoint sent main's later edits to a stream A does not
@@ -170,6 +227,16 @@ What is still one-at-a-time is the merge, not the branch: `branch finish`
 pauses main's sync, merges, replays and commits, and a second `finish` started
 underneath it would meet a checkout already mid-merge. The budget on live
 branch Studios (default 3) is about Roblox's window cap and nothing else.
+
+### Observed
+
+Three branches live at once on a real place, each on its own daemon: their
+clones booted with the place's real `placeId` and `gameId`, each carrying the
+marker with its own name and binding to the daemon that named it. A script
+edited in one worktree reached that clone's editor source in about six seconds.
+One branch was finished while the other two stayed live: the merge took about
+nine seconds, main's editor source carried the change, the other two branches
+were untouched, and only the finished branch's mark was dropped.
 
 ## Merge in Studio
 
