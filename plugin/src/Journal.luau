@@ -129,6 +129,12 @@ local parentOf: { [Instance]: string } = {}
 local newCounter = 0
 
 local seq = 0
+
+-- Bumped by every emit. A pending add is only re-captured when this moved
+-- since its last capture: an idle branch used to re-serialize every added
+-- subtree every BLOB_REFRESH_SECONDS forever (363 adds for one folder in
+-- the first DungeonDemo branch), each with a fresh blob pinned in memory.
+local emitTick = 0
 local pending: { [string]: Event } = {}
 local pendingKeys: { [string]: { [string]: boolean } } = {}
 local pendingCount = 0
@@ -181,7 +187,7 @@ local disconnectInstances: () -> () = function() end
 -- removal batch, both of which are defined further down.
 local onParentChanged: (Instance) -> () = function() end
 
-type AddedRoot = { instance: Instance, parent: string, name: string, class: string, capturedAt: number }
+type AddedRoot = { instance: Instance, parent: string, name: string, class: string, capturedAt: number, capturedTick: number }
 
 local addedRoots: { [string]: AddedRoot } = {}
 local blobs = Transfers.newOutStore({ ttl = Journal.BLOB_TTL_SECONDS, dropOnEof = false })
@@ -765,6 +771,7 @@ local function emit(id: string, op: string, fields: Event?)
 	end
 
 	seq += 1
+	emitTick += 1
 
 	local event: Event = { t = nowMillis(), seq = seq, id = id, op = op }
 
@@ -917,13 +924,14 @@ local function refreshBlobs()
 			continue
 		end
 
-		if now - root.capturedAt < Journal.BLOB_REFRESH_SECONDS then
+		if now - root.capturedAt < Journal.BLOB_REFRESH_SECONDS or root.capturedTick == emitTick then
 			continue
 		end
 
 		local blobId = Journal.captureBlob(root.instance)
 
 		root.capturedAt = os.clock()
+		root.capturedTick = emitTick
 
 		if blobId == nil then
 			continue
@@ -1522,6 +1530,7 @@ local function onDescendantAdded(instance: Instance, service: Instance)
 			name = instance.Name,
 			class = class,
 			capturedAt = os.clock(),
+			capturedTick = emitTick + 1,
 		}
 	end
 
