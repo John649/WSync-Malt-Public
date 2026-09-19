@@ -139,6 +139,21 @@ export const host = {
   daemonStatus: (projectId) => call("daemon_status", { projectId }),
 
   /**
+   * Live daemons this app did not start, matched to registered projects.
+   *
+   * `[{projectId, project, canonicalProject, port, pid, managedBy, name,
+   * branch, ephemeral, pluginConnected, place}]` — the runtime records on disk
+   * plus one `/hello` each, which is how `wsync places` sees the same set. A
+   * project served from the CLI is invisible to `daemonStatus`, so without
+   * this the card would read "Idle" while a plugin is attached to it.
+   *
+   * Strictly a read: nothing here starts, stops or adopts anything. Resolves
+   * with `[]` rather than throwing when nothing is running, because it is
+   * polled.
+   */
+  externalDaemons: () => call("external_daemons"),
+
+  /**
    * Read one allowlisted daemon route through the host (Design 5.2).
    *
    * The webview cannot call the daemon over HTTP itself: a browser-origin

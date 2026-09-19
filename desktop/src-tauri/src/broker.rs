@@ -879,9 +879,12 @@ impl Broker {
         // A place that belongs to a project the app already knows gets THAT
         // project served — never a scratch daemon, which would sit there
         // keep-only while the user believes their edits are reaching disk.
-        if request.place_id != 0 {
-            if let Some((id, path)) = registered_project_for_place(&self.read_registry().await, request.place_id)
-            {
+        if request.place_id != 0 || request.usable_place_key().is_some() {
+            let registry = self.read_registry().await;
+            let found = registered_project_for_place(&registry, request.place_id)
+                .or_else(|| request.usable_place_key().and_then(|key| registered_project_for_key(&registry, key)));
+
+            if let Some((id, path)) = found {
                 let port = host.serve(id.clone(), path.clone()).await.map_err(|error| {
                     InitError::new(500, format!("the project's daemon did not start: {error}"))
                 })?;
@@ -1314,6 +1317,20 @@ struct AttachRequest {
     /// One Studio window's identity, minted by the plugin at boot. It is what
     /// keeps two windows on two copies of the same unnamed baseplate apart.
     session_id: String,
+    /// The key on the place's own `WSyncPlace` marker, when it carries one.
+    /// A place that was made permanent is routed by this, so it names the
+    /// project to serve rather than a scratch to invent (docs/places.md).
+    #[serde(default)]
+    place_key: Option<String>,
+}
+
+impl AttachRequest {
+    fn usable_place_key(&self) -> Option<&str> {
+        self.place_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+    }
 }
 
 /// One attached place, as the route answers for it.
@@ -1781,6 +1798,36 @@ fn verify_inside(root: &Path, directory: &Path) -> Result<(), InitError> {
 /// The registered project whose project file claims `place_id`, as
 /// `(id, directory)`. Reads each record's `default.project.json`, so a claim
 /// edited on disk counts without the registry having to notice
+/// The registered project whose project file carries `place_key`, as
+/// `(id, directory)`. This is how an unpublished place that was made
+/// permanent finds its project again: the place has no ids, only the key on
+/// its marker (docs/places.md — "Unpublished places")
+fn registered_project_for_key(document: &Map<String, Value>, place_key: &str) -> Option<(String, String)> {
+    let projects = document.get("projects")?.as_array()?;
+    for project in projects {
+        let (Some(id), Some(path)) = (
+            project.get("id").and_then(Value::as_str),
+            project.get("path").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let file = Path::new(path).join("default.project.json");
+        if !file.is_file() {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if parsed.get("placeKey").and_then(Value::as_str).map(str::trim) == Some(place_key) {
+            return Some((id.to_string(), path.to_string()));
+        }
+    }
+    None
+}
+
 fn registered_project_for_place(document: &Map<String, Value>, place_id: u64) -> Option<(String, String)> {
     let projects = document.get("projects")?.as_array()?;
     for project in projects {

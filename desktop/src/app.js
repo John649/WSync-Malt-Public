@@ -88,6 +88,12 @@ const app = {
   link: { state: LINK_STATE.IDLE, detail: "No project is being served.", projectId: null },
   /** Not persisted: last plugin-status event per project. */
   plugin: new Map(),
+  /**
+   * Not persisted: live daemons this app did not start, keyed by the
+   * registered project each one serves (`external_daemons`). Only ever read
+   * from — the host matches them to projects, and nothing here adopts one.
+   */
+  external: new Map(),
   /** Not persisted: projects whose daemon answered 404 on /resolve. */
   conflictsUnsupported: new Set(),
   /**
@@ -384,6 +390,61 @@ function isProjectServed(projectId) {
   return servedProjectIds().includes(projectId);
 }
 
+// ------------------------------------------------- externally served projects --
+//
+// A daemon started from the CLI (`wsync daemon start --project <dir>`) serves a
+// registered project without this app knowing: the host only tracks sessions it
+// spawned or adopted. The result was a card reading "Idle" with its toggle off
+// while the Studio plugin reported itself connected to that very project.
+//
+// The host answers with the daemons it can see on disk; this half decides which
+// of them belong on a project card. Nothing below serves, stops or adopts —
+// flipping the toggle still does that, and adoption is exactly what it does.
+
+/** The external daemon serving a project, or null. */
+function getExternalDaemon(projectId) {
+  return app.external.get(projectId) ?? null;
+}
+
+/** What has to change before the Projects view is worth re-rendering. */
+function externalSignature(daemons) {
+  return [...daemons.values()]
+    .map((daemon) => `${daemon.projectId}:${daemon.port}:${daemon.pid}:${daemon.pluginConnected}:${daemon.place ?? ""}`)
+    .sort()
+    .join("|");
+}
+
+/**
+ * Re-read the daemons nobody here started. Never throws — this is polled, and
+ * a host that could not answer is not a reason to claim nothing is running.
+ */
+async function refreshExternalDaemons() {
+  if (!IS_TAURI) return;
+
+  let found;
+  try {
+    found = await host.externalDaemons();
+  } catch {
+    return;
+  }
+
+  const next = new Map();
+  for (const daemon of Array.isArray(found) ? found : []) {
+    // No project: an attach daemon, or one serving a folder this app has not
+    // been told about. A branch: it belongs to that branch, not to the project
+    // card. Ephemeral: a scratch place daemon that is never a registered
+    // project. And a project this app is already serving has its own session,
+    // which is the better answer.
+    if (!daemon?.projectId || daemon.branch || daemon.ephemeral) continue;
+    if (isProjectServed(daemon.projectId)) continue;
+    next.set(daemon.projectId, daemon);
+  }
+
+  if (externalSignature(next) === externalSignature(app.external)) return;
+  app.external = next;
+  emit("external", next);
+}
+
 // ------------------------------------------------------- daemon sessions ----
 //
 // The host owns the daemon children and their owner tokens; this half owns the
@@ -519,6 +580,10 @@ async function stopProject(projectId) {
     emit("daemon", { projectId, ok: false, outcome });
     refreshLink();
     void pollBacklog();
+    // `requested` means the process was asked, not killed: an adopted daemon
+    // may well still be serving, and the card should say so now rather than at
+    // the next tick.
+    void refreshExternalDaemons();
     return true;
   } catch (error) {
     const hostError = recordFailure(projectId, error);
@@ -770,8 +835,14 @@ let conflictTimer = null;
 
 function startBacklogPolling() {
   if (conflictTimer !== null) return;
-  conflictTimer = setInterval(() => void pollBacklog(), CONFLICT_POLL_MS);
+  conflictTimer = setInterval(() => {
+    void pollBacklog();
+    // Same cadence, same reason: a daemon started outside this app announces
+    // nothing, so the only way a card learns about one is by looking.
+    void refreshExternalDaemons();
+  }, CONFLICT_POLL_MS);
   void pollBacklog();
+  void refreshExternalDaemons();
 }
 
 /**
@@ -941,6 +1012,8 @@ function buildApi() {
     getDaemonSession,
     getDaemonFailure,
     daemonFetch,
+    getExternalDaemon,
+    refreshExternalDaemons,
 
     // the live WS link (ws.js)
     getLinkState: () => app.link,

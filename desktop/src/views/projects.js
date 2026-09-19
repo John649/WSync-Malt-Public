@@ -168,18 +168,44 @@ export function mountProjects(root, api) {
       return el("span", { class: "chip chip-ok", text: "Serving" });
     }
     if (busy.has(project.id)) return el("span", { class: "chip chip-accent", text: "Starting…" });
+    // A daemon this app did not start still serves this project: the card said
+    // "Idle" while the Studio plugin said "connected", which is the one thing a
+    // status chip must never do. It is not this app's session, so the chip says
+    // whose it is and the toggle stays off — flipping it adopts the daemon.
+    const external = api.getExternalDaemon?.(project.id);
+    if (external) {
+      return el("span", {
+        class: "chip chip-external",
+        text: external.managedBy === "cli" ? "Serving · CLI" : "Serving · external",
+        title: externalHint(external),
+      });
+    }
     if (failure) return el("span", { class: "chip chip-danger", text: "Failed" });
     return el("span", { class: "chip", text: "Idle" });
+  }
+
+  /** What the external chip and the Adopt toggle both explain. */
+  function externalHint(external) {
+    const who = external.managedBy === "cli" ? "the WSync CLI" : `another process (${external.managedBy || "unknown"})`;
+    const studio = external.pluginConnected
+      ? ` Studio is connected${external.place ? ` on ${external.place}` : ""}.`
+      : " No Studio is connected yet.";
+    return `Served by ${who} on port ${external.port} (pid ${external.pid}).${studio} Turn this on to adopt it.`;
   }
 
   function serveToggle(project, { withLabel = false } = {}) {
     const served = api.isProjectServed(project.id);
     const working = busy.has(project.id);
+    // An external daemon is already serving: turning the toggle on adopts that
+    // process rather than spawning one (`daemon.rs` — "spawn (or adopt)"), so
+    // the control says adopt and the label stops claiming the project is idle.
+    const external = served ? null : api.getExternalDaemon?.(project.id);
     const input = el("input", {
       type: "checkbox",
       checked: served,
       disabled: working,
-      "aria-label": `Serve ${project.name}`,
+      "aria-label": external ? `Adopt the running daemon for ${project.name}` : `Serve ${project.name}`,
+      title: external ? externalHint(external) : null,
       on: {
         change: async (event) => {
           const wanted = event.target.checked;
@@ -206,7 +232,8 @@ export function mountProjects(root, api) {
       withLabel
         ? el("span", {
             class: "toggle-label",
-            text: working ? "Working…" : served ? "Serving" : "Not serving",
+            text: working ? "Working…" : served ? "Serving" : external ? "Adopt" : "Not serving",
+            title: external ? externalHint(external) : null,
           })
         : null,
     );
@@ -599,6 +626,9 @@ export function mountProjects(root, api) {
       }
     }),
     api.onBus("daemon", () => render()),
+    // A daemon started outside this app appearing or going away changes what a
+    // card may claim, exactly as one of our own sessions does.
+    api.onBus("external", () => render()),
     // Reconnects and non-retryable shutdowns change what a card may claim.
     api.onBus("link", () => render()),
     // Design 8.4: a project the broker just created. The store has already been

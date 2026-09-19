@@ -23,6 +23,7 @@ use crate::{
     broker::BrokerStatus,
     daemon::{DaemonResponse, DaemonSession, DaemonStatus},
     error::{HostError, HostResult},
+    external::{self, ExternalDaemon},
     plugin_install,
     secrets::{self, SecretStatus},
     storage, AppState,
@@ -367,6 +368,36 @@ pub(crate) async fn daemon_status(
 ) -> HostResult<DaemonStatus> {
     require_non_empty("projectId", &project_id)?;
     Ok(state.daemons.status(&project_id).await)
+}
+
+/// Daemons that are running for registered projects but were not started here.
+///
+/// The Projects view would otherwise draw a card as "Idle" while a CLI-started
+/// daemon serves that exact project and a Studio plugin is attached to it —
+/// the app saying "not connected" while the plugin says the opposite. This is
+/// the read that makes the card honest: the runtime records on disk plus one
+/// `GET /hello` each (`external.rs`), matched to registered projects by
+/// canonical path.
+///
+/// Strictly a read. It starts, adopts and stops nothing — flipping the serve
+/// toggle is still what adopts one of these daemons. It takes no argument
+/// because there is nothing for the webview to name: the answer is derived
+/// from the state file and the state directories, both of which are the host's.
+///
+/// Succeeds rather than throwing, for the reason `daemon_status` gives: this
+/// rides the Projects view's poll, and a poll that throws every tick is noise.
+#[tauri::command]
+pub(crate) async fn external_daemons(state: State<'_, AppState>) -> HostResult<Vec<ExternalDaemon>> {
+    let projects = {
+        let _guard = state.state_lock.lock().await;
+        storage::read_value(&state.paths.state_file, Some("projects")).unwrap_or(Value::Null)
+    };
+
+    Ok(external::scan(
+        &state.paths.daemon_dirs,
+        &external::registered_projects(&projects),
+    )
+    .await)
 }
 
 /// Read one allowlisted route on a served project's daemon (Design 5.2).

@@ -10,6 +10,7 @@ mod broker;
 mod commands;
 mod daemon;
 mod error;
+mod external;
 mod loopback;
 mod plugin_install;
 mod secrets;
@@ -116,6 +117,7 @@ pub fn run() {
             commands::daemon_start,
             commands::daemon_stop,
             commands::daemon_status,
+            commands::external_daemons,
             commands::daemon_request,
             commands::daemon_post,
             commands::plugin_install,

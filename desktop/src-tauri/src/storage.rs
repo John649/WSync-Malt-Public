@@ -70,6 +70,10 @@ pub(crate) struct AppPaths {
     pub(crate) state_file: PathBuf,
     pub(crate) secrets_file: PathBuf,
     pub(crate) daemons_dir: PathBuf,
+    /// Every `daemons/` directory a runtime record may live in: this app's own
+    /// plus the CLI's (`external.rs`). Read-only, and resolved once here
+    /// because the second one needs the Tauri path resolver too.
+    pub(crate) daemon_dirs: Vec<PathBuf>,
 }
 
 impl AppPaths {
@@ -85,10 +89,18 @@ impl AppPaths {
         let daemons_dir = data_dir.join("daemons");
         create_private_dir(&daemons_dir)?;
 
+        // The CLI writes its records under the *local* data dir while this app
+        // writes under the roaming one. Not created and not required: a
+        // machine with no CLI daemons simply has no such directory, and on
+        // macOS/Linux it is the same directory as the one above.
+        let local_dir = app.path().local_data_dir().ok();
+        let daemon_dirs = crate::external::daemon_dirs(&daemons_dir, local_dir.as_deref());
+
         Ok(Self {
             state_file: data_dir.join("state.json"),
             secrets_file: data_dir.join("secrets.json"),
             daemons_dir,
+            daemon_dirs,
             data_dir,
         })
     }
