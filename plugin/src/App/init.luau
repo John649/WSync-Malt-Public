@@ -828,6 +828,7 @@ function App:__connectTo(host: string, port: number, generation: number)
 		elseif status.kind == "connected" then
 			self.transportStatus:set(nil)
 			self:setIcon("Ok")
+			self:__refreshTemporaryNote()
 		end
 	end)
 
@@ -886,14 +887,48 @@ function App:makePermanent()
 	local broker = self.attachBroker
 
 	if broker == nil then
+		Log.stage("Make permanent: no broker recorded for this window")
+
 		return
 	end
 
+	Log.stage("Make permanent: dropping the temporary daemon and creating a project")
+
+	-- The marker this place picked up names the SCRATCH daemon. Dropping it
+	-- does two things: the rescan after the disconnect cannot find that
+	-- throwaway daemon by key, and the create asks the app for a project
+	-- with no key of its own, so the app mints one and the plugin writes it
+	-- back on the connect that follows (docs/places.md)
 	Discovery.setSessionPort(nil)
+	Place.forget()
 	self.attachNote:set(nil)
 	self:disconnect(true)
-	self:dispatch({ kind = "offer-create", broker = broker, known = false })
-	self:dispatch({ kind = "create" })
+	self:dispatch({ kind = "force-create", broker = broker, known = false })
+end
+
+--- Ask the daemon this window is connected to whether it is a throwaway,
+--- and show (or hide) the temporary note accordingly. Derived from the
+--- daemon rather than remembered from the attach: a reconnect, a rescan or
+--- any disconnect in between would otherwise leave the card claiming the
+--- wrong thing — and the "Make permanent" button rides on this note.
+function App:__refreshTemporaryNote()
+	local host, port = self.host, self.port
+
+	if host == nil or port == nil then
+		return
+	end
+
+	task.spawn(function()
+		local ok, hello = pcall(function()
+			return Discovery.hello(host, port):expect()
+		end)
+
+		if not ok or self.host ~= host or self.port ~= port then
+			return
+		end
+
+		self.attachNote:set(Policy.temporaryNote(hello))
+	end)
 end
 
 function App:disconnect(cancel: boolean?)

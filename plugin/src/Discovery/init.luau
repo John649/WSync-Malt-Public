@@ -405,6 +405,13 @@ end
 --- `POST /places/attach` to the broker for the open place (docs/places.md).
 --- Resolves one table — `{attached}` on success, `{message, disabled}` when
 --- the app refused or has the flow switched off. Never rejects: a refusal is
+--- One daemon's `/hello`, for a host and port already known. The card uses
+--- it to ask the daemon it is connected to whether it is a throwaway, which
+--- is a fact of the daemon rather than of how this window reached it.
+function Discovery.hello(host: string, port: number)
+	return Transport.hello(host, port, false)
+end
+
 --- a fall-back to the ordinary no-daemon card, not an error page.
 function Discovery.attachPlace(broker: BrokerMatch)
 	return Promise.new(function(resolve)

@@ -147,6 +147,27 @@ end
 --- or an earlier one did. Never throws, and never overwrites a key that is
 --- already there: a place routed to one project must not be silently
 --- re-pointed at another by a connect to a second.
+--- Drop the marker, if there is one. Used when a temporary attach is being
+--- turned into a real project: the key on the place names the throwaway
+--- daemon, and leaving it there would let the post-disconnect rescan find
+--- that daemon again instead of the project about to be created. The new
+--- project's key is written back on the next connect.
+function Place.forget(): boolean
+	local ok, removed = pcall(function(): boolean
+		local marker = Place.marker()
+
+		if marker == nil then
+			return false
+		end
+
+		marker:Destroy()
+
+		return true
+	end)
+
+	return ok and removed
+end
+
 function Place.remember(key: string, daemonPort: number?): boolean
 	local wanted = usableKey(key)
 
