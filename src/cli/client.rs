@@ -37,6 +37,7 @@ use std::{
 };
 
 use crate::{
+	cli::places,
 	config::Config,
 	daemon::{self, RuntimeRecord},
 	ext::PathExt,
@@ -54,7 +55,8 @@ const HTTP_SLACK_MS: u64 = 3000;
 /// How long `GET /hello` discovery probes wait
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
-/// `--project`/`--port` targeting, flattened into every live command
+/// `--project`/`--port`/`--place` targeting, flattened into every live
+/// command
 #[derive(Args, Debug, Clone, Default)]
 pub struct Targeting {
 	/// Project path (defaults to the current directory)
@@ -74,6 +76,8 @@ pub enum PortSource {
 	Record,
 	ProjectFile,
 	Config,
+	/// `--place <id>` resolved to this daemon (docs/places.md)
+	Place,
 }
 
 impl PortSource {
@@ -83,6 +87,7 @@ impl PortSource {
 			PortSource::Record => "runtime record",
 			PortSource::ProjectFile => "project file",
 			PortSource::Config => "config default",
+			PortSource::Place => "--place",
 		}
 	}
 }
@@ -105,6 +110,17 @@ impl Target {
 	/// (the authoritative registry), then the project file's `port`, then the
 	/// config default
 	pub fn resolve(targeting: &Targeting) -> Result<Self> {
+		// `--place <id>` is a global option rather than a field here, so that
+		// every command that already targets a daemon gains it without a
+		// per-command change (docs/places.md)
+		if let Some((place, branch)) = places::selector() {
+			if targeting.project.is_some() || targeting.port.is_some() {
+				bail!("--place selects the daemon on its own; drop --project/--port");
+			}
+
+			return Self::resolve_place(place, branch.as_deref());
+		}
+
 		let project_path = project::resolve(targeting.project.clone().unwrap_or_default())?;
 		let project_exists = project_path.exists();
 
@@ -162,6 +178,43 @@ impl Target {
 		})
 	}
 
+	/// `--place <id>`: the daemon is found first and the project comes from
+	/// it, which is the opposite direction to the `--project` chain above.
+	/// The place is resolved against every runtime record on this machine
+	/// ([`places::resolve`] owns the rules), so the project identity used for
+	/// verification is the one the chosen daemon reported for itself
+	fn resolve_place(place: u64, branch: Option<&str>) -> Result<Self> {
+		let entries = places::registry()?;
+		let candidates = places::candidates(&entries);
+		let chosen = places::resolve(&candidates, place, branch)?;
+
+		let project_path = PathBuf::from(&chosen.project);
+		let project_exists = project_path.exists();
+
+		if project_exists {
+			Config::load_workspace(project_path.get_parent());
+		}
+
+		let state_dir = daemon::state_dir(None)?;
+		let record =
+			daemon::read_record(&daemon::runtime_paths(&state_dir, &chosen.canonical).record).unwrap_or_default();
+
+		debug!(
+			"Live target: place {place} served by {} on port {}",
+			chosen.project, chosen.port
+		);
+
+		Ok(Self {
+			project_path,
+			project_exists,
+			canonical: Some(chosen.canonical.clone()),
+			state_dir,
+			record,
+			port: chosen.port,
+			port_source: PortSource::Place,
+		})
+	}
+
 	/// The daemon's runtime record matches the daemon that actually answers
 	pub fn record_is_live(&self, hello: &Hello) -> bool {
 		match &self.record {
@@ -215,6 +268,15 @@ pub struct Hello {
 	pub game_id: Option<u64>,
 	#[serde(default)]
 	pub place_ids: Vec<u64>,
+	/// The branch this daemon serves (docs/branches.md); absent on main and
+	/// on every non-branch project, which `--place` reads as main
+	#[serde(default)]
+	pub branch: Option<String>,
+	/// The Studio plugin holding the live bridge. Absent on a daemon build
+	/// that predates the field, which reads the same as "none connected" —
+	/// `wsync places` prints it, nothing decides on it
+	#[serde(default)]
+	pub plugin: Option<PluginIdentity>,
 	#[serde(default)]
 	pub boot_id: String,
 	#[serde(default)]
@@ -229,6 +291,16 @@ pub struct Hello {
 	/// confirmed
 	#[serde(default)]
 	pub writes_log: Option<String>,
+}
+
+/// The connected Studio plugin, as `/hello` reports it
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginIdentity {
+	#[serde(default)]
+	pub name: String,
+	#[serde(default)]
+	pub transport: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]

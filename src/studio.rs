@@ -28,6 +28,72 @@ pub fn launch(path: Option<PathBuf>) -> Result<u32> {
 	Ok(child.id())
 }
 
+/// The protocol URL that opens a cloud place for editing.
+///
+/// Studio is not given a file here: `EditPlace` makes it fetch the place from
+/// Roblox itself, which is the only way to reach a place that exists nowhere
+/// on this disk. Both ids are required — Studio resolves a place inside its
+/// universe, and a URL without `universeId` opens nothing
+pub fn edit_place_url(place_id: u64, universe_id: u64) -> String {
+	format!("roblox-studio:1+launchmode:edit+task:EditPlace+placeId:{place_id}+universeId:{universe_id}")
+}
+
+/// Launches Studio on a protocol URL and returns the pid of whatever was
+/// spawned.
+///
+/// The installed Studio binary is tried first, because it gives a pid worth
+/// having; the shell's protocol handler is the fallback for a machine where
+/// the binary cannot be located but the URL scheme is registered (in which
+/// case the pid belongs to the launcher, not to Studio).
+pub fn launch_url(url: &str) -> Result<u32> {
+	if let Ok(studio) = RobloxStudio::locate() {
+		let child = Command::new(studio.application_path())
+			.arg(url)
+			.stdin(Stdio::null())
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.spawn()?;
+
+		return Ok(child.id());
+	}
+
+	shell_open(url)
+}
+
+#[allow(unused_variables)]
+fn shell_open(url: &str) -> Result<u32> {
+	#[cfg(target_os = "windows")]
+	{
+		// `start` is a cmd builtin, and the empty first argument is the
+		// window title it would otherwise take the URL for
+		let child = Command::new("cmd")
+			.args(["/C", "start", "", url])
+			.stdin(Stdio::null())
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.spawn()?;
+
+		return Ok(child.id());
+	}
+
+	#[cfg(target_os = "macos")]
+	{
+		let child = Command::new("open")
+			.arg(url)
+			.stdin(Stdio::null())
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.spawn()?;
+
+		return Ok(child.id());
+	}
+
+	#[cfg(target_os = "linux")]
+	{
+		anyhow::bail!("Roblox Studio cannot be launched on Linux");
+	}
+}
+
 #[allow(unused_variables)]
 pub fn is_running(title: Option<String>) -> Result<bool> {
 	#[cfg(target_os = "macos")]

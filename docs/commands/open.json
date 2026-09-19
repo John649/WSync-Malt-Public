@@ -2,14 +2,20 @@
   "name": "open",
   "title": "wsync open",
   "category": "Studio control",
-  "description": "Selects one or more Studio instances by path.",
-  "usage": "wsync open [--project <path>] [--port <port>] [--raw] <studio-path>...",
+  "description": "Opens a cloud place in Roblox Studio by place id, or selects one or more Studio instances by path.",
+  "usage": "wsync open [<placeId> [--universe <gameId>] [--into <dir>] [--no-attach] [--keep]] [--project <path>] [--port <port>] [--raw] [<studio-path>...]",
   "examples": [
+    "wsync open 1234567890 --universe 9876543210",
+    "wsync open --project .",
+    "wsync open 1234567890 --no-attach",
     "wsync open ReplicatedStorage/Client/UIController",
     "wsync open Workspace/Baseplate ReplicatedStorage/Client"
   ],
   "notes": [
-    "This is a shorthand over `wsync select set --paths '[...]'`.",
+    "A single all-digit argument is a place id; anything else is a Studio path, so the two forms never collide.",
+    "The place form launches Studio through the `roblox-studio:` protocol URL (`task:EditPlace`), which needs both the place id and its universe; the universe is taken from a daemon that already claims the place, or from `--project`'s `gameId`, and is otherwise requested with `--universe`.",
+    "When no daemon serves the place, a scratch project is created under `<projectsRoot>/_places/<placeId>` and its daemon is started, so the place is addressable as soon as Studio connects; the scratch project deletes itself when Studio closes. `--keep` keeps it, `--into <dir>` puts it elsewhere (never auto-deleted), and `--no-attach` only launches Studio.",
+    "The path form is a shorthand over `wsync select set --paths '[...]'`.",
     "With the `OpenInEditor` plugin setting on, selecting a script also opens it in the Studio script editor."
   ]
 }

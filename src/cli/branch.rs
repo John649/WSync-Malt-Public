@@ -84,7 +84,7 @@ use std::{
 
 use crate::{
 	cli::client::{print_json, truncate, Client, Envelope, Target, Targeting},
-	daemon, docsgen,
+	docsgen,
 	ext::PathExt,
 	server::journal::{finish_decision, FinishDecision},
 	wsync_info, wsync_warn,
@@ -1447,66 +1447,12 @@ fn claim(record: &mut Record, root: &Path, steal: bool) -> Result<()> {
 /// `GET /hello` on the port it recorded, not a line on a pipe we would have
 /// to hold open to read
 fn spawn_daemon(project: &Path) -> Result<(u16, u32)> {
-	let binary = env::current_exe().context("Failed to locate the running wsync executable")?;
-	let canonical = daemon::canonical_project(project)?;
-	let paths = daemon::runtime_paths(&daemon::state_dir(None)?, &canonical);
+	// One spawn for every daemon the CLI starts (`branch new`, `branch up`,
+	// `open`): the detached launch, the handle hygiene and the readiness wait
+	// live in `cli::spawn`
+	let spawned = crate::cli::spawn::daemon(project, &[])?;
 
-	// Whatever is recorded now belongs to a previous daemon for this project;
-	// readiness is a record this spawn wrote, never that one
-	let stale = daemon::read_record(&paths.record)
-		.unwrap_or_default()
-		.map(|record| record.boot_id);
-
-	let mut command = Command::new(&binary);
-
-	command
-		.args(["daemon", "start", "--project"])
-		.arg(project)
-		.stdin(Stdio::null())
-		.stdout(Stdio::null())
-		.stderr(Stdio::null());
-
-	detach(&mut command);
-
-	let mut child = command
-		.spawn()
-		.with_context(|| format!("Failed to run {}", binary.to_string()))?;
-
-	let deadline = Instant::now() + DAEMON_READY;
-
-	loop {
-		if let Ok(Some(record)) = daemon::read_record(&paths.record) {
-			if Some(&record.boot_id) != stale.as_ref() {
-				if let Some(hello) = probe_hello(record.port) {
-					let serves = hello.get("canonicalProject").and_then(Value::as_str) == Some(canonical.as_str());
-					let booted = hello.get("bootId").and_then(Value::as_str) == Some(record.boot_id.as_str());
-
-					if serves && booted {
-						return Ok((record.port, record.pid));
-					}
-				}
-			}
-		}
-
-		// A child that has already exited will never record itself
-		if let Ok(Some(status)) = child.try_wait() {
-			bail!(
-				"The branch daemon exited before it started serving ({status}). Its own log has the reason: `{}`",
-				format!("wsync daemon logs --project {}", project.to_string()).bold()
-			);
-		}
-
-		if Instant::now() >= deadline {
-			stop_child(&mut child);
-
-			bail!(
-				"The branch daemon did not start serving within {}s; it was stopped",
-				DAEMON_READY.as_secs()
-			);
-		}
-
-		thread::sleep(Duration::from_millis(250));
-	}
+	Ok((spawned.port, spawned.pid))
 }
 
 /// Cuts a child loose from this process: no inherited console, and its own

@@ -157,6 +157,12 @@ pub struct Open {
 }
 
 impl Open {
+	/// The path-selection form, reached through the `wsync open` dispatcher
+	/// (`cli::open`) once it has ruled out a place id
+	pub fn select(targeting: Targeting, paths: Vec<String>, raw: bool) -> Result<()> {
+		Self { targeting, paths, raw }.main()
+	}
+
 	pub fn main(self) -> Result<()> {
 		SelectSet {
 			targeting: self.targeting,

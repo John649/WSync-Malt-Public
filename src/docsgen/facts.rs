@@ -378,7 +378,7 @@ pub enum Safety {
 }
 
 /// Commands whose category does not imply their tier
-const SAFETY_EXCEPTIONS: [(&str, Safety); 8] = [
+const SAFETY_EXCEPTIONS: [(&str, Safety); 9] = [
 	// Launches Studios and daemons, and merges a branch into the live place
 	("branch", Safety::Mutating),
 	// Reads Studio, writes only WSync's own private clipboard
@@ -391,8 +391,10 @@ const SAFETY_EXCEPTIONS: [(&str, Safety); 8] = [
 	("capabilities", Safety::ReadOnly),
 	// Listing parked conflicts changes nothing
 	("conflicts", Safety::ReadOnly),
-	// Selection is Studio state
+	// Selection is Studio state, and a place id launches a Studio
 	("open", Safety::Mutating),
+	// Lists daemons and probes `/hello`; touches nothing
+	("places", Safety::ReadOnly),
 	// Pastes instances into the connected place
 	("paste", Safety::Mutating),
 ];

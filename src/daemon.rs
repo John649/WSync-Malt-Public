@@ -49,6 +49,18 @@ pub struct RuntimeRecord {
 	pub managed_by: String,
 	pub log_path: String,
 	pub started_at: u64,
+	/// True for a scratch place daemon (`wsync open <placeId>`): the daemon
+	/// stops itself once Studio disconnects, and the CLI deletes the scratch
+	/// project directory on the way out. Absent on every record written
+	/// before place routing landed, which reads as `false`
+	#[serde(default, skip_serializing_if = "is_false")]
+	pub ephemeral: bool,
+}
+
+/// `skip_serializing_if` for the ephemeral flag: an ordinary daemon's record
+/// keeps exactly the shape it had before place routing
+fn is_false(value: &bool) -> bool {
+	!*value
 }
 
 #[derive(Debug, Clone)]
@@ -351,6 +363,7 @@ mod tests {
 			managed_by: "test".into(),
 			log_path: "/tmp/daemon.log".into(),
 			started_at: 123,
+			ephemeral: false,
 		}
 	}
 

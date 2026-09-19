@@ -111,6 +111,9 @@ pub struct Identity {
 	pub control_token: Option<String>,
 	/// Per-daemon lifecycle journal backing `wsync daemon logs`
 	pub journal: Option<Arc<DaemonLog>>,
+	/// Scratch place daemon (`wsync open <placeId>`): it stops itself once
+	/// Studio has connected and then gone away (docs/places.md)
+	pub ephemeral: bool,
 }
 
 /// Boot parameters supplied by the CLI entrypoint (`wsync serve` or
@@ -155,6 +158,8 @@ pub struct Server {
 	/// Overrides the state directory (`writes.log` home); defaults to the
 	/// platform state dir resolution (`WSYNC_STATE_DIR` honored)
 	state_dir: Option<PathBuf>,
+	/// Scratch place daemon: self-terminates once Studio goes away
+	ephemeral: bool,
 }
 
 impl Server {
@@ -165,6 +170,7 @@ impl Server {
 			port,
 			identity,
 			state_dir: None,
+			ephemeral: false,
 		}
 	}
 
@@ -172,6 +178,14 @@ impl Server {
 	/// (used by hermetic tests and embedders)
 	pub fn with_state_dir(mut self, state_dir: PathBuf) -> Self {
 		self.state_dir = Some(state_dir);
+		self
+	}
+
+	/// Marks this daemon as a scratch place daemon (`wsync open <placeId>`
+	/// attach mode, docs/places.md): once a Studio plugin has connected and
+	/// then stayed away past the grace window, the daemon shuts itself down
+	pub fn with_ephemeral(mut self, ephemeral: bool) -> Self {
+		self.ephemeral = ephemeral;
 		self
 	}
 
@@ -251,6 +265,7 @@ impl Server {
 				managed_by: self.identity.managed_by.clone(),
 				control_token: self.identity.control_token.clone(),
 				journal: self.identity.journal.clone(),
+				ephemeral: self.ephemeral,
 			}),
 			ws: Arc::new(ws::state::WsState::new()),
 			lifecycle: Arc::new(lifecycle::Lifecycle::new(self.identity.control_token.is_some())),
@@ -286,6 +301,7 @@ impl Server {
 		}
 
 		lifecycle::spawn_watchdog(state.clone());
+		lifecycle::spawn_ephemeral_watchdog(state.clone());
 
 		// The msgpack (Argon-protocol) routes below are protocol v1's
 		// fallback transport and are served unconditionally; `compat_argon`

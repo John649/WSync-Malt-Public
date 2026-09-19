@@ -2,7 +2,7 @@
 
 # wsync command reference
 
-69 commands in 15 categories. Every entry is generated from one JSON file
+70 commands in 15 categories. Every entry is generated from one JSON file
 under `docs/commands/`; edit the JSON and re-run `node scripts/build-command-docs.mjs`.
 
 `wsync commands [name] [--compact]` serves this same registry from the binary, and the desktop
@@ -11,7 +11,7 @@ Docs view renders it from `docs/client-commands.generated.json`.
 ## Contents
 
 - [Project setup](#project-setup) (4) — `init`, `plugin`, `auth`, `branch`
-- [Daemon](#daemon) (3) — `daemon`, `serve`, `stop`
+- [Daemon](#daemon) (4) — `daemon`, `places`, `serve`, `stop`
 - [Command registry](#command-registry) (3) — `commands`, `context`, `plan`
 - [Agent runtime](#agent-runtime) (4) — `capabilities`, `capture`, `playtest`, `run`
 - [Live inspection](#live-inspection) (14) — `query`, `get`, `ls`, `tree`, `snapshot`, `backlog`, `services`, `props`, `source`, `find`, `find-attr`, `classinfo`, `enums`, `enum`
@@ -208,6 +208,32 @@ wsync daemon start --project . --game-id 123 --place-id 456 --raw
 - Stop verifies the exact live canonical project and boot ID before graceful shutdown. On graceful timeout it can use an OS-kill fallback only for that verified process; a stale PID record alone is insufficient.
 - Runtime records live in the platform data directory under WSync/daemons, alongside start locks and lifecycle logs. The mutation audit log is WSync/writes.log.
 - Desktop managers can supply an owner token through --owner-token-env <ENV>. Lifecycle JSON does not disclose the token. No --projects-root flag is implemented in this CLI family.
+
+---
+
+### `wsync places`
+
+Lists every recorded WSync daemon with the places it serves, its port, branch, and whether a Studio plugin is connected.
+
+**Usage**
+
+```sh
+wsync places [--raw]
+```
+
+**Examples**
+
+```sh
+wsync places
+wsync places --raw
+```
+
+**Notes**
+
+- Reads the runtime records under the state directory and probes `GET /hello` on each recorded port; nothing is started, stopped, or written.
+- A daemon that does not answer is still listed as `unreachable`, with the place ids its project file claims, so a stale record is visible rather than silent.
+- The `KIND` column marks scratch projects created by `wsync open <placeId>`: `attach` for one that persists, `attach (ephemeral)` for one that deletes itself when Studio closes.
+- Place ids listed here are what the global `--place <placeId>` option resolves against.
 
 ---
 
@@ -1265,24 +1291,30 @@ wsync monetization product images ./icons --project .
 
 ### `wsync open`
 
-Selects one or more Studio instances by path.
+Opens a cloud place in Roblox Studio by place id, or selects one or more Studio instances by path.
 
 **Usage**
 
 ```sh
-wsync open [--project <path>] [--port <port>] [--raw] <studio-path>...
+wsync open [<placeId> [--universe <gameId>] [--into <dir>] [--no-attach] [--keep]] [--project <path>] [--port <port>] [--raw] [<studio-path>...]
 ```
 
 **Examples**
 
 ```sh
+wsync open 1234567890 --universe 9876543210
+wsync open --project .
+wsync open 1234567890 --no-attach
 wsync open ReplicatedStorage/Client/UIController
 wsync open Workspace/Baseplate ReplicatedStorage/Client
 ```
 
 **Notes**
 
-- This is a shorthand over `wsync select set --paths '[...]'`.
+- A single all-digit argument is a place id; anything else is a Studio path, so the two forms never collide.
+- The place form launches Studio through the `roblox-studio:` protocol URL (`task:EditPlace`), which needs both the place id and its universe; the universe is taken from a daemon that already claims the place, or from `--project`'s `gameId`, and is otherwise requested with `--universe`.
+- When no daemon serves the place, a scratch project is created under `<projectsRoot>/_places/<placeId>` and its daemon is started, so the place is addressable as soon as Studio connects; the scratch project deletes itself when Studio closes. `--keep` keeps it, `--into <dir>` puts it elsewhere (never auto-deleted), and `--no-attach` only launches Studio.
+- The path form is a shorthand over `wsync select set --paths '[...]'`.
 - With the `OpenInEditor` plugin setting on, selecting a script also opens it in the Studio script editor.
 
 ---

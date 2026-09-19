@@ -37,6 +37,19 @@ pub struct Hello {
 	/// Resolved mutation audit log path, so `wsync status` can report
 	/// write-log health (Design §6.4/§12)
 	writes_log: String,
+	/// The Studio plugin currently owning the live bridge, when one is
+	/// connected. `wsync places` reads it to tell a daemon waiting for
+	/// Studio from one already driving it, without spending a plugin op
+	#[serde(skip_serializing_if = "Option::is_none")]
+	plugin: Option<PluginIdentity>,
+}
+
+/// The connected plugin as `/hello` reports it
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginIdentity {
+	name: String,
+	transport: &'static str,
 }
 
 pub async fn main(State(state): State<AppState>) -> Json<Hello> {
@@ -81,5 +94,9 @@ pub async fn main(State(state): State<AppState>) -> Json<Hello> {
 		// broker flow) is not available before the desktop app lands
 		project_init: false,
 		writes_log: state.audit.path().to_string(),
+		plugin: state
+			.ws
+			.plugin_status()
+			.map(|(name, transport)| PluginIdentity { name, transport }),
 	})
 }

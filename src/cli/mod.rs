@@ -22,6 +22,8 @@ mod install;
 mod lint;
 mod live;
 mod monetization;
+mod open;
+mod places;
 mod plan;
 mod plugin;
 mod registry;
@@ -33,6 +35,7 @@ pub(crate) mod refresh;
 mod serve;
 mod source_input;
 mod sourcemap;
+mod spawn;
 mod stop;
 mod studio;
 mod update;
@@ -76,6 +79,16 @@ pub struct Cli {
 	/// Print full backtrace on panic
 	#[arg(short = 'B', long, global = true)]
 	backtrace: bool,
+
+	/// Address the daemon serving this place id instead of a project
+	/// directory (docs/places.md)
+	#[arg(long, global = true, value_name = "PLACE-ID")]
+	place: Option<u64>,
+
+	/// With --place, which branch's daemon to take when several serve the
+	/// place; `main` selects the branchless one
+	#[arg(long, global = true, value_name = "NAME", requires = "place")]
+	branch: Option<String>,
 
 	#[arg(long, hide = true, global = true)]
 	profile: bool,
@@ -150,6 +163,11 @@ impl Cli {
 	}
 
 	pub fn main(self) -> Result<()> {
+		// Parked before dispatch: every command that resolves a daemon reads
+		// it out of `places`, which is how `--place` reaches the whole live
+		// surface without a per-command flag (docs/places.md)
+		places::set_selector(self.place, self.branch);
+
 		match self.command {
 			Commands::Init(command) => command.main(),
 			Commands::Serve(command) => command.main(),
@@ -237,6 +255,7 @@ impl Cli {
 			Commands::Backlog(command) => command.main(),
 			Commands::Services(command) => command.main(),
 			Commands::Open(command) => command.main(),
+			Commands::Places(command) => command.main(),
 
 			// Live diagnostics & maintenance
 			Commands::Lint(command) => command.main(),
@@ -329,7 +348,8 @@ pub enum Commands {
 	Snapshot(live::Snapshot),
 	Backlog(live::Backlog),
 	Services(live::Services),
-	Open(live::Open),
+	Open(open::Open),
+	Places(places::Places),
 
 	Lint(lint::Lint),
 	Repair(repair::Repair),

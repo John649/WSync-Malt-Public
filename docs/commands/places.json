@@ -1,0 +1,17 @@
+{
+  "name": "places",
+  "title": "wsync places",
+  "category": "Daemon",
+  "description": "Lists every recorded WSync daemon with the places it serves, its port, branch, and whether a Studio plugin is connected.",
+  "usage": "wsync places [--raw]",
+  "examples": [
+    "wsync places",
+    "wsync places --raw"
+  ],
+  "notes": [
+    "Reads the runtime records under the state directory and probes `GET /hello` on each recorded port; nothing is started, stopped, or written.",
+    "A daemon that does not answer is still listed as `unreachable`, with the place ids its project file claims, so a stale record is visible rather than silent.",
+    "The `KIND` column marks scratch projects created by `wsync open <placeId>`: `attach` for one that persists, `attach (ephemeral)` for one that deletes itself when Studio closes.",
+    "Place ids listed here are what the global `--place <placeId>` option resolves against."
+  ]
+}

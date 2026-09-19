@@ -19,6 +19,7 @@ use std::{
 use uuid::Uuid;
 
 use crate::{
+	cli::places,
 	config::Config,
 	daemon::{self, RuntimePaths, RuntimeRecord},
 	ext::PathExt,
@@ -95,6 +96,12 @@ struct Start {
 	/// Persist these place IDs into the project before starting
 	#[arg(long = "place-id")]
 	place_id: Vec<u64>,
+
+	/// Scratch place daemon (`wsync open <placeId>` attach mode,
+	/// docs/places.md): stop once Studio disconnects and delete the scratch
+	/// project on the way out
+	#[arg(long, hide = true)]
+	ephemeral: bool,
 
 	/// Print one machine-readable JSON line once the daemon is serving
 	#[arg(long)]
@@ -291,6 +298,9 @@ fn record_from_hello(hello: &Hello, canonical: &str, paths: &RuntimePaths) -> Ru
 		},
 		log_path: paths.log.to_string(),
 		started_at: daemon::unix_now(),
+		// An adopted daemon's lifetime belongs to whoever started it; this
+		// process is not the one that would clean up after it
+		ephemeral: false,
 	}
 }
 
@@ -517,7 +527,7 @@ impl Start {
 			journal: Some(journal.clone()),
 		};
 
-		let server = Server::new(core, &host, port, identity);
+		let server = Server::new(core, &host, port, identity).with_ephemeral(self.ephemeral);
 		let bound_port = Arc::new(AtomicU16::new(port));
 
 		let ready: Box<dyn FnOnce(u16) + Send> = {
@@ -531,6 +541,7 @@ impl Start {
 			let journal = journal.clone();
 			let bound_port = bound_port.clone();
 			let raw = self.raw;
+			let ephemeral = self.ephemeral;
 
 			Box::new(move |actual_port| {
 				bound_port.store(actual_port, Ordering::Relaxed);
@@ -547,6 +558,7 @@ impl Start {
 					managed_by,
 					log_path,
 					started_at: daemon::unix_now(),
+					ephemeral,
 				};
 
 				if let Err(err) = daemon::write_record(&record_path, &record) {
@@ -611,6 +623,19 @@ impl Start {
 		// watchdog): clean the runtime record and session entry
 		journal.note("Daemon stopped");
 		daemon::remove_record_if_boot(&paths.record, &boot_id).ok();
+
+		// A scratch place project outlives nothing: the daemon that served it
+		// is gone, so the directory `wsync open` created goes with it. The
+		// guard lives in `places`, which refuses anything that is not a
+		// scratch directory, and a refusal is a warning — never a failed stop
+		if self.ephemeral {
+			let workspace = project_path.get_parent();
+
+			match places::remove_scratch_dir(&workspace) {
+				Ok(()) => journal.note(&format!("Removed the scratch place project {}", workspace.to_string())),
+				Err(err) => wsync_warn!("{}", err),
+			}
+		}
 
 		let final_port = bound_port.load(Ordering::Relaxed);
 		if let Ok(Some(session)) = sessions::get(None, None, Some(final_port)) {
@@ -851,7 +876,11 @@ impl Stop {
 impl Restart {
 	fn main(self) -> Result<()> {
 		let context = project_context(self.project.clone(), self.data_dir.as_ref())?;
-		let previous_port = daemon::read_record(&context.paths.record)?.map(|record| record.port);
+		let previous = daemon::read_record(&context.paths.record)?;
+		let previous_port = previous.as_ref().map(|record| record.port);
+		// A restarted scratch place daemon stays scratch: losing the flag
+		// here would strand the `_places/<id>` directory forever
+		let ephemeral = previous.as_ref().is_some_and(|record| record.ephemeral);
 
 		let outcome = stop_daemon(&context, Duration::from_secs(self.timeout))?;
 
@@ -870,6 +899,7 @@ impl Restart {
 			game_id: None,
 			group_id: None,
 			place_id: Vec::new(),
+			ephemeral,
 			raw: self.raw,
 		}
 		.main()
