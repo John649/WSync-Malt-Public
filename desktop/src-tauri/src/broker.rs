@@ -774,10 +774,15 @@ impl Broker {
             game_id: request.game_id,
             place_ids: request.place_ids(),
             group_id: request.group_id(),
-            // Carried, not minted: a place that already reached a scratch
-            // daemon by key keeps that key, so the marker it carries now
-            // points at the permanent project instead (docs/places.md).
-            place_key: request.usable_place_key(),
+            // Carried when the place already has one, minted when it has no
+            // ids to be found by: an unpublished place is routed by this key
+            // alone, and the plugin writes it onto the place after the
+            // connect that follows (docs/places.md).
+            place_key: request.usable_place_key().or_else(|| {
+                (request.game_id == 0)
+                    .then(|| attach_key(0, request.place_name.as_deref(), &request.request_id).1)
+                    .flatten()
+            }),
         };
         if let Err(error) = templates::write_scaffold(&directory, &facts) {
             // A half-written project is worse than none.
@@ -1287,7 +1292,11 @@ fn parse_init(body: &[u8]) -> Result<InitRequest, HttpReply> {
             format!("requestId must be {REQUEST_ID_MIN}–{REQUEST_ID_MAX} hex characters"),
         ));
     }
-    if request.game_id == 0 {
+    // An unpublished place has no ids at all, and that is a place worth
+    // giving a project to: it is keyed by `placeKey` instead of by ids
+    // (docs/places.md — "Unpublished places"). Half-identified is still a
+    // refusal, because nothing could route it
+    if request.game_id == 0 && request.place_id.unwrap_or(0) != 0 {
         return Err(HttpReply::error(400, "gameId is required"));
     }
 

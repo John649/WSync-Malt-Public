@@ -81,7 +81,17 @@ function Broker.shapeInitRequest(requestId: any, place: PlaceInfo): { [string]: 
 		return nil
 	end
 
+	-- An unpublished place has no ids at all (both 0). It can still have a
+	-- project: the app keys it by `placeKey` instead (docs/places.md —
+	-- "Unpublished places"). What it cannot be is half-identified, so a
+	-- non-number is still a refusal
 	if not isCountingNumber(place.gameId) or not isCountingNumber(place.placeId) then
+		return nil
+	end
+
+	local unpublished = place.gameId == 0 and place.placeId == 0
+
+	if not unpublished and (place.gameId :: number) == 0 then
 		return nil
 	end
 

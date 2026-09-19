@@ -660,6 +660,12 @@ function App:__runWait(state)
 		end
 
 		if match then
+			-- The project this window just created names a `placeKey` when the
+			-- place has no ids of its own. Remember it here as the scan path
+			-- does, or the marker is never written and the place forgets which
+			-- project it belongs to the moment it closes (docs/places.md)
+			self:__rememberPlace(match.hello.placeKey, match.port)
+
 			self:dispatch({
 				kind = "wait-found",
 				generation = generation,
