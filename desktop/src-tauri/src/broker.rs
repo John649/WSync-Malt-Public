@@ -922,6 +922,7 @@ impl Broker {
             request.place_id,
             request.game_id,
             place_key.as_deref(),
+            request.name.as_deref(),
         )
         .await?;
 
@@ -1458,6 +1459,7 @@ async fn write_attach_project(
     place_id: u64,
     game_id: u64,
     place_key: Option<&str>,
+    name: Option<&str>,
 ) -> Result<AttachProject, InitError> {
     let binary =
         crate::daemon::resolve_binary().map_err(|error| InitError::new(500, error.message))?;
@@ -1477,6 +1479,9 @@ async fn write_attach_project(
     }
     if let Some(place_key) = place_key {
         command.arg("--place-key").arg(place_key);
+    }
+    if let Some(name) = name.filter(|name| !name.trim().is_empty()) {
+        command.arg("--name").arg(name);
     }
 
     command

@@ -66,6 +66,11 @@ pub struct Open {
 	#[arg(long, hide = true, requires = "into")]
 	attach_only: bool,
 
+	/// The place's published title, for the scratch project's name (the
+	/// folder stays keyed by id); the desktop app passes what Studio reports
+	#[arg(long, hide = true)]
+	name: Option<String>,
+
 	/// The `placeKey` an attach project claims, for a place with no ids
 	/// (docs/places.md — "Unpublished places")
 	#[arg(long, hide = true, value_name = "KEY")]
@@ -118,7 +123,7 @@ impl Open {
 		std::fs::create_dir_all(&workspace)
 			.with_context(|| format!("Failed to create the attach project directory {}", workspace.to_string()))?;
 
-		let project = places::write_scratch_project(&workspace, place_id, self.universe, self.place_key.as_deref())?;
+		let project = places::write_scratch_project(&workspace, place_id, self.universe, self.place_key.as_deref(), self.name.as_deref())?;
 		// Whether the auto-delete rules would own this directory. The caller
 		// decides on `--ephemeral` from this, rather than guessing at the
 		// scratch roots from outside
@@ -300,7 +305,7 @@ impl Open {
 			)
 		})?;
 
-		let project = places::write_scratch_project(&workspace, Some(place_id), Some(universe), None)?;
+		let project = places::write_scratch_project(&workspace, Some(place_id), Some(universe), None, None)?;
 
 		// Only a directory this command owns by name may be auto-deleted, so
 		// `--into` is always a keep

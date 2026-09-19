@@ -649,6 +649,7 @@ pub fn write_scratch_project(
 	place_id: Option<u64>,
 	game_id: Option<u64>,
 	place_key: Option<&str>,
+	name: Option<&str>,
 ) -> Result<PathBuf> {
 	if place_id.is_none() && place_key.is_none() {
 		bail!("A scratch place project needs a place id or a place key to be addressed by");
@@ -680,7 +681,7 @@ pub fn write_scratch_project(
 	}
 
 	let project = json!({
-		"name": scratch_project_name(place_id, place_key),
+		"name": name.filter(|n| !n.trim().is_empty()).map(str::to_owned).unwrap_or_else(|| scratch_project_name(place_id, place_key)),
 		"scope": "code",
 		"initialSync": "keep",
 		"servePlaceIds": place_id.map(|id| vec![id]).unwrap_or_default(),
@@ -1086,7 +1087,7 @@ mod tests {
 	#[test]
 	fn an_unpublished_scratch_project_claims_a_key_and_no_ids() {
 		let dir = tempfile::tempdir().unwrap();
-		let path = write_scratch_project(dir.path(), None, None, Some("my-level-ab12cd34")).unwrap();
+		let path = write_scratch_project(dir.path(), None, None, Some("my-level-ab12cd34"), None).unwrap();
 		let project: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
 
 		assert_eq!(project["name"], json!("my-level-ab12cd34"));
@@ -1106,7 +1107,7 @@ mod tests {
 	fn a_scratch_project_needs_something_to_be_addressed_by() {
 		let dir = tempfile::tempdir().unwrap();
 
-		assert!(write_scratch_project(dir.path(), None, None, None).is_err());
+		assert!(write_scratch_project(dir.path(), None, None, None, None).is_err());
 	}
 
 	#[test]
@@ -1123,7 +1124,7 @@ mod tests {
 	#[test]
 	fn a_scratch_project_keeps_both_sides_where_they_are() {
 		let dir = tempfile::tempdir().unwrap();
-		let path = write_scratch_project(dir.path(), Some(1234567), Some(42), None).unwrap();
+		let path = write_scratch_project(dir.path(), Some(1234567), Some(42), None, None).unwrap();
 		let project: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
 
 		assert_eq!(project["name"], json!("place-1234567"));
@@ -1153,7 +1154,7 @@ mod tests {
 	#[test]
 	fn an_unknown_universe_leaves_the_key_out() {
 		let dir = tempfile::tempdir().unwrap();
-		let path = write_scratch_project(dir.path(), Some(99), None, None).unwrap();
+		let path = write_scratch_project(dir.path(), Some(99), None, None, None).unwrap();
 		let project: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
 
 		assert!(project.get("gameId").is_none());
