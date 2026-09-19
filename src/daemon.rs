@@ -57,6 +57,30 @@ pub struct RuntimeRecord {
 	pub ephemeral: bool,
 }
 
+
+impl RuntimeRecord {
+	/// A stand-in for a daemon that answered on its port but has no record on
+	/// disk — a cleanup removed it, or whatever started it keeps its records
+	/// somewhere this build does not read. What matters, where it serves and
+	/// on which port, comes from its own `/hello`; how it was started is
+	/// unknown and says so
+	pub fn unrecorded(canonical_project: &str, port: u16, boot_id: &str) -> Self {
+		Self {
+			version: 1,
+			project: canonical_project.to_owned(),
+			canonical_project: canonical_project.to_owned(),
+			pid: 0,
+			port,
+			boot_id: boot_id.to_owned(),
+			control_token: None,
+			managed_by: String::from("unrecorded"),
+			log_path: String::new(),
+			started_at: 0,
+			ephemeral: false,
+		}
+	}
+}
+
 /// `skip_serializing_if` for the ephemeral flag: an ordinary daemon's record
 /// keeps exactly the shape it had before place routing
 fn is_false(value: &bool) -> bool {

@@ -393,6 +393,10 @@ impl DaemonEntry {
 /// Reads every runtime record and probes the daemon each one names.
 ///
 /// Probes run in parallel: a stale record costs a full probe timeout, and a
+/// The loopback range a daemon may take, mirroring the plugin's own scan
+const PORT_SCAN_MIN: u16 = 7968;
+const PORT_SCAN_MAX: u16 = 7990;
+
 /// machine with a branch or two open has several of them.
 pub fn registry() -> Result<Vec<DaemonEntry>> {
 	// The CLI keeps its records under the local data dir; the desktop app
@@ -429,7 +433,7 @@ pub fn registry() -> Result<Vec<DaemonEntry>> {
 			})
 			.collect();
 
-		probes
+		let mut entries: Vec<DaemonEntry> = probes
 			.into_iter()
 			.map(|(record, handle)| {
 				let hello = handle
@@ -455,7 +459,46 @@ pub fn registry() -> Result<Vec<DaemonEntry>> {
 
 				DaemonEntry { record, hello, project }
 			})
-			.collect::<Vec<_>>()
+			.collect::<Vec<_>>();
+
+		// A record is written by whoever started the daemon, and it can be
+		// missing while the daemon is very much alive — a crash before it was
+		// written, a cleanup that removed it, a daemon started by something
+		// that keeps its records elsewhere. Listing only records makes this
+		// command answer "nothing is running" to an agent looking straight at
+		// a working Studio, so the port range is swept for the rest
+		let known: Vec<u16> = entries.iter().map(|entry| entry.record.port).collect();
+		let sweep: Vec<u16> = (PORT_SCAN_MIN..=PORT_SCAN_MAX)
+			.filter(|port| !known.contains(port))
+			.collect();
+		let found: Vec<_> = sweep
+			.into_iter()
+			.map(|port| (port, scope.spawn(move || probe(port))))
+			.collect();
+
+		for (port, handle) in found {
+			let Some(hello) = handle.join().ok().flatten() else {
+				continue;
+			};
+
+			let project = Project::load(Path::new(&hello.canonical_project))
+				.ok()
+				.map(|project| ProjectClaim {
+					name: project.name.clone(),
+					game_id: project.game_id,
+					place_ids: project.place_ids.clone(),
+					place_key: project.place_key.clone(),
+					branch: project.branch.clone(),
+				});
+
+			entries.push(DaemonEntry {
+				record: RuntimeRecord::unrecorded(&hello.canonical_project, port, &hello.boot_id),
+				hello: Some(hello),
+				project,
+			});
+		}
+
+		entries
 	});
 
 	Ok(entries)
