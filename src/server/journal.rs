@@ -72,8 +72,9 @@ use std::{
 	path::{Path, PathBuf},
 	sync::{
 		atomic::{AtomicBool, Ordering},
-		Mutex,
+		Arc, Mutex,
 	},
+	time::Duration,
 };
 
 use crate::{constants::BRANCHES_DIR, lock, server::bulk, server::AppState};
@@ -244,8 +245,10 @@ impl FinishDecision {
 
 		Some(format!(
 			"Branch {branch}'s Studio is closed and {} of its added subtree(s) never reached the journal on disk \
-			 ({}). Reopen it with `wsync branch up {branch}` and run the finish again — merging without those blobs \
-			 would drop the instances they carry",
+			 ({}). Reopen it with `wsync branch up {branch}` and run the finish again — the daemon pulls what the \
+			 plugin still holds the moment it reconnects, and the finish serializes anything else again from the \
+			 live tree. If that does not clear it, follow the wsync-branch-recovery skill. Merging without those \
+			 blobs would drop the instances they carry",
 			missing.len(),
 			missing.join(", ")
 		))
@@ -602,13 +605,49 @@ impl JournalStore {
 
 	/// Indexed ids with no bytes on disk, oldest first
 	pub fn pending_blobs(&self) -> Vec<String> {
+		self.pending_blob_records()
+			.into_iter()
+			.map(|record| record.id)
+			.collect()
+	}
+
+	/// The same, with each record's owner: a pull that finds the plugin no
+	/// longer holds an id can ask for the OWNER to be serialized again
+	pub fn pending_blob_records(&self) -> Vec<BlobRecord> {
 		let stored = self.stored_blobs();
 
 		self.blob_index()
 			.into_iter()
 			.filter(|record| !stored.contains(&record.id))
-			.map(|record| record.id)
 			.collect()
+	}
+
+	/// What `POST /journal/pull` answers: every indexed blob with its state,
+	/// and the ids still owed. `stored` is counted from the directory, so a
+	/// blob that arrived by push rather than pull counts the same
+	pub fn pull_report(&self) -> Value {
+		let stored = self.stored_blobs();
+		let records = self.blob_index();
+
+		let pending: Vec<Value> = records
+			.iter()
+			.filter(|record| !stored.contains(&record.id))
+			.map(|record| {
+				json!({
+					"id": record.id,
+					"owner": record.owner,
+					"error": record.error,
+				})
+			})
+			.collect();
+
+		json!({
+			"ok": true,
+			"indexed": records.len(),
+			"stored": records.iter().filter(|record| stored.contains(&record.id)).count(),
+			"blobsOnDisk": stored.len(),
+			"pending": pending,
+		})
 	}
 
 	/// A blob's bytes have arrived. Marks it stored and drops every blob an
@@ -718,8 +757,35 @@ pub async fn pump_blobs(state: AppState) {
 		return;
 	}
 
+	loop {
+		// Whatever way this pass ends — a panic in a pull, the task dropped
+		// with the runtime — the flag comes back down. It used to be cleared
+		// only by the last line of a pass that ran to completion, and a pass
+		// that did not left every later append believing a pull was still
+		// running: no blob was pulled again for the life of the daemon, and
+		// every one the plugin held expired
+		let pulling = PullingGuard(store.clone());
+
+		pull_pass(&state).await;
+
+		drop(pulling);
+
+		// An append that landed between the pass's last `wanted` check and
+		// the guard dropping saw `pulling` still set and went away expecting
+		// that pass to pick its ids up. Nobody would have: go round again
+		// for it, unless a newer pass has already taken the flag
+		if !store.wanted.load(Ordering::SeqCst) || store.pulling.swap(true, Ordering::SeqCst) {
+			return;
+		}
+	}
+}
+
+/// One pass over everything owed, repeated while appends keep arriving
+async fn pull_pass(state: &AppState) {
+	let store = state.journal.clone();
+
 	while store.wanted.swap(false, Ordering::SeqCst) {
-		let pending = store.pending_blobs();
+		let pending = store.pending_blob_records();
 
 		if pending.is_empty() {
 			continue;
@@ -727,8 +793,30 @@ pub async fn pump_blobs(state: AppState) {
 
 		debug!("Journal blobs: pulling {} blob(s) out of the plugin", pending.len());
 
-		for id in pending {
-			match pull_blob(&state, &id).await {
+		for record in pending {
+			let id = record.id;
+
+			let pulled = match pull_blob(state, &id).await {
+				Ok(bytes) => Ok(bytes),
+				Err(message) if should_recapture(&message) && record.owner.is_some() => {
+					// The plugin no longer holds these bytes — its pinned copy
+					// idled past the TTL while this daemon was down, wedged or
+					// restarted — but the instance they describe is still in
+					// its tree. Any serialization of an instance serves for
+					// any other, so it is captured again and stored under the
+					// id the event names
+					let owner = record.owner.as_deref().unwrap_or_default();
+
+					debug!("Journal blob {id}: {message}; asking the plugin to serialize {owner} again");
+
+					recapture_blob(state, owner)
+						.await
+						.map_err(|why| format!("{message}; recapture: {why}"))
+				}
+				Err(message) => Err(message),
+			};
+
+			match pulled {
 				Ok(bytes) => {
 					let stored = bytes.len();
 
@@ -749,7 +837,7 @@ pub async fn pump_blobs(state: AppState) {
 							// only seconds after the event instead of days
 							drop(
 								bulk::plugin_request(
-									&state,
+									state,
 									"branch_blob_close",
 									json!({ "artifactId": id }),
 									BLOB_OP_TIMEOUT_MS,
@@ -777,8 +865,106 @@ pub async fn pump_blobs(state: AppState) {
 			}
 		}
 	}
+}
 
-	store.pulling.store(false, Ordering::SeqCst);
+/// Clears the store's `pulling` flag however the pass that took it ends
+struct PullingGuard(Arc<JournalStore>);
+
+impl Drop for PullingGuard {
+	fn drop(&mut self) {
+		self.0.pulling.store(false, Ordering::SeqCst);
+	}
+}
+
+/// Whether a failed pull is one the plugin can answer by serializing the
+/// instance again: the id is gone from its store (closed, expired or never
+/// captured — `branch_blob_open`'s NOT_FOUND wording), as opposed to a
+/// plugin that is absent, a timeout, or bytes that arrived damaged
+pub fn should_recapture(message: &str) -> bool {
+	let lower = message.to_ascii_lowercase();
+
+	lower.contains("expired") || lower.contains("never captured") || lower.contains("no blob ")
+}
+
+/// `journal_recapture {ids: [owner]}` and a pull of the fresh id it answers
+/// with. The fresh pin is closed once the bytes are in hand; a plugin too old
+/// to know the op answers an error, which is reported like any other
+async fn recapture_blob(state: &AppState, owner: &str) -> Result<Vec<u8>, String> {
+	let answer = bulk::plugin_request(
+		state,
+		"journal_recapture",
+		json!({ "ids": [owner] }),
+		BLOB_OP_TIMEOUT_MS,
+	)
+	.await
+	.map_err(|error| error.to_string())?;
+
+	let fresh = answer
+		.get("blobs")
+		.and_then(|blobs| blobs.get(owner))
+		.and_then(|blob| blob.get("artifactId"))
+		.and_then(Value::as_str)
+		.map(str::to_owned);
+
+	let Some(fresh) = fresh else {
+		return Err(format!("the plugin no longer has {owner} in its tree"));
+	};
+
+	let pulled = pull_blob(state, &fresh).await;
+
+	drop(
+		bulk::plugin_request(
+			state,
+			"branch_blob_close",
+			json!({ "artifactId": fresh }),
+			BLOB_OP_TIMEOUT_MS,
+		)
+		.await,
+	);
+
+	pulled
+}
+
+// POST /journal/pull
+
+/// How long `POST /journal/pull` waits for a pass that is already running
+/// before it answers that it could not run one of its own
+const PULL_WAIT: Duration = Duration::from_secs(120);
+
+/// `POST /journal/pull` — one blob pull pass, run to completion, and the
+/// index afterwards. This is the pull `wsync branch repair` asks for: every
+/// other pass is a side effect of an append, and a daemon that came back
+/// after being down has no append to trigger one until the plugin next has
+/// something to say. Only a branch daemon keeps blobs (see `append`)
+pub async fn pull(State(state): State<AppState>) -> Response {
+	trace!("Received request: journal pull");
+
+	if state.core.project().branch.is_none() {
+		return error(
+			StatusCode::BAD_REQUEST,
+			"Only a branch daemon keeps journal blobs; this project names no branch",
+		);
+	}
+
+	let store = state.journal.clone();
+	let deadline = tokio::time::Instant::now() + PULL_WAIT;
+
+	// A pass already running is somebody else's; wait it out rather than
+	// answer with an index it is about to change
+	while store.pulling.load(Ordering::SeqCst) {
+		if tokio::time::Instant::now() >= deadline {
+			return error(
+				StatusCode::SERVICE_UNAVAILABLE,
+				"A blob pull pass has been running for over two minutes; try again once it finishes",
+			);
+		}
+
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	}
+
+	pump_blobs(state.clone()).await;
+
+	Json(store.pull_report()).into_response()
 }
 
 /// One blob, over the ops the CLI's own pull uses: `branch_blob_open` for the
@@ -1495,5 +1681,87 @@ mod tests {
 				missing: vec!["bb".to_owned()]
 			}
 		);
+	}
+
+	/// The refusal names the reopen — the one remedy that needs no manual
+	/// work — and the skill for everything past it
+	#[test]
+	fn a_refusal_names_the_reopen_and_the_recovery_skill() {
+		let decision = finish_decision(&[add("new:1", "aa")], &HashSet::new());
+		let refusal = decision.refusal("alpha").expect("a refusal");
+
+		assert!(refusal.contains("wsync branch up alpha"), "{refusal}");
+		assert!(refusal.contains("wsync-branch-recovery"), "{refusal}");
+	}
+
+	/// Only the plugin saying it no longer HOLDS the id is worth a second
+	/// serialization. An absent plugin, a timeout or a bad digest are not
+	#[test]
+	fn only_a_blob_the_plugin_has_lost_is_recaptured() {
+		assert!(should_recapture(
+			"no blob 0f3a (closed, expired, or never captured) — re-run branch_checkpoint [NOT_FOUND]"
+		));
+		assert!(should_recapture("blob 0f3a is closed, expired, or was never captured"));
+
+		assert!(!should_recapture("no Studio plugin connected"));
+		assert!(!should_recapture(
+			"No plugin response to branch_blob_read within 30000 ms"
+		));
+		assert!(!should_recapture("sha256 is aa, the plugin named bb"));
+		assert!(!should_recapture("the plugin sent 10 of 20 byte(s)"));
+	}
+
+	/// The pull report separates what is on disk from what is still owed,
+	/// and carries the owner and last failure of each owed id
+	#[test]
+	fn the_pull_report_lists_what_is_owed_with_its_owner() {
+		let (_dir, store) = store();
+
+		store.note_blobs(&blob_refs(&[add("new:1", "aa"), add("new:2", "bb")]));
+		store.store_blob("aa", b"bytes").expect("aa is stored");
+		store.blob_failed("bb", "no blob bb (closed, expired, or never captured)");
+
+		let report = store.pull_report();
+
+		assert_eq!(report["ok"], json!(true));
+		assert_eq!(report["indexed"], json!(2));
+		assert_eq!(report["stored"], json!(1));
+		assert_eq!(report["blobsOnDisk"], json!(1));
+		assert_eq!(report["pending"].as_array().map(Vec::len), Some(1));
+		assert_eq!(report["pending"][0]["id"], json!("bb"));
+		assert_eq!(report["pending"][0]["owner"], json!("new:2"));
+		assert!(report["pending"][0]["error"]
+			.as_str()
+			.is_some_and(|error| error.contains("expired")));
+	}
+
+	/// Pending records carry their owner, which is what a recapture asks for
+	#[test]
+	fn pending_records_name_their_owner() {
+		let (_dir, store) = store();
+
+		store.note_blobs(&blob_refs(&[add("new:7", "aa")]));
+
+		let pending = store.pending_blob_records();
+
+		assert_eq!(pending.len(), 1);
+		assert_eq!(pending[0].id, "aa");
+		assert_eq!(pending[0].owner.as_deref(), Some("new:7"));
+	}
+
+	/// The guard is what clears `pulling`, so a pass that unwinds early
+	/// leaves the store able to start another
+	#[test]
+	fn the_pulling_guard_releases_the_pass_when_dropped() {
+		let (_dir, store) = store();
+		let store = Arc::new(store);
+
+		assert!(!store.pulling.swap(true, Ordering::SeqCst));
+
+		{
+			let _guard = PullingGuard(store.clone());
+		}
+
+		assert!(!store.pulling.load(Ordering::SeqCst));
 	}
 }

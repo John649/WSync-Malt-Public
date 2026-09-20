@@ -369,6 +369,7 @@ impl Server {
 				post(journal::unmark).fallback(Self::default_redirect),
 			)
 			.route("/journal/marks", get(journal::marks).fallback(Self::default_redirect))
+			.route("/journal/pull", post(journal::pull).fallback(Self::default_redirect))
 			.route(
 				"/journal/blob/:blob_id",
 				get(journal::get_blob)

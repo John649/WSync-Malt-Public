@@ -1,0 +1,18 @@
+{
+  "name": "launch",
+  "title": "wsync launch",
+  "category": "Studio control",
+  "description": "Launches Roblox Studio on a place given as either a place file on disk or a cloud place id, without creating a project or starting a daemon.",
+  "usage": "wsync launch <placefile|placeId> [--universe <gameId>] [--project <path>] [--raw]",
+  "examples": [
+    "wsync launch ./build/game.rbxl",
+    "wsync launch 1234567890 --universe 9876543210",
+    "wsync launch 1234567890 --project .",
+    "wsync launch ./build/game.rbxl --raw"
+  ],
+  "notes": [
+    "An all-digit argument is a place id; anything else is a path to a .rbxl or .rbxlx file. A path that does not exist is tried with .rbxl and .rbxlx appended when smart paths are on, the way wsync studio resolves one; a file that is still missing is an error, never a place id.",
+    "A place id launches Studio through the roblox-studio: protocol URL (task:EditPlace), which needs the universe too: --universe, else a daemon on this machine that already claims the place, else --project's gameId. Nothing is attached: no scratch project is created and no daemon is started. Use wsync open for a place that should be addressable as soon as Studio connects, and wsync studio to launch Studio with no place.",
+    "Launching returns before the place has finished loading. --raw prints {\"ok\": true, \"launched\": true, \"pid\": <n>} with either \"file\" or \"placeId\", \"universeId\" and \"url\"; the pid is the process that was spawned, and Studio may re-exec itself into another."
+  ]
+}

@@ -6,6 +6,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- `wsync branch finish` no longer dies on an `add` whose blob expired out of
+  the plugin before the daemon pulled it: the live branch Studio serializes
+  the instance again (`journal_recapture`), and the daemon's own pull pass
+  does the same. Four causes of the pull never happening are closed: a pull
+  pass that unwound left its `pulling` flag set for the daemon's lifetime, a
+  restarted daemon had no trigger to pull what it missed (the plugin's
+  reconnect and `POST /journal/pull` now are), a flush past the 4096-event
+  bound was refused and requeued whole forever (it is posted in pieces), and
+  the blob refresh timer re-armed itself every ten seconds.
+- The replay into main's Studio goes over in chunks of 250 events and yields
+  inside a chunk, so it can no longer outlast the daemon's 8 s heartbeat and
+  be cut off mid-recording. A replay that stopped early, or that had to skip
+  a subtree it had no bytes for, is not committed: the git merge stays in
+  progress and the rerun resumes it. An `add` without its blob is skipped and
+  reported instead of being stood in for by an empty instance.
+- `finish` starts a branch daemon that is not answering instead of failing on
+  the connect, and gives the branch Studio 45 s to find it before deciding the
+  Studio is closed.
+- A container filled after it was added no longer merges with every child
+  twice. The root's refreshed blob already carries the children, and their own
+  `add` events now claim those instances instead of creating them again — in
+  `finish` and in `branch up`'s self-replay alike.
+- A branch clone reconnects on its own after its daemon is replaced. The
+  transport fails such a reconnect on purpose ("The daemon restarted —
+  reconnect to resync") and the app then only retried under the AutoReconnect
+  setting, off by default — so after `finish` restarted a dead daemon the
+  clone sat disconnected and the merge read it as a closed Studio.
+- An addition from disk adopts an untracked instance already standing at its
+  path instead of creating it again beside it. After a replay, the merged
+  files' rescan used to create a second copy of every container the replay
+  had just put in main, holding only the scripts.
+- On macOS, `branch rm` and `finish` now close a branch Studio that ignores
+  the polite signal, and `branch new` counts Studio windows by process name
+  rather than matching every `StudioMCP` proxy and crash handler as a window.
+
+### Added
+
+- `wsync launch <placefile|placeId>` opens a place in Studio from either a
+  `.rbxl` / `.rbxlx` file or a cloud place id (universe from `--universe`, a
+  daemon that claims the place, or `--project`'s `gameId`), and only
+  launches — no scratch project, no daemon. `wsync open` remains the attach
+  form and `wsync studio` the bare launch.
+- `wsync branch finish --allow-missing-blobs` commits a merge whose lost
+  subtrees were carried over by hand, and the `wsync-branch-recovery` skill
+  (`docs/skills/wsync-branch-recovery/SKILL.md`) is the manual ladder for a
+  merge the rerun does not clear.
+
 ### Changed
 
 - Generated agent instructions now use a concise contract with on-demand

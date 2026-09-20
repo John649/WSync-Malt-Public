@@ -40,6 +40,17 @@
 //! and it stops it before main is touched, naming `wsync branch up <name>`.
 //! Nothing here ever launches a Studio to rescue a merge.
 //!
+//! A LIVE BRANCH STUDIO CAN ALWAYS SERVE A BLOB. The plugin pins a subtree's
+//! bytes for ten minutes; a daemon that was down, wedged or restarted while
+//! the branch kept recording never pulled them, and by merge time neither
+//! side holds them — the first `sell-loot-menu` merge died exactly there,
+//! three instances in a row. But the INSTANCE is still in the branch's tree,
+//! and any serialization of it serves for any other, so `collect_blobs`
+//! asks the plugin to serialize it again (`journal_recapture {ids}`) before
+//! it calls anything unrecoverable, and stores what came back beside the
+//! journal so the next run reads it from disk. The manual ladder for
+//! everything past that lives in the `wsync-branch-recovery` skill.
+//!
 //! MORE THAN ONE LIVE BRANCH. Nothing here assumes a single branch, and the
 //! three places that could have are each pinned down:
 //!
@@ -144,6 +155,19 @@ const CONFLICT_EXIT: i32 = 3;
 /// Checkpoint and replay are whole-tree operations; they outlast the 5 s
 /// default remote-op deadline the way `copy` does
 const HEAVY_TIMEOUT_MS: u64 = 120_000;
+
+/// How long `finish` gives a branch Studio to find the daemon it just
+/// restarted before it decides the Studio is closed
+const RECONNECT_WAIT: Duration = Duration::from_secs(45);
+
+/// Events per `journal_replay` call. A replay runs on Studio's main thread,
+/// and one call carrying a whole map import ran past the daemon's 8 s pong
+/// deadline: the daemon dropped the plugin mid-recording, the CLI saw
+/// "plugin disconnected", and main was left half-replayed with its git
+/// merge pending. Calls this size finish in a fraction of that, the plugin's
+/// per-checkpoint ledger makes each one idempotent, and the conflict numbers
+/// are re-based here so `branch pick` sees one numbering across all of them
+const REPLAY_CHUNK: usize = 250;
 
 /// How long `new`/`up` wait for a freshly launched Studio's plugin to connect
 const PLUGIN_WAIT: Duration = Duration::from_secs(180);
@@ -363,6 +387,12 @@ struct Finish {
 	/// Also purge the worktree once the merge lands
 	#[arg(long)]
 	purge: bool,
+
+	/// Commit even if the replay had to skip added subtrees whose bytes exist
+	/// nowhere any more (they are listed). For a merge whose lost subtrees
+	/// were carried over by hand, per the wsync-branch-recovery skill
+	#[arg(long)]
+	allow_missing_blobs: bool,
 
 	/// Take the branch from an owner that is still running
 	#[arg(long)]
@@ -733,6 +763,16 @@ impl Up {
 			true,
 			self.raw,
 		)?;
+		// A self-replay that died mid-stream leaves the clone half rebuilt;
+		// the rerun's ledger picks up where it stopped
+		if let Some(stopped) = replayed.get("stopped").and_then(Value::as_str) {
+			bail!(
+				"Replaying branch `{}` into its own Studio stopped early: {stopped}. Run `wsync branch up {}` again",
+				record.name,
+				record.name
+			);
+		}
+
 		let conflicts = conflicts_of(&replayed);
 
 		if !conflicts.is_empty() {
@@ -893,6 +933,40 @@ impl Finish {
 		// nobody home is a note, not an error — the merge runs from disk.
 		// What it may NOT do is run from a disk that is missing a payload,
 		// which is the one case that sends the person back to `branch up`
+		// The branch daemon serves the journal and the blobs, and a daemon
+		// is the one part of a branch that can simply be started again: its
+		// state is the directory. A Studio is never launched from here
+		if !record.daemon_port.is_some_and(daemon_answers) {
+			let project = record.project(&main.project);
+			let (port, _) = spawn_daemon(&project)?;
+
+			record.daemon_port = Some(port);
+			record.write(&root)?;
+
+			if !self.raw {
+				wsync_info!(
+					"Branch {}'s daemon was not answering; started one on port {}",
+					record.name.bold(),
+					port.to_string().bold()
+				);
+			}
+
+			// A branch Studio that is open finds the new daemon on its own
+			// retry, not instantly. Without this pause the flush below runs
+			// before it has reconnected and the merge takes the closed-Studio
+			// path — and refuses, because the daemon that just started has
+			// pulled nothing yet. A Studio that really is closed costs the
+			// wait and nothing else
+			let branch = Client::connect(&record.targeting(&main.project))?;
+
+			if wait_for_plugin(&branch, RECONNECT_WAIT).is_err() && !self.raw {
+				wsync_info!(
+					"No branch Studio reconnected within {}s; merging from the journal on disk",
+					RECONNECT_WAIT.as_secs()
+				);
+			}
+		}
+
 		let branch = Client::connect(&record.targeting(&main.project))?;
 		let flush = branch.request_with_timeout("journal_flush", json!({}), HEAVY_TIMEOUT_MS)?;
 		let studio_closed = studio_is_closed(&flush);
@@ -1047,6 +1121,17 @@ impl Finish {
 				return Err(error);
 			}
 		};
+
+		// The plugin reports a replay that died mid-stream (`stopped`) and
+		// the subtrees it had no bytes for (`missingBlobs`) as ordinary
+		// fields of a successful op, because the ChangeHistory recording
+		// still closed cleanly. Neither is a merge to commit: the plugin's
+		// ledger makes the rerun skip what already landed, so the git merge
+		// is left in progress for it exactly as after a parked conflict
+		if let Some(incomplete) = replay_incomplete(&replayed, &record.name, self.allow_missing_blobs) {
+			resume(&client);
+			bail!("{incomplete}");
+		}
 
 		let conflicts = conflicts_of(&replayed);
 
@@ -1448,10 +1533,13 @@ fn studio_count() -> usize {
 		// silently reports zero Studios, so the cap would never fire on the
 		// one platform that cannot be checked from here.
 		//
-		// NOTE (unverified, needs a Mac): this counts PROCESSES. If macOS
-		// Studio hosts several open places in one process, eight branch
-		// windows there count as one and the cap still will not bite.
-		let output = Command::new("pgrep").args(["-f", "RobloxStudio"]).output();
+		// One process per window on macOS (verified: each open place is its
+		// own `RobloxStudio` process). Matched by exact process NAME, not by
+		// command line: `-f RobloxStudio` also matched every `StudioMCP`
+		// proxy, every `RobloxCrashHandler` and any wrapper that merely
+		// names the app path, and reported 25 windows on a Mac showing four —
+		// so `branch new` refused with the cap on a machine nowhere near it
+		let output = Command::new("pgrep").args(["-x", "RobloxStudio"]).output();
 
 		output
 			.map(|out| {
@@ -1995,26 +2083,97 @@ fn replay(
 	own: bool,
 	raw: bool,
 ) -> Result<Value> {
-	let events = journal.get("events").cloned().unwrap_or_else(|| json!([]));
-	let mut args = json!({
-		"checkpoint": checkpoint,
-		"events": events,
-		"blobs": blobs,
-		"decisions": decisions_map(decisions),
-	});
+	let events = journal
+		.get("events")
+		.and_then(Value::as_array)
+		.cloned()
+		.unwrap_or_default();
 
-	if own {
-		args["own"] = json!(true);
+	// Only the blobs a chunk's own events name travel with it: the whole
+	// map went with every call otherwise, and a merge is bounded by how much
+	// one request may carry
+	let all_blobs = blobs.as_object().cloned().unwrap_or_default();
+
+	let mut applied = 0;
+	let mut skipped = 0;
+	let mut already_applied = 0;
+	let mut conflicts: Vec<Value> = Vec::new();
+	let mut missing_blobs: Vec<Value> = Vec::new();
+	let mut stopped: Option<Value> = None;
+
+	for (index, chunk) in events.chunks(REPLAY_CHUNK.max(1)).enumerate() {
+		let offset = (index * REPLAY_CHUNK) as u64;
+
+		let chunk_blobs: serde_json::Map<String, Value> = chunk
+			.iter()
+			.filter_map(|event| event.get("blob").and_then(Value::as_str))
+			.filter_map(|id| all_blobs.get(id).map(|payload| (id.to_owned(), payload.clone())))
+			.collect();
+
+		let mut args = json!({
+			"checkpoint": checkpoint,
+			"events": chunk,
+			"blobs": Value::Object(chunk_blobs),
+			"decisions": decisions_map(decisions, offset, chunk.len() as u64),
+		});
+
+		if own {
+			args["own"] = json!(true);
+		}
+
+		let answer = client
+			.request_with_timeout("journal_replay", args, HEAVY_TIMEOUT_MS)?
+			.into_value(raw)?;
+
+		applied += answer.get("applied").and_then(Value::as_u64).unwrap_or(0);
+		skipped += answer.get("skipped").and_then(Value::as_u64).unwrap_or(0);
+		already_applied += answer.get("alreadyApplied").and_then(Value::as_u64).unwrap_or(0);
+
+		for mut conflict in conflicts_of(&answer) {
+			// The plugin numbers a conflict by its index in THIS call's
+			// events; `branch pick` and decisions.json need one numbering
+			// across the whole journal
+			if let Some(n) = conflict.get("n").and_then(Value::as_u64) {
+				conflict["n"] = json!(n + offset);
+			}
+
+			conflicts.push(conflict);
+		}
+
+		if let Some(missing) = answer.get("missingBlobs").and_then(Value::as_array) {
+			missing_blobs.extend(missing.iter().cloned());
+		}
+
+		// A chunk that died mid-stream is reported and the rest is not
+		// attempted: the rerun's ledger skips what landed, and what did not
+		// land is replayed in order from the event that failed
+		if let Some(why) = answer.get("stopped").filter(|why| !why.is_null()) {
+			stopped = Some(why.clone());
+			break;
+		}
 	}
 
-	client
-		.request_with_timeout("journal_replay", args, HEAVY_TIMEOUT_MS)?
-		.into_value(raw)
+	let mut summary = json!({
+		"applied": applied,
+		"skipped": skipped,
+		"alreadyApplied": already_applied,
+		"conflicts": conflicts,
+		"missingBlobs": missing_blobs,
+		"own": own,
+	});
+
+	if let Some(why) = stopped {
+		summary["stopped"] = why;
+	}
+
+	Ok(summary)
 }
 
 /// decisions.json keeps an ordered list, because a human reads it; the plugin
-/// indexes the same decisions by event number
-fn decisions_map(decisions: &[Value]) -> Value {
+/// indexes the same decisions by event number — within the call, so a
+/// decision for event `n` of the whole journal is keyed `n - offset` for the
+/// chunk that carries it and left out of every other
+fn decisions_map(decisions: &[Value], offset: u64, len: u64) -> Value {
 	let mut map = serde_json::Map::new();
 
 	for decision in decisions {
@@ -2022,7 +2181,9 @@ fn decisions_map(decisions: &[Value]) -> Value {
 			decision.get("n").and_then(Value::as_u64),
 			decision.get("side").and_then(Value::as_str),
 		) {
-			map.insert(n.to_string(), json!(side));
+			if n > offset && n <= offset + len {
+				map.insert((n - offset).to_string(), json!(side));
+			}
 		}
 	}
 
@@ -2112,14 +2273,54 @@ fn collect_blobs(client: &Client, journal: &Value, source: BlobSource, raw: bool
 			}
 		}
 
-		let Some(payload) = payload else {
-			match source {
+		// Neither disk nor the plugin's pinned store has any serialization of
+		// this instance. With a live Studio that is not the end: the instance
+		// is still in its tree, and serializing it again is the same bytes
+		// the original `add` would have carried
+		let payload = match payload {
+			Some(payload) => payload,
+			None if source == BlobSource::PluginRequired => match recapture(client, &owner, raw) {
+				Ok(Some(bytes)) => {
+					wsync_warn!(
+						"Journal blob(s) {} for {owner} had expired everywhere; the branch Studio serialized it again",
+						ids.join(", ")
+					);
+
+					// Beside the journal, under the id the newest event
+					// names, so a rerun after `branch pick` — or after this
+					// Studio closes — reads it from disk like any other
+					if let Some(newest) = ids.last() {
+						if let Err(error) = upload_blob(port, newest, &bytes) {
+							wsync_warn!("The recaptured blob for {owner} was not stored beside the journal: {error}");
+						}
+					}
+
+					bytes
+				}
+				Ok(None) => {
+					let (id, error) = refusal.expect("a required pull that found nothing reports why");
+
+					return Err(error.context(format!(
+						"Journal blob {id} could not be drained for the replay, and {owner} is no longer in the \
+						 branch Studio's tree to serialize again"
+					)));
+				}
+				Err(error) => {
+					let (id, cause) = refusal.expect("a required pull that found nothing reports why");
+
+					return Err(cause.context(format!(
+						"Journal blob {id} could not be drained for the replay, and serializing {owner} again failed: \
+						 {error:#}"
+					)));
+				}
+			},
+			None => match source {
 				BlobSource::DiskOnly => bail!(
 					"Branch instance {owner}'s subtree is not in the journal on disk ({}) and this branch's Studio \
 					 is closed, so there is nowhere left to read it from",
 					ids.join(", ")
 				),
-				BlobSource::PluginOptional => {
+				_ => {
 					wsync_warn!(
 						"Journal blob(s) {} for {owner} are no longer pinned, so its `add` will be skipped",
 						ids.join(", ")
@@ -2127,12 +2328,7 @@ fn collect_blobs(client: &Client, journal: &Value, source: BlobSource, raw: bool
 
 					continue;
 				}
-				BlobSource::PluginRequired => {
-					let (id, error) = refusal.expect("a required pull that found nothing reports why");
-
-					return Err(error.context(format!("Journal blob {id} could not be drained for the replay")));
-				}
-			}
+			},
 		};
 
 		let encoded = json!(base64::engine::general_purpose::STANDARD.encode(payload));
@@ -2196,6 +2392,108 @@ fn blobs_missing_on_disk(journal: &Value) -> FinishDecision {
 		.unwrap_or_default();
 
 	finish_decision(&events, &on_disk)
+}
+
+/// Why a replay's answer must not be committed, or `None` when it may be.
+/// Both cases leave the git merge in progress and name the rerun
+fn replay_incomplete(replayed: &Value, name: &str, allow_missing_blobs: bool) -> Option<String> {
+	let applied = replayed.get("applied").and_then(Value::as_u64).unwrap_or(0);
+
+	if let Some(stopped) = replayed.get("stopped").and_then(Value::as_str) {
+		return Some(format!(
+			"The replay into main's Studio stopped early after {applied} event(s): {stopped}. Nothing was committed; \
+			 run `wsync branch finish {name}` again — the plugin's ledger skips what already landed"
+		));
+	}
+
+	let missing: Vec<&str> = replayed
+		.get("missingBlobs")
+		.and_then(Value::as_array)
+		.map(|ids| ids.iter().filter_map(Value::as_str).collect())
+		.unwrap_or_default();
+
+	if missing.is_empty() {
+		return None;
+	}
+
+	if allow_missing_blobs {
+		wsync_warn!(
+			"The replay skipped {} added subtree(s) whose bytes were not supplied ({}); committing anyway, as asked",
+			missing.len(),
+			missing.join(", ")
+		);
+
+		return None;
+	}
+
+	Some(format!(
+		"The replay skipped {} added subtree(s) whose bytes were not supplied ({}), so main is missing instances the \
+		 branch has. Nothing was committed; see the `wsync-branch-recovery` skill, then run `wsync branch finish \
+		 {name}` again (or with `--allow-missing-blobs` once they were carried over by hand)",
+		missing.len(),
+		missing.join(", ")
+	))
+}
+
+#[cfg(test)]
+mod replay_tests {
+	use super::*;
+
+	/// A replay that ran to the end with every blob in hand may be committed
+	#[test]
+	fn a_complete_replay_is_committed() {
+		let answer = json!({ "applied": 3, "skipped": 0, "conflicts": [], "missingBlobs": [] });
+
+		assert_eq!(replay_incomplete(&answer, "alpha", false), None);
+	}
+
+	/// `stopped` is the plugin's pcall catching an error mid-stream: the
+	/// answer is otherwise a success envelope, and used to be committed
+	#[test]
+	fn a_replay_that_stopped_early_is_not_committed() {
+		let answer = json!({ "applied": 3, "stopped": "attempt to index nil", "missingBlobs": [] });
+		let why = replay_incomplete(&answer, "alpha", false).expect("refused");
+
+		assert!(why.contains("stopped early after 3 event(s)"), "{why}");
+		assert!(why.contains("attempt to index nil"), "{why}");
+		assert!(why.contains("wsync branch finish alpha"), "{why}");
+	}
+
+	/// A skipped subtree is a merge that lost instances, unless the caller
+	/// says those were carried over another way
+	#[test]
+	fn a_replay_that_dropped_a_subtree_is_not_committed_unless_allowed() {
+		let answer = json!({ "applied": 3, "missingBlobs": ["aa", "bb"] });
+
+		let why = replay_incomplete(&answer, "alpha", false).expect("refused");
+
+		assert!(why.contains("2 added subtree(s)"), "{why}");
+		assert!(why.contains("aa, bb"), "{why}");
+		assert!(why.contains("--allow-missing-blobs"), "{why}");
+
+		assert_eq!(replay_incomplete(&answer, "alpha", true), None);
+	}
+
+	/// Decisions are keyed by the event's number within the chunk that
+	/// carries it, and left out of every other chunk
+	#[test]
+	fn decisions_are_rekeyed_per_chunk() {
+		let decisions = vec![
+			json!({ "n": 1, "side": "ours" }),
+			json!({ "n": 250, "side": "theirs" }),
+			json!({ "n": 251, "side": "ours" }),
+			json!({ "n": 600, "side": "theirs" }),
+		];
+
+		let first = decisions_map(&decisions, 0, 250);
+		assert_eq!(first, json!({ "1": "ours", "250": "theirs" }));
+
+		let second = decisions_map(&decisions, 250, 250);
+		assert_eq!(second, json!({ "1": "ours" }));
+
+		let third = decisions_map(&decisions, 500, 250);
+		assert_eq!(third, json!({ "100": "theirs" }));
+	}
 }
 
 fn conflicts_of(replayed: &Value) -> Vec<Value> {
@@ -2639,6 +2937,44 @@ fn pull_blob(client: &Client, artifact: &str, raw: bool) -> Result<Vec<u8>> {
 	pull_parts(client, artifact, bytes, &sha, raw)
 }
 
+/// `journal_recapture {ids: [owner]}`: the branch plugin serializes the
+/// instance again and pins the bytes under a fresh id, which is pulled and
+/// closed here. `Ok(None)` when the plugin answers that the instance is no
+/// longer in its tree — or is too old to know the op, which for a merge
+/// means the same thing: nothing more can be had from this Studio
+fn recapture(client: &Client, owner: &str, raw: bool) -> Result<Option<Vec<u8>>> {
+	let answer = client.request_with_timeout("journal_recapture", json!({ "ids": [owner] }), HEAVY_TIMEOUT_MS)?;
+
+	if !answer.ok {
+		wsync_warn!(
+			"The branch plugin could not serialize {owner} again: {} [{}]",
+			answer.error_message(),
+			answer.error_code()
+		);
+
+		return Ok(None);
+	}
+
+	let value = answer.into_value(raw)?;
+
+	let Some(fresh) = value
+		.get("blobs")
+		.and_then(|blobs| blobs.get(owner))
+		.and_then(|blob| blob.get("artifactId"))
+		.and_then(Value::as_str)
+		.map(str::to_owned)
+	else {
+		return Ok(None);
+	};
+
+	let pulled = pull_blob(client, &fresh, raw);
+
+	// Closed whether or not the pull landed: the pin was for this one read
+	client.request("branch_blob_close", json!({ "artifactId": fresh })).ok();
+
+	pulled.map(Some)
+}
+
 /// Names the service, the blob, the reader and the real cause — the top-level
 /// error printer shows `Display` only, so anyhow's context chain would
 /// otherwise swallow exactly the part that says what went wrong
@@ -3026,7 +3362,31 @@ fn kill_tree(pid: u32) {
 	}
 
 	#[cfg(not(target_os = "windows"))]
-	crate::util::kill_process(pid);
+	{
+		// A polite SIGTERM first: Studio may take it as a close request.
+		// Then the force the Windows arm has always applied (`taskkill /F`):
+		// Roblox Studio on macOS survived the plain `kill` in `kill_process`
+		// and stayed open, plugin still attached to a daemon `rm` had just
+		// stopped. Nothing is lost by the SIGKILL — the clone is immutable
+		// and the journal is on disk
+		crate::util::kill_process(pid);
+
+		for _ in 0..10 {
+			if !process_alive(pid) {
+				return;
+			}
+
+			thread::sleep(Duration::from_millis(300));
+		}
+
+		Command::new("kill")
+			.args(["-9", &pid.to_string()])
+			.stdin(Stdio::null())
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.status()
+			.ok();
+	}
 }
 
 #[cfg(all(test, unix))]

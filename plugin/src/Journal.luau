@@ -118,6 +118,16 @@ Journal.CONTENT_SERVICES = {
 
 Journal.FLUSH_SECONDS = 2
 Journal.BLOB_REFRESH_SECONDS = 10
+-- The daemon answers 400 to any `POST /journal/append` past this many events
+-- (`APPEND_MAX_EVENTS` in src/server/journal.rs). A flush that grew past it
+-- — one map import is thousands of adds — used to be re-sent whole, refused
+-- whole and requeued whole on every timer tick, so nothing ever reached the
+-- daemon again and every blob the batch named expired unpulled. Batches are
+-- cut at this size and posted in sequence order instead.
+Journal.APPEND_MAX_EVENTS = 4096
+-- How long a replay may hold the Lua thread before it yields once so the
+-- socket can answer the daemon's heartbeat (see `Journal.replay`).
+Journal.REPLAY_YIELD_SECONDS = 0.2
 -- How many instances the initial observation pass connects before it yields.
 -- Connecting two signals on every instance of a 157k-instance place in one
 -- synchronous go would blow the remote op's timeout and freeze Studio's main
@@ -196,6 +206,15 @@ local marks: { [string]: number } = {}
 -- the only thing a rerun reconsiders.
 local replayApplied: { [string]: { [number]: boolean } } = {}
 local replayCreated: { [string]: { [string]: Instance } } = {}
+-- Per checkpoint: the ids whose instance a replay built FROM A BLOB, and the
+-- children of those instances that a later child `add` has claimed. A root's
+-- blob is re-captured while the branch works, so by merge time it carries the
+-- children that were added under it — and each of those children has an
+-- `add` of its own in the stream. Without this ledger the replay created
+-- every one of them a second time (a folder filled after it was added merged
+-- with each part twice)
+local replayFromBlob: { [string]: { [string]: boolean } } = {}
+local replayClaimed: { [string]: { [Instance]: boolean } } = {}
 
 local connections: { RBXScriptConnection } = {}
 local subscribedTags: { [string]: boolean } = {}
@@ -769,6 +788,8 @@ function Journal.adoptShape(shape: Shape, services: { Instance }?): { [string]: 
 	table.clear(sessionAdded)
 	table.clear(replayApplied)
 	table.clear(replayCreated)
+	table.clear(replayFromBlob)
+	table.clear(replayClaimed)
 
 	newCounter = 0
 	numberCounter = 0
@@ -1227,7 +1248,71 @@ local function refreshBlobs()
 			blob = blobId,
 			update = true,
 		})
+
+		-- The refresh's own `add` is an emit like any other, and left alone it
+		-- would count as "something happened since the last capture" on the
+		-- next tick: every added root was re-serialized, re-pinned and
+		-- re-pulled every ten seconds for as long as the branch stayed open,
+		-- a new blob id and a new journal line each time. Only an edit after
+		-- THIS event makes the subtree worth capturing again.
+		root.capturedTick = emitTick
 	end
+end
+
+--- Serialize named instances again, right now, and pin the bytes under fresh
+--- ids — without emitting anything. This is the recovery path for a blob
+--- nobody holds any more: the plugin's pinned copy idled past its TTL before
+--- the daemon pulled it (a daemon that was down, wedged or restarted), and
+--- the merge is left naming bytes that exist nowhere. The instance itself is
+--- still in this Studio's tree, so its subtree can simply be captured again;
+--- an instance's serializations are interchangeable, and the caller ships
+--- the new bytes under whichever ids its events name.
+---
+--- Returns `{blobs = {[id] = {artifactId, bytes, sha256}}, missing = {id}}`.
+--- An id that is not in the tree — removed, or never numbered here — is
+--- listed under `missing` rather than failing the call, so one lost
+--- instance does not stop the others being recovered.
+function Journal.recapture(ids: { string }): { [string]: any }
+	local captured: { [string]: { [string]: any } } = {}
+	local missing: { string } = {}
+
+	for _, id in ids do
+		local instance = byId[id]
+
+		if instance == nil or not instance:IsDescendantOf(game) then
+			table.insert(missing, id)
+			continue
+		end
+
+		local blobId = Journal.captureBlob(instance)
+		local info = if blobId ~= nil then Journal.blobInfo(blobId) else nil
+
+		if blobId == nil or info == nil then
+			table.insert(missing, id)
+			continue
+		end
+
+		local root = addedRoots[id]
+
+		if root ~= nil then
+			root.blobId = blobId
+			root.capturedAt = os.clock()
+			root.capturedTick = emitTick
+
+			-- An `add` still waiting to go out carries the fresh id from here
+			-- on, so the daemon's own pull lands on bytes that exist
+			local existing = pending[coalesceKey(id, "add", {})]
+
+			if existing ~= nil then
+				existing.blob = blobId
+				existing.t = nowMillis()
+			end
+		end
+
+		captured[id] = { artifactId = blobId, bytes = info.bytes, sha256 = info.sha256 }
+	end
+
+	return { blobs = captured, missing = missing }
 end
 
 --------------------------------------------------------------------------------
@@ -1308,21 +1393,41 @@ function Journal.flush(): { flushed: number, pending: number }
 	local scheme = if endpoint.https then "https" else "http"
 	local url = `{scheme}://{endpoint.host}:{endpoint.port}/journal/append`
 
-	local ok = pcall(function()
-		Http.postJson(url, { checkpoint = checkpointId, events = batch }):expect()
-	end)
+	-- In sequence order and in bounded pieces. A piece that fails goes back
+	-- along with everything after it, so the stream never receives a later
+	-- piece before an earlier one and the retry starts where this one stopped.
+	local flushed = 0
+	local total = #batch
+	local from = 1
 
-	if not ok then
-		requeue(batch)
-		Log.debug(`Journal: /journal/append failed, {#batch} events requeued`)
+	while from <= total do
+		local to = math.min(from + Journal.APPEND_MAX_EVENTS - 1, total)
+		local piece = table.move(batch, from, to, 1, {})
 
-		return { flushed = 0, pending = pendingCount }
+		local ok = pcall(function()
+			Http.postJson(url, { checkpoint = checkpointId, events = piece }):expect()
+		end)
+
+		if not ok then
+			requeue(table.move(batch, from, total, 1, {}))
+			Log.debug(`Journal: /journal/append failed, {total - from + 1} events requeued ({flushed} sent first)`)
+
+			if flushed > 0 then
+				flushedTotal += flushed
+				lastFlushAt = os.clock()
+			end
+
+			return { flushed = flushed, pending = pendingCount }
+		end
+
+		flushed += #piece
+		from = to + 1
 	end
 
-	flushedTotal += #batch
+	flushedTotal += flushed
 	lastFlushAt = os.clock()
 
-	return { flushed = #batch, pending = pendingCount }
+	return { flushed = flushed, pending = pendingCount }
 end
 
 --- The recorder's last word, run from `plugin.Unloading`.
@@ -2449,7 +2554,10 @@ local function applyEvent(
 	event: Event,
 	instance: Instance?,
 	blobData: { [string]: any },
-	created: { [string]: Instance }
+	created: { [string]: Instance },
+	dropped: { string },
+	fromBlobIds: { [string]: boolean },
+	claimed: { [Instance]: boolean }
 ): boolean
 	local op = event.op
 
@@ -2468,7 +2576,43 @@ local function applyEvent(
 			return false
 		end
 
+		-- A child whose parent this replay built from a blob has very likely
+		-- ARRIVED INSIDE THAT BLOB already: the root is re-serialized while
+		-- the branch works, so its last capture carries everything added
+		-- under it, and the child's own `add` is the same instance told a
+		-- second time. It is claimed rather than created — the first
+		-- unclaimed child of that name and class, in `GetChildren` order,
+		-- which is the order the adds were journalled in — and bound to the
+		-- id the branch knows it by, so every later event for it resolves.
+		-- A child the blob predates (added after the last refresh) matches
+		-- nothing and is created below, as before
+		if event.blob == nil and fromBlobIds[event.parent] then
+			for _, child in parent:GetChildren() do
+				if child.Name == event.name and child.ClassName == event.class and not claimed[child] then
+					claimed[child] = true
+					created[event.id] = child
+					byId[event.id] = child
+					reserveId(event.id)
+
+					return true
+				end
+			end
+		end
+
 		local subject = fromBlob(blobData[event.blob])
+
+		-- An `add` that NAMES a blob is a subtree, and a subtree whose bytes
+		-- did not travel must not be stood in for by an empty instance of the
+		-- right class and name: that is exactly the silent loss the journal
+		-- exists to prevent, and it looked like success ("applied") to every
+		-- caller. Skipped, and reported, so the merge can refuse to commit.
+		-- A later `add` for the same id with a blob that did travel (a
+		-- refresh) still creates it.
+		if subject == nil and type(event.blob) == "string" then
+			table.insert(dropped, event.blob)
+
+			return false
+		end
 
 		if subject == nil then
 			local ok, fresh = pcall(function()
@@ -2501,6 +2645,10 @@ local function applyEvent(
 		end
 
 		created[event.id] = added
+
+		if subject ~= nil and type(event.blob) == "string" then
+			fromBlobIds[event.id] = true
+		end
 
 		-- Registered under the id the journal gave it, so every later event in
 		-- the same stream resolves. The session counters are pushed past it so
@@ -2637,14 +2785,37 @@ function Journal.replay(
 		replayApplied[checkpoint] = done
 	end
 
+	local fromBlobIds = replayFromBlob[checkpoint]
+
+	if fromBlobIds == nil then
+		fromBlobIds = {}
+		replayFromBlob[checkpoint] = fromBlobIds
+	end
+
+	local claimed = replayClaimed[checkpoint]
+
+	if claimed == nil then
+		claimed = {}
+		replayClaimed[checkpoint] = claimed
+	end
+
 	local conflicts: { Conflict } = {}
 	local applied = 0
 	local skipped = 0
 	local alreadyApplied = 0
+	local missingBlobs: { string } = {}
 
 	local label = if reconstructing then "branch restore" else "branch replay"
 
 	local recordingId = tryBeginRecording(`WSync: {label} {checkpoint}`)
+
+	-- The op runs in its own coroutine, but a coroutine that never yields
+	-- still owns Studio's one Lua thread: the socket cannot answer the
+	-- daemon's 2 s pings, the daemon closes the connection at 8 s, and a
+	-- replay the size of a map import was cut off mid-recording with "plugin
+	-- disconnected" — main half-replayed, git merge pending. A short yield
+	-- every fraction of a second lets the frame loop pong in between
+	local lastYield = os.clock()
 
 	local wasMuted = muted
 	muted = reconstructing
@@ -2712,11 +2883,16 @@ function Journal.replay(
 				continue
 			end
 
-			if applyEvent(event, instance, blobsIn, created) then
+			if applyEvent(event, instance, blobsIn, created, missingBlobs, fromBlobIds, claimed) then
 				done[stamp] = true
 				applied += 1
 			else
 				skipped += 1
+			end
+
+			if os.clock() - lastYield >= Journal.REPLAY_YIELD_SECONDS then
+				task.wait()
+				lastYield = os.clock()
 			end
 		end
 	end)
@@ -2739,6 +2915,9 @@ function Journal.replay(
 		alreadyApplied = alreadyApplied,
 		conflicts = conflicts,
 		own = reconstructing,
+		-- Blob ids that `add` events named and nobody supplied: each is a
+		-- subtree that did NOT land. Empty on a merge that carried everything
+		missingBlobs = missingBlobs,
 		stopped = if ok then nil else tostring(caught),
 	}
 end

@@ -13,6 +13,9 @@
 --                                          start the journal
 --   journal_flush {}                both   push everything pending now
 --   journal_status {}               both   what the recorder is holding
+--   journal_recapture {ids}         branch serialize named instances again
+--                                          and pin the bytes under fresh ids,
+--                                          for a blob nobody holds any more
 --   journal_replay {checkpoint,     main   apply a branch's stream inside one
 --                   events, blobs,         ChangeHistory recording and report
 --                   decisions}             the conflicts it skipped
@@ -344,6 +347,35 @@ end
 --- `journal_flush {}` → `{flushed, pending}`.
 function BranchOps.ops.journal_flush(_args: Args, _ctx)
 	return Journal.flush()
+end
+
+--- `journal_recapture {ids}` → `{blobs = {[id] = {artifactId, bytes,
+--- sha256}}, missing = {id}}`. The recovery path for an `add` whose blob
+--- expired out of this store before the daemon pulled it: the instance is
+--- still in the tree, so it is serialized again and pinned under a new id,
+--- which the caller pulls with `branch_blob_open`/`branch_blob_read` exactly
+--- like the original. Nothing is journalled by this op. An id no longer in
+--- the tree is reported under `missing`, not raised.
+function BranchOps.ops.journal_recapture(args: Args, _ctx)
+	local ids = args.ids
+
+	if type(ids) ~= "table" or #ids == 0 then
+		invalid("ids must be a non-empty array of journal ids")
+	end
+
+	if #ids > 256 then
+		invalid("at most 256 ids per journal_recapture")
+	end
+
+	for _, id in ids do
+		if type(id) ~= "string" or id == "" then
+			invalid("every id must be a non-empty string")
+		end
+	end
+
+	serializationService()
+
+	return Journal.recapture(ids)
 end
 
 --- `journal_status {}` → what the recorder is holding.

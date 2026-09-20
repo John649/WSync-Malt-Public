@@ -55,6 +55,7 @@
     "get",
     "init",
     "install",
+    "launch",
     "lint",
     "logs",
     "ls",

@@ -197,6 +197,15 @@ async fn plugin_connection(state: AppState, mut socket: WebSocket, hello: Client
 	// §10.6) — debounced, on the blocking pool, and warn-only on failure
 	crate::cli::refresh::auto_refresh_on_connect(core.clone());
 
+	// A branch daemon pulls each `add`'s blob when the append that names it
+	// lands — so a daemon that was down or restarted while its Studio kept
+	// recording owes blobs with no append left to trigger a pull for them,
+	// and the plugin's pinned copies expire ten minutes after they were last
+	// touched. The reconnect is the trigger the append is not
+	if core.project().branch.is_some() && !state.journal.pending_blobs().is_empty() {
+		tokio::spawn(crate::server::journal::pump_blobs(state.clone()));
+	}
+
 	// Push results are reported strictly in application order through a
 	// dedicated FIFO pump so overlapping pushes cannot reorder their acks
 	let (result_tx, mut result_rx) =

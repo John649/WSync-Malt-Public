@@ -184,6 +184,7 @@
         "wsync branch ls --project . --raw",
         "wsync branch up reward-rooms --project .",
         "wsync branch finish reward-rooms --project .",
+        "wsync branch finish reward-rooms --allow-missing-blobs --project .",
         "wsync branch pick reward-rooms 2 theirs --project .",
         "wsync branch rm reward-rooms --purge --project ."
       ],
@@ -193,6 +194,7 @@
         "The clone is immutable and the journal is the state, so up reopens the clone, adopts the numbering again and replays the branch's own journal into its own Studio. Nothing is rewritten on autosave.",
         "Finish commits the worktree, then commits exactly the files main has changed that the branch also touched (the daemon regenerates the agent docs on every plugin connect, which would otherwise make git refuse the merge outright); unrelated changes in main are left alone and counted. It then runs git merge --no-ff --no-commit in the main checkout, flushes the branch journal, pauses main's sync, and replays the events into main's Studio. Git conflicts and replay conflicts both stop the merge and exit 3; replay conflicts are parked in .wsync-branches/<name>/conflicts.json.",
         "Pick writes .wsync-branches/<name>/decisions.json; ours keeps main's value, theirs takes the branch's. Run branch finish again to apply the rest: that rerun resumes the merge git already has in progress instead of starting another, skipping the parking commit that git would reject as a partial commit mid-merge. A merge someone already committed is treated as done, not as a failure, and both files are cleared once the branch is finished.",
+        "A merge is not committed when the replay stopped early or had to skip an added subtree whose bytes exist nowhere any more; the git merge stays in progress and a rerun resumes it, the plugin's per-checkpoint ledger skipping what already landed. Before a subtree is called lost, finish asks the live branch Studio to serialize the instance again (journal_recapture), because its pinned copy expires ten minutes after the daemon last touched it and a daemon that was down or restarted never pulled it; a branch daemon that is not answering is started again first. The replay itself goes over in chunks of 250 events so no single call outlasts the daemon's heartbeat. --allow-missing-blobs commits anyway, for subtrees carried over by hand; the wsync-branch-recovery skill is the manual ladder for everything the rerun does not clear.",
         "The merge commit is scoped to git diff --name-only HEAD...MERGE_HEAD plus the conflicted paths. The branch directory is never added, and the main checkout's sync is resumed whether the replay succeeded or failed. Main's own project file is restored from HEAD before the commit, so a merge never hands main the branch's name, branch field or synthetic place ID. WSync does not request a programmatic place save. Branch state is preserved by the serialized clone and journal until explicitly purged; save merged instance changes through main Studio's native save controls when needed.",
         "Rm stops the Studio and the daemon and keeps the worktree, the clone and the journal. --purge also removes the worktree, deletes the branch wsync/<name> and the directory, and refuses a dirty worktree unless --force.",
         "One owner per branch is recorded in branch.json. A branch whose owner process is gone is adopted by the next command; a branch whose owner is still running is refused unless --steal. At most three branch Studios are live at once (--budget overrides), because past Roblox's window cap a launch succeeds into a windowless stub; a refusal names branch rm.",
@@ -1032,6 +1034,24 @@
         "When no daemon serves the place, a scratch project is created under `<projectsRoot>/_places/<placeId>` and its daemon is started, so the place is addressable as soon as Studio connects; the scratch project deletes itself when Studio closes. `--keep` keeps it, `--into <dir>` puts it elsewhere (never auto-deleted), and `--no-attach` only launches Studio.",
         "The path form is a shorthand over `wsync select set --paths '[...]'`.",
         "With the `OpenInEditor` plugin setting on, selecting a script also opens it in the Studio script editor."
+      ]
+    },
+    {
+      "name": "launch",
+      "title": "wsync launch",
+      "category": "Studio control",
+      "description": "Launches Roblox Studio on a place given as either a place file on disk or a cloud place id, without creating a project or starting a daemon.",
+      "usage": "wsync launch <placefile|placeId> [--universe <gameId>] [--project <path>] [--raw]",
+      "examples": [
+        "wsync launch ./build/game.rbxl",
+        "wsync launch 1234567890 --universe 9876543210",
+        "wsync launch 1234567890 --project .",
+        "wsync launch ./build/game.rbxl --raw"
+      ],
+      "notes": [
+        "An all-digit argument is a place id; anything else is a path to a .rbxl or .rbxlx file. A path that does not exist is tried with .rbxl and .rbxlx appended when smart paths are on, the way wsync studio resolves one; a file that is still missing is an error, never a place id.",
+        "A place id launches Studio through the roblox-studio: protocol URL (task:EditPlace), which needs the universe too: --universe, else a daemon on this machine that already claims the place, else --project's gameId. Nothing is attached: no scratch project is created and no daemon is started. Use wsync open for a place that should be addressable as soon as Studio connects, and wsync studio to launch Studio with no place.",
+        "Launching returns before the place has finished loading. --raw prints {\"ok\": true, \"launched\": true, \"pid\": <n>} with either \"file\" or \"placeId\", \"universeId\" and \"url\"; the pid is the process that was spawned, and Studio may re-exec itself into another."
       ]
     },
     {

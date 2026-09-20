@@ -99,6 +99,24 @@ local function findChild(parent: Instance, name: string, class: string): Instanc
 	return nil
 end
 
+--- A child of `parent` with this name and class that the tree does not know
+--- and that is not kept in Studio: an instance already standing where an
+--- addition from disk is about to go.
+local function findUntracked(tree, parent: Instance, name: string, class: string): Instance?
+	for _, child in parent:GetChildren() do
+		if
+			child.Name == name
+			and child.ClassName == class
+			and tree:getId(child) == nil
+			and not ReadProcessor.isExcluded(child)
+		then
+			return child
+		end
+	end
+
+	return nil
+end
+
 local function warnKeptInStudio(instance: Instance)
 	Log.warn(
 		`'{instance.Name}' is kept in Studio ({ReadProcessor.exclusionOf(instance)}) — a change from disk was not applied to it`
@@ -149,6 +167,28 @@ function WriteProcessor:applyChanges(changes: Types.Changes, initial: boolean?)
 	end
 end
 
+--- Every encoded property of a snapshot onto an instance, each failure
+--- warned and skipped rather than stopping the rest
+function WriteProcessor:__applyProperties(instance: Instance, properties: Types.Properties)
+	for property, value in properties do
+		local decodeSuccess, decodedValue = Dom.EncodedValue.decode(value)
+
+		if not decodeSuccess then
+			local err = Error.new(Error.DecodeFailed, property, value)
+			Log.warn(err)
+
+			continue
+		end
+
+		local writeSuccess, reason = Dom.writeProperty(instance, property, decodedValue)
+
+		if not writeSuccess then
+			local err = Error.new(Error.WriteFailed, property, instance, reason.kind)
+			Log.warn(err)
+		end
+	end
+end
+
 function WriteProcessor:applyAddition(
 	snapshot: Types.AddedSnapshot,
 	initial: boolean?,
@@ -194,6 +234,34 @@ function WriteProcessor:applyAddition(
 		end
 	end
 
+	-- An untracked instance already standing where this addition goes IS
+	-- this addition, not a sibling for it. `branch finish` replays a
+	-- branch's instances into Studio while the daemon holds disk pushes,
+	-- then resumes; the rescan finds the merged files — a script under a
+	-- container the replay just created — with no tree entry, and used to
+	-- create the container and the script a second time beside the replayed
+	-- ones. The standing instance takes the disk properties (the file is the
+	-- merged truth for a script's source), the id, and the children
+	local standing = if skipExisting then nil else findUntracked(self.tree, parent, snapshot.name, snapshot.class)
+
+	if standing ~= nil then
+		Log.debug("Adopting the instance already standing at", snapshot.name, "for an addition from disk")
+
+		self:__applyProperties(standing, snapshot.properties)
+		self.tree:insertInstance(standing, snapshot.id, snapshot.meta)
+
+		for _, child in snapshot.children do
+			child.parent = snapshot.id
+			self:applyAddition(child, initial)
+		end
+
+		if not initial then
+			batchWaypoint("Adopt", standing.Name)
+		end
+
+		return standing
+	end
+
 	local instance
 	local isService = false
 
@@ -226,23 +294,7 @@ function WriteProcessor:applyAddition(
 
 	instance.Name = snapshot.name
 
-	for property, value in snapshot.properties do
-		local decodeSuccess, decodedValue = Dom.EncodedValue.decode(value)
-
-		if not decodeSuccess then
-			local err = Error.new(Error.DecodeFailed, property, value)
-			Log.warn(err)
-
-			continue
-		end
-
-		local writeSuccess, reason = Dom.writeProperty(instance, property, decodedValue)
-
-		if not writeSuccess then
-			local err = Error.new(Error.WriteFailed, property, instance, reason.kind)
-			Log.warn(err)
-		end
-	end
+	self:__applyProperties(instance, snapshot.properties)
 
 	if not isService then
 		instance.Parent = parent

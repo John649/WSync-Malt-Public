@@ -19,6 +19,7 @@ mod doc;
 mod exec;
 mod init;
 mod install;
+mod launch;
 mod lint;
 mod live;
 mod monetization;
@@ -177,6 +178,7 @@ impl Cli {
 			Commands::Sourcemap(command) => command.main(),
 			Commands::Stop(command) => command.main(),
 			Commands::Studio(command) => command.main(),
+			Commands::Launch(command) => command.main(),
 			Commands::Debug(command) => command.main(),
 			Commands::Exec(command) => command.main(),
 			Commands::Update(command) => command.main(),
@@ -280,6 +282,7 @@ pub enum Commands {
 	Sourcemap(sourcemap::Sourcemap),
 	Stop(stop::Stop),
 	Studio(studio::Studio),
+	Launch(launch::Launch),
 	Debug(debug::Debug),
 	Exec(exec::Exec),
 	Update(update::Update),

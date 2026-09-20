@@ -330,7 +330,89 @@ Studio itself. Merging without a blob would silently drop the instances it
 carries, which is the failure mode the whole design exists to avoid.
 
 The branch daemon does have to be running: it serves the journal and the
-blobs. `branch up` starts one if it is gone.
+blobs. `branch up` starts one if it is gone, and so does `finish` — a daemon
+is the one part of a branch that can simply be started again, because its
+state is the directory. Neither launches a Studio to rescue a merge.
+
+### When a merge breaks
+
+The first real merge of a large branch (`sell-loot-menu`, September 2026)
+failed three times in a row and then cut main's Studio off mid-replay. Every
+link in that chain is now either closed or self-healing; the order below is
+the order the code takes, and the `wsync-branch-recovery` skill is the
+manual ladder for what is left.
+
+**Nobody holds the bytes.** The plugin pins an `add`'s subtree for ten minutes
+after it was last touched, and the daemon pulls it as the append lands. Four
+ways the pull never happened, each fixed at its cause:
+
+- A pull pass that panicked or was dropped left the store's `pulling` flag
+  set for the life of the daemon, so no later append started another pass.
+  The flag is now held by a guard and cleared however the pass ends, and an
+  append that lands as a pass is finishing is not lost.
+- A daemon that was down or restarted while the branch kept recording had
+  no append to trigger a pull for what it missed. The plugin's reconnect is
+  now a trigger, and `POST /journal/pull` runs a pass on demand.
+- One flush past the daemon's 4096-event bound (a map import) was refused
+  whole and requeued whole on every tick, so nothing reached the daemon
+  again. The plugin now posts a flush in bounded pieces, in order.
+- The refresh timer re-armed itself: its own `add` counted as "something
+  happened since the last capture", so every added root was re-serialized,
+  re-pinned and re-pulled every ten seconds for as long as the branch stayed
+  open. It re-captures only after a real edit now.
+
+And when the bytes are gone anyway: **a live branch Studio can always serve a
+blob.** The instance is still in its tree, and any serialization of it serves
+for any other, so before `finish` calls a subtree unrecoverable it asks the
+plugin to serialize it again (`journal_recapture {ids}`), stores the result
+beside the journal under the id the newest event names, and carries on. The
+daemon's own pull pass does the same when the plugin answers that an id is
+gone. Only an instance that has left the tree is beyond that — and its `add`
+is then not worth replaying.
+
+**The replay outlives the heartbeat.** `journal_replay` runs on Studio's one
+Lua thread. A call carrying a whole import held it past the daemon's 8 s pong
+deadline; the daemon closed the socket, the CLI saw "plugin disconnected",
+and main was left half-replayed with its git merge pending. The CLI now ships
+the replay in chunks of 250 events (conflict numbers re-based across them, so
+`branch pick` sees one numbering), and the plugin yields every 200 ms inside
+a chunk so the socket can pong.
+
+**A child that arrived inside its parent's blob is claimed, not created
+again.** Every instance added under an added root gets an `add` of its own,
+and the root's blob is re-captured while the branch works, so by merge time
+the blob carries those same children. The replay used to create each of
+them a second time — a folder filled after it was added merged with every
+part twice. A child `add` whose parent this replay built from a blob now
+claims the first unclaimed child of that name and class, in `GetChildren`
+order, and binds it to the branch's id; a child the blob predates matches
+nothing and is created as before.
+
+**A replaced daemon does not strand the clone.** A branch Studio whose daemon
+died keeps recording; `finish` starts a daemon again and waits up to 45 s for
+the clone to find it. The transport fails that reconnect on purpose — a new
+boot means new refs, so Core has to be re-entered — and a branch clone now
+re-enters it on its own instead of waiting for a click, which is what main
+does under the AutoReconnect setting.
+
+**The merged files never duplicate the replayed instances.** The replay puts
+the branch's instances into main while the daemon holds disk pushes; the
+resume rescan then meets the merged files with no tree entry behind them and
+used to create a second container beside the replayed one, holding only the
+scripts. An addition from disk now adopts an untracked instance of the same
+name and class already standing at its path — properties, id and children —
+and creates only what is not there.
+
+**Nothing incomplete is committed.** The plugin reports a replay that died
+mid-stream as `stopped`, and every `add` whose blob it was not handed as
+`missingBlobs` — both as fields of a successful op, because the recording
+still closed cleanly, and both used to be committed as a merge. Either now
+leaves the git merge in progress and names the rerun; the plugin's
+per-checkpoint ledger makes the rerun skip what already landed. A subtree
+that was stood in for by an empty instance of the right class is gone too:
+an `add` that names a blob it was not given is skipped and reported, never
+faked. `finish --allow-missing-blobs` is the escape hatch for a subtree the
+skill carried over by hand.
 
 ## Locks and budget
 

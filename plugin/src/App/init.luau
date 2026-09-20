@@ -20,6 +20,7 @@ local Types = require(WSync.Types)
 local Util = require(WSync.Util)
 local Log = require(WSync.Log)
 local Core = require(WSync.Core)
+local Branch = require(WSync.Branch)
 local Discovery = require(WSync.Discovery)
 local Broker = require(WSync.Broker)
 local Place = require(WSync.Place)
@@ -874,8 +875,19 @@ function App:__connectTo(host: string, port: number, generation: number)
 		self:disconnect()
 
 		-- A non-retryable server shutdown halts the retry loop by design
-		-- (Design §9.4)
-		if Config:get("AutoReconnect") and not Core.wasFatal(err) then
+		-- (Design §9.4).
+		--
+		-- A BRANCH CLONE always comes back. Its daemon being replaced is a
+		-- restart, never a reason to wait for a click: `branch finish` and
+		-- `branch up` start a fresh daemon for a branch whose daemon died,
+		-- and the transport then fails the reconnect on purpose ("The daemon
+		-- restarted — reconnect to resync") because Core has to be re-entered
+		-- for the new boot's refs. Left to the AutoReconnect setting (off by
+		-- default) the clone sat disconnected, the merge read it as a closed
+		-- Studio, and nothing it still held could be pulled or serialized
+		local branchClone = Branch.current() ~= nil
+
+		if (Config:get("AutoReconnect") or branchClone) and not Core.wasFatal(err) then
 			task.wait(RECONNECT_INTERVAL)
 
 			if self.lastUpdate + RECONNECT_INTERVAL <= os.clock() then
