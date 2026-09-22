@@ -71,7 +71,7 @@ impl Exec {
 				port: self.port,
 			})?;
 			(
-				format!("http://localhost:{}", live.port()),
+				live.url(""),
 				live.target.canonical.clone(),
 				Some(live.hello.boot_id.clone()),
 			)

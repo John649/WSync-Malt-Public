@@ -23,6 +23,7 @@ use crate::{
 	config::Config,
 	daemon::{self, RuntimePaths, RuntimeRecord},
 	ext::PathExt,
+	hub,
 	project::{self, Project},
 	server::{self, Server, ServerIdentity},
 	sessions, util, wsync_info, wsync_warn,
@@ -48,6 +49,8 @@ enum Command {
 	Stop(Stop),
 	Restart(Restart),
 	Logs(Logs),
+	#[command(hide = true)]
+	Hub(Hub),
 }
 
 impl Daemon {
@@ -58,6 +61,7 @@ impl Daemon {
 			Command::Stop(command) => command.main(),
 			Command::Restart(command) => command.main(),
 			Command::Logs(command) => command.main(),
+			Command::Hub(command) => command.main(),
 		}
 	}
 }
@@ -71,7 +75,9 @@ struct Start {
 	#[arg(long)]
 	project: Option<PathBuf>,
 
-	/// Server port (a port serving a different project is a hard error)
+	/// Pin the daemon's own port instead of taking whatever the OS hands out.
+	/// Everything reaches a daemon through the hub either way; a pinned port
+	/// is only for a client that cannot, such as a stock Argon plugin
 	#[arg(short = 'P', long)]
 	port: Option<u16>,
 
@@ -148,14 +154,15 @@ struct Stop {
 	raw: bool,
 }
 
-/// Restart the project daemon, preferring its previous port
+/// Restart the project daemon. It keeps its hub route, so a connected Studio
+/// reconnects to it wherever it binds
 #[derive(Parser)]
 struct Restart {
 	/// Project path
 	#[arg(long)]
 	project: Option<PathBuf>,
 
-	/// Server port (defaults to the port the daemon ran on)
+	/// Pin the new daemon's own port (see `daemon start --port`)
 	#[arg(short = 'P', long)]
 	port: Option<u16>,
 
@@ -196,6 +203,17 @@ struct Logs {
 	lines: usize,
 }
 
+/// Run the hub in the foreground. Daemons start it on their own; this is the
+/// process they start
+#[derive(Parser)]
+struct Hub {}
+
+impl Hub {
+	fn main(self) -> Result<()> {
+		hub::server::run(hub::port())
+	}
+}
+
 /// The subset of `GET /hello` the lifecycle machinery relies on
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -222,6 +240,21 @@ fn probe_hello(port: u16) -> Result<Hello> {
 		.error_for_status()?;
 
 	Ok(response.json()?)
+}
+
+/// Whether the hub routes to this exact boot of this project's daemon. A
+/// daemon that answers on its port but not here predates the hub, and
+/// nothing but its own port reaches it until it is restarted
+fn routed(canonical: &str, boot_id: &str) -> bool {
+	reqwest::blocking::Client::builder()
+		.no_proxy()
+		.timeout(PROBE_TIMEOUT)
+		.build()
+		.ok()
+		.and_then(|client| client.get(format!("{}/hello", hub::route_url(canonical))).send().ok())
+		.and_then(|response| response.error_for_status().ok())
+		.and_then(|response| response.json::<Hello>().ok())
+		.is_some_and(|hello| hello.boot_id == boot_id)
 }
 
 fn resolve_project_path(project: Option<PathBuf>) -> Result<PathBuf> {
@@ -258,6 +291,8 @@ fn project_context(project: Option<PathBuf>, data_dir: Option<&PathBuf>) -> Resu
 }
 
 fn report_already_running(raw: bool, record: &RuntimeRecord) -> Result<()> {
+	let routed = routed(&record.canonical_project, &record.boot_id);
+
 	if raw {
 		println!(
 			"{}",
@@ -269,6 +304,7 @@ fn report_already_running(raw: bool, record: &RuntimeRecord) -> Result<()> {
 				"project": record.project,
 				"canonicalProject": record.canonical_project,
 				"alreadyRunning": true,
+				"routed": routed,
 			})
 		);
 		io::stdout().flush().ok();
@@ -277,6 +313,14 @@ fn report_already_running(raw: bool, record: &RuntimeRecord) -> Result<()> {
 			"A daemon for this project is already running on port {} (PID {})",
 			record.port.to_string().bold(),
 			record.pid.to_string().bold()
+		);
+	}
+
+	if !routed {
+		wsync_warn!(
+			"That daemon is not registered with the hub, so Studio and the CLI cannot reach it: it predates the hub. \
+			 Restart it with `wsync daemon restart --project {}`",
+			record.project
 		);
 	}
 
@@ -431,23 +475,16 @@ impl Start {
 			bail!("Cannot serve non-place project!");
 		}
 
-		let config = Config::new();
-		let host = project.host.clone().unwrap_or_else(|| config.host.clone());
-		let mut port = self.port.unwrap_or(project.port.unwrap_or(config.port));
-		let scan_ports = config.scan_ports;
-		let port_scan_max = config.port_scan_max;
-		drop(config);
+		let host = project.host.clone().unwrap_or_else(|| Config::new().host.clone());
 
-		// `/hello` is the authoritative occupancy probe: a daemon may hold
-		// only one loopback stack (e.g. 127.0.0.1), which a plain bind probe
-		// on `localhost` would miss by succeeding on the other stack.
-		// One daemon per project means neighbouring ports are expected to be
-		// other projects' daemons (Design §3.2) — scan past them unless the
-		// caller pinned a port explicitly
-		let max_port = port_scan_max.max(port);
-		let start_port = port;
+		// A daemon takes whatever port the OS hands it: nothing addresses a
+		// daemon by its port any more, so there is no range to scan and no
+		// neighbour to collide with. Only an explicit pin (the flag, or the
+		// project file's `port`) binds a fixed one, and a pinned port that is
+		// taken is a hard error, never a quiet move to the next
+		let port = self.port.or(project.port).unwrap_or(0);
 
-		loop {
+		if port != 0 {
 			match probe_hello(port) {
 				Ok(hello) if hello.canonical_project == *canonical => {
 					// A daemon for this project runs on the port without a
@@ -457,49 +494,24 @@ impl Start {
 
 					return report_already_running(self.raw, &record);
 				}
-				Ok(hello) => {
-					if self.port.is_some() {
-						bail!(
-							"Port {} is already serving a different project: {}",
-							port,
-							hello.project.bold()
-						);
-					}
-
-					if !scan_ports {
-						bail!(
-							"Port {} is already serving a different project: {}! Enable the {} setting to use the first available port automatically",
-							port.to_string().bold(),
-							hello.project.bold(),
-							"scan_ports".bold()
-						);
-					}
+				Ok(hello) => bail!(
+					"Port {} is already serving a different project: {}",
+					port,
+					hello.project.bold()
+				),
+				Err(_) if !server::is_port_free(&host, port) => {
+					bail!("Port {port} is already in use by another process")
 				}
-				Err(_) => {
-					if server::is_port_free(&host, port) {
-						break;
-					}
-
-					// Occupied by something that is not a WSync daemon
-					if self.port.is_some() {
-						bail!("Port {port} is already in use by another process");
-					}
-
-					if !scan_ports {
-						bail!(
-							"Port {} is already in use! Enable {} setting to use the first available port automatically",
-							port.to_string().bold(),
-							"scan_ports".bold()
-						);
-					}
-				}
+				Err(_) => {}
 			}
+		}
 
-			if port >= max_port {
-				bail!("No free port found in range {start_port}-{max_port}! Increase the port_scan_max setting");
-			}
-
-			port += 1;
+		// The daemon registers with the hub on its own and starts one when
+		// none answers. Starting it here first means the daemon is routable
+		// the moment it listens, and a hub that cannot start is reported now
+		// rather than only in the daemon log
+		if let Err(err) = hub::ensure_running() {
+			wsync_warn!("{err}");
 		}
 
 		let owner_token =
@@ -530,7 +542,9 @@ impl Start {
 			journal: Some(journal.clone()),
 		};
 
-		let server = Server::new(core, &host, port, identity).with_ephemeral(self.ephemeral);
+		let server = Server::new(core, &host, port, identity)
+			.with_ephemeral(self.ephemeral)
+			.with_hub(true);
 		let bound_port = Arc::new(AtomicU16::new(port));
 
 		let ready: Box<dyn FnOnce(u16) + Send> = {
@@ -690,6 +704,10 @@ impl Status {
 				if hello.boot_id == record.boot_id && hello.canonical_project == context.canonical
 		);
 		let stale = record.is_some() && !running;
+		let routed = running
+			&& live
+				.as_ref()
+				.is_some_and(|hello| routed(&context.canonical, &hello.boot_id));
 
 		if self.raw {
 			let record_json = record.as_ref().map(|record| {
@@ -724,6 +742,8 @@ impl Status {
 					"ok": true,
 					"running": running,
 					"stale": stale,
+					"routed": routed,
+					"route": hub::route_url(&context.canonical),
 					"canonicalProject": context.canonical,
 					"record": record_json,
 					"live": live_json,
@@ -734,11 +754,18 @@ impl Status {
 		}
 
 		match (&record, running) {
-			(Some(record), true) => wsync_info!(
-				"Daemon is running on port {} (PID {}, managed by {})",
+			(Some(record), true) if routed => wsync_info!(
+				"Daemon is running on port {} (PID {}, managed by {}), reached at {}",
 				record.port.to_string().bold(),
 				record.pid.to_string().bold(),
-				record.managed_by.bold()
+				record.managed_by.bold(),
+				hub::route_url(&context.canonical).bold()
+			),
+			(Some(record), true) => wsync_warn!(
+				"Daemon is running on port {} (PID {}) but is not registered with the hub, so nothing reaches it; \
+				 restart it with `wsync daemon restart`",
+				record.port.to_string().bold(),
+				record.pid.to_string().bold()
 			),
 			(Some(record), false) => wsync_warn!(
 				"Daemon record exists (port {}, PID {}) but no matching daemon answers — the record is stale",
@@ -908,7 +935,6 @@ impl Restart {
 	fn main(self) -> Result<()> {
 		let context = project_context(self.project.clone(), self.data_dir.as_ref())?;
 		let previous = daemon::read_record(&context.paths.record)?;
-		let previous_port = previous.as_ref().map(|record| record.port);
 		// A restarted scratch place daemon stays scratch: losing the flag
 		// here would strand the `_places/<id>` directory forever
 		let ephemeral = previous.as_ref().is_some_and(|record| record.ephemeral);
@@ -921,9 +947,8 @@ impl Restart {
 
 		Start {
 			project: self.project,
-			// Same-port preference: explicit flag first, then the port the
-			// daemon previously ran on
-			port: self.port.or(outcome.port).or(previous_port),
+			// The route is what a restart keeps; the port is whatever is free
+			port: self.port,
 			managed_by: self.managed_by,
 			owner_token_env: self.owner_token_env,
 			data_dir: self.data_dir,

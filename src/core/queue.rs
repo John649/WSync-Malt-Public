@@ -207,6 +207,7 @@ impl Queue {
 		self.push(
 			server::Disconnect {
 				message: message.to_owned(),
+				stopping: false,
 			},
 			Some(id),
 		)?;

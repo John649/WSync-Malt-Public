@@ -11,10 +11,8 @@
 --   * `ServerStorage/WSyncPlace` — a `StringValue` whose `Value` is the
 --     project's `placeKey`. A daemon whose `/hello` reports the same
 --     `placeKey` ranks MATCH_EXACT for this place, whatever the ids say.
---   * optional number attribute `DaemonPort` — the port that daemon was last
---     reached on. Probed first, so a marked place connects without walking
---     the scan range. A shortcut, not an override: the port still has to rank
---     exact, or discovery carries on without it.
+--   Places marked before the hub may also carry a `DaemonPort` attribute.
+--     Nothing reads it any more, and the next `remember` clears it.
 --
 -- The plugin is the only thing that writes it: the engine never touches
 -- Studio, and the desktop app never touches a place. It is written once, after
@@ -118,28 +116,6 @@ function Place.key(): string?
 	return if ok then key else nil
 end
 
---- The port the marker names as this key's daemon, when it names one. A
---- shortcut for the scan, never a decision — Policy still has to rank it.
-function Place.daemonPort(): number?
-	local ok, port = pcall(function(): number?
-		local marker = Place.marker()
-
-		if marker == nil then
-			return nil
-		end
-
-		local value = marker:GetAttribute(Place.DAEMON_PORT_ATTRIBUTE)
-
-		if type(value) == "number" and value % 1 == 0 and value > 0 and value < 65536 then
-			return value
-		end
-
-		return nil
-	end)
-
-	return if ok then port else nil
-end
-
 --- Write the marker for `key`, unless this place already carries a different
 --- one.
 ---
@@ -168,7 +144,7 @@ function Place.forget(): boolean
 	return ok and removed
 end
 
-function Place.remember(key: string, daemonPort: number?): boolean
+function Place.remember(key: string): boolean
 	local wanted = usableKey(key)
 
 	if wanted == nil then
@@ -205,8 +181,10 @@ function Place.remember(key: string, daemonPort: number?): boolean
 		-- documented attribute is the marker's own opt-out (SyncScope).
 		found:SetAttribute(SyncScope.AVOID_SYNC_ATTRIBUTE, true)
 
-		if daemonPort ~= nil then
-			found:SetAttribute(Place.DAEMON_PORT_ATTRIBUTE, daemonPort)
+		-- A port remembered before the hub named a daemon by where it happened
+		-- to listen, which is exactly what went stale
+		if found:GetAttribute(Place.DAEMON_PORT_ATTRIBUTE) ~= nil then
+			found:SetAttribute(Place.DAEMON_PORT_ATTRIBUTE, nil)
 		end
 
 		return true

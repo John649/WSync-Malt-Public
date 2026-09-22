@@ -218,8 +218,9 @@ impl Status {
 					"placeIds": project.as_ref().map(|project| project.place_ids.clone()),
 				},
 				"daemon": {
-					"port": target.port,
-					"portSource": target.port_source.as_str(),
+					"port": hello.as_ref().map(|hello| hello.port).or(target.route.port()),
+					"portSource": target.source.as_str(),
+					"address": target.route.base(),
 					"recorded": target.record.is_some(),
 					"reachable": hello.is_some(),
 					"running": running,
@@ -266,26 +267,27 @@ impl Status {
 
 		match (&hello, running) {
 			(Some(hello), true) => println!(
-				"Daemon    running on port {} (PID {}, v{}, protocol {}){}",
-				target.port.to_string().bold(),
+				"Daemon    running on port {} at {} (PID {}, v{}, protocol {}){}",
+				hello.port.to_string().bold(),
+				target.route.describe(),
 				hello.pid,
 				hello.version,
 				hello.protocol,
 				match (target.record.is_some(), stale) {
-					(false, _) => " — no runtime record, so discovery cannot find it without --port",
+					(false, _) => " — no runtime record, so `daemon stop` cannot authenticate it",
 					(true, true) => " — the runtime record names a different boot and is stale",
 					(true, false) => "",
 				}
 			),
 			(Some(hello), false) => println!(
-				"Daemon    port {} serves a different project: {}",
-				target.port.to_string().bold(),
+				"Daemon    {} serves a different project: {}",
+				target.route.describe().bold(),
 				hello.project
 			),
 			(None, _) => println!(
-				"Daemon    not reachable on port {} (from the {})",
-				target.port.to_string().bold(),
-				target.port_source.as_str()
+				"Daemon    not reachable at {} (from the {})",
+				target.route.describe().bold(),
+				target.source.as_str()
 			),
 		}
 
@@ -463,28 +465,34 @@ impl Doctor {
 				"runtime-record",
 				"Runtime record",
 				format!(
-					"No runtime record for this project; using port {} from the {}",
-					target.port,
-					target.port_source.as_str()
+					"No runtime record for this project; reaching it at {} (from the {})",
+					target.route.describe(),
+					target.source.as_str()
 				),
-				"Start the daemon with `wsync daemon start --project <path>` so discovery stops guessing",
+				"Start the daemon with `wsync daemon start --project <path>` so it can be stopped and restarted by name",
 			)),
 		}
 
 		// 3. Daemon reachability
-		let hello = target.probe().ok();
+		let hello = target.probe_patiently().ok();
 
 		match &hello {
 			Some(hello) => checks.push(Check::pass(
 				"daemon",
 				"Daemon reachable",
-				format!("v{} on port {} (PID {})", hello.version, target.port, hello.pid),
+				format!(
+					"v{} at {} (port {}, PID {})",
+					hello.version,
+					target.route.describe(),
+					hello.port,
+					hello.pid
+				),
 			)),
 			None => checks.push(Check::fail(
 				"daemon",
 				"Daemon reachable",
-				format!("Nothing answers GET /hello on port {}", target.port),
-				"Start it with `wsync daemon start --project <path>`, or pass --port for a daemon on another port",
+				format!("Nothing answers GET /hello at {}", target.route.describe()),
+				"Start it with `wsync daemon start --project <path>`",
 			)),
 		}
 
@@ -494,8 +502,8 @@ impl Doctor {
 			(Some(hello), Some(canonical)) if &hello.canonical_project != canonical => checks.push(Check::fail(
 				"identity",
 				"Daemon identity",
-				format!("Port {} serves {} instead", target.port, hello.project),
-				"Stop the other daemon or target this project's port with --port",
+				format!("{} serves {} instead", target.route.describe(), hello.project),
+				"Drop --port so the command reaches this project's own daemon through the hub",
 			)),
 			(Some(hello), _) if target.record.is_some() && !target.record_is_live(hello) => checks.push(Check::warn(
 				"identity",
@@ -719,8 +727,8 @@ impl Client {
 			canonical: target.canonical.clone(),
 			state_dir: target.state_dir.clone(),
 			record: None,
-			port: target.port,
-			port_source: target.port_source,
+			route: target.route.clone(),
+			source: target.source,
 		};
 
 		Client::open(target, hello).ok()

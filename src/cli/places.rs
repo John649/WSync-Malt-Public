@@ -8,11 +8,11 @@
 //! A place id is the one identifier both sides of that work already share,
 //! so this module turns one into a daemon.
 //!
-//! The registry is the set of runtime records under `<state>/daemons/*.json`
-//! — the same files `wsync daemon status` reads. Each record names a port;
-//! `GET /hello` on that port is what proves the daemon is alive, which place
-//! ids it claims, and whether it serves a branch. A record whose daemon does
-//! not answer is not dropped: its project file still says which places it
+//! The registry is the hub's list of registered daemons (src/hub), each with
+//! its live `GET /hello`: that is what says which place ids a daemon claims
+//! and whether it serves a branch. The runtime records under
+//! `<state>/daemons/*.json` fill in the rest. A record whose daemon is not
+//! registered is not dropped: its project file still says which places it
 //! would serve, so `--place` can explain what exists instead of reporting
 //! nothing at all.
 
@@ -24,19 +24,15 @@ use std::{
 	fs,
 	path::{Path, PathBuf},
 	sync::Mutex,
-	thread,
-	time::Duration,
 };
 
 use crate::{
 	cli::client::{self, Hello},
 	daemon::{self, RuntimeRecord},
 	ext::PathExt,
+	hub,
 	project::Project,
 };
-
-/// How long a `/hello` probe waits while listing or resolving
-const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Directory name that holds scratch place projects under the desktop app's
 /// projects root
@@ -416,14 +412,14 @@ impl DaemonEntry {
 	}
 }
 
-/// Reads every runtime record and probes the daemon each one names.
+/// Every daemon this machine knows of.
 ///
-/// Probes run in parallel: a stale record costs a full probe timeout, and a
-/// The loopback range a daemon may take, mirroring the plugin's own scan
-const PORT_SCAN_MIN: u16 = 7968;
-const PORT_SCAN_MAX: u16 = 7990;
-
-/// machine with a branch or two open has several of them.
+/// The hub's registrations come first, each with the live `/hello` the hub
+/// fetched for it: a registered daemon is by definition running and
+/// reachable. Runtime records whose daemon is not registered follow, marked
+/// as not answering — a stale record should be visible, not silent. That
+/// includes a daemon from a build that predates the hub, which nothing can
+/// reach until it is restarted
 pub fn registry() -> Result<Vec<DaemonEntry>> {
 	// The CLI keeps its records under the local data dir; the desktop app
 	// keeps its own under the roaming one (it hands that dir to every daemon
@@ -444,102 +440,67 @@ pub fn registry() -> Result<Vec<DaemonEntry>> {
 		for record in read_records(&dir.join("daemons")) {
 			if !records
 				.iter()
-				.any(|known| known.port == record.port && known.pid == record.pid)
+				.any(|known| known.canonical_project == record.canonical_project && known.boot_id == record.boot_id)
 			{
 				records.push(record);
 			}
 		}
 	}
 
-	let entries = thread::scope(|scope| {
-		let probes: Vec<_> = records
-			.into_iter()
-			.map(|record| {
-				let port = record.port;
-				let handle = scope.spawn(move || probe(port));
+	let mut entries: Vec<DaemonEntry> = Vec::new();
 
-				(record, handle)
-			})
-			.collect();
+	for listed in hub::listing().daemons {
+		let hello = listed
+			.hello
+			.and_then(|hello| serde_json::from_value::<Hello>(hello).ok())
+			.filter(|hello| hello.boot_id == listed.boot_id && hello.canonical_project == listed.canonical_project);
 
-		let mut entries: Vec<DaemonEntry> = probes
-			.into_iter()
-			.map(|(record, handle)| {
-				let hello = handle
-					.join()
-					.ok()
-					.flatten()
-					// A record points at a port, not at a process: a daemon
-					// that died and left its port to another project must
-					// never be reported as this record's daemon
-					.filter(|hello: &Hello| {
-						hello.boot_id == record.boot_id && hello.canonical_project == record.canonical_project
-					});
+		// The record this daemon wrote, when it wrote one. A daemon started
+		// by something that keeps its records elsewhere has none here, and
+		// is listed all the same: the hub is what proves it is alive
+		let record = match records
+			.iter()
+			.position(|record| record.boot_id == listed.boot_id && record.canonical_project == listed.canonical_project)
+		{
+			Some(index) => records.remove(index),
+			None => {
+				let mut record = RuntimeRecord::unrecorded(&listed.canonical_project, listed.port, &listed.boot_id);
 
-				let project = Project::load(Path::new(&record.project))
-					.ok()
-					.map(|project| ProjectClaim {
-						name: project.name.clone(),
-						game_id: project.game_id,
-						place_ids: project.place_ids.clone(),
-						place_key: project.place_key.clone(),
-						branch: project.branch.clone(),
-					});
-
-				DaemonEntry { record, hello, project }
-			})
-			.collect::<Vec<_>>();
-
-		// A record is written by whoever started the daemon, and it can be
-		// missing while the daemon is very much alive — a crash before it was
-		// written, a cleanup that removed it, a daemon started by something
-		// that keeps its records elsewhere. Listing only records makes this
-		// command answer "nothing is running" to an agent looking straight at
-		// a working Studio, so the port range is swept for the rest
-		let known: Vec<u16> = entries.iter().map(|entry| entry.record.port).collect();
-		let sweep: Vec<u16> = (PORT_SCAN_MIN..=PORT_SCAN_MAX)
-			.filter(|port| !known.contains(port))
-			.collect();
-		let found: Vec<_> = sweep
-			.into_iter()
-			.map(|port| (port, scope.spawn(move || probe(port))))
-			.collect();
-
-		for (port, handle) in found {
-			let Some(hello) = handle.join().ok().flatten() else {
-				continue;
-			};
-
-			// The desktop app's broker answers on this range too, and it is
-			// not a daemon: it serves no project and nothing can be addressed
-			// through it
-			if hello.canonical_project.trim().is_empty() {
-				continue;
+				record.pid = listed.pid;
+				record
 			}
+		};
 
-			let project = Project::load(Path::new(&hello.canonical_project))
-				.ok()
-				.map(|project| ProjectClaim {
-					name: project.name.clone(),
-					game_id: project.game_id,
-					place_ids: project.place_ids.clone(),
-					place_key: project.place_key.clone(),
-					branch: project.branch.clone(),
-				});
+		let project = project_claim(Path::new(&record.project));
 
-			entries.push(DaemonEntry {
-				record: RuntimeRecord::unrecorded(&hello.canonical_project, port, &hello.boot_id),
-				hello: Some(hello),
-				project,
-			});
-		}
+		entries.push(DaemonEntry { record, hello, project });
+	}
 
-		entries
-	});
+	// Nothing is registered under these: a daemon that died without cleaning
+	// up, or one too old to register
+	for record in records {
+		let project = project_claim(Path::new(&record.project));
+
+		entries.push(DaemonEntry {
+			record,
+			hello: None,
+			project,
+		});
+	}
 
 	learn_titles(&entries);
 
 	Ok(entries)
+}
+
+fn project_claim(path: &Path) -> Option<ProjectClaim> {
+	Project::load(path).ok().map(|project| ProjectClaim {
+		name: project.name.clone(),
+		game_id: project.game_id,
+		place_ids: project.place_ids.clone(),
+		place_key: project.place_key.clone(),
+		branch: project.branch.clone(),
+	})
 }
 
 /// Every candidate `--place` may resolve to, newest daemon first
@@ -573,24 +534,6 @@ fn read_records(dir: &Path) -> Vec<RuntimeRecord> {
 	});
 
 	records
-}
-
-/// `GET /hello`, tolerant: anything that is not a daemon answering for this
-/// port is simply "no daemon"
-pub fn probe(port: u16) -> Option<Hello> {
-	reqwest::blocking::Client::builder()
-		.no_proxy()
-		.timeout(PROBE_TIMEOUT)
-		.redirect(reqwest::redirect::Policy::none())
-		.build()
-		.ok()?
-		.get(format!("http://localhost:{port}/hello"))
-		.send()
-		.ok()?
-		.error_for_status()
-		.ok()?
-		.json()
-		.ok()
 }
 
 ////////////////////////////////////////////////////////////////////////////////

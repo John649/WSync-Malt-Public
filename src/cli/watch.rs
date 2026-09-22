@@ -9,14 +9,7 @@ use std::{
 use tungstenite::{connect, Message};
 use uuid::Uuid;
 
-use crate::{
-	config::Config,
-	constants::PROTOCOL_VERSION,
-	daemon,
-	ext::PathExt,
-	project::{self, Project},
-	wsync_info, wsync_warn,
-};
+use crate::{constants::PROTOCOL_VERSION, daemon, ext::PathExt, hub, project, wsync_info, wsync_warn};
 
 /// Watch the project daemon's live event feed over WebSocket
 #[derive(Parser)]
@@ -29,8 +22,7 @@ pub struct Watch {
 	#[arg(long = "project", value_name = "PATH", conflicts_with = "project")]
 	project_flag: Option<PathBuf>,
 
-	/// Daemon port (defaults to the runtime record, then the project/config
-	/// port)
+	/// Talk to the daemon on this port directly instead of through the hub
 	#[arg(short = 'P', long)]
 	port: Option<u16>,
 
@@ -45,12 +37,12 @@ pub struct Watch {
 
 impl Watch {
 	pub fn main(self) -> Result<()> {
-		let port = match self.port {
-			Some(port) => port,
-			None => self.discover_port()?,
+		let address = match self.port {
+			Some(port) => format!("127.0.0.1:{port}"),
+			None => self.route()?,
 		};
 
-		let url = format!("ws://localhost:{port}/ws");
+		let url = format!("ws://{address}/ws");
 		let (mut socket, _) = connect(&url).with_context(|| format!("Failed to connect to {url}"))?;
 
 		let hello = serde_json::json!({
@@ -64,7 +56,7 @@ impl Watch {
 		socket.send(Message::Text(hello.to_string()))?;
 
 		if !self.raw {
-			wsync_info!("Watching daemon on port {} (Ctrl+C to stop)", port.to_string().bold());
+			wsync_info!("Watching the daemon at {} (Ctrl+C to stop)", address.bold());
 		}
 
 		loop {
@@ -110,9 +102,8 @@ impl Watch {
 		Ok(())
 	}
 
-	/// Finds the daemon port: runtime record first (the authoritative
-	/// registry), then the project file, then the config default
-	fn discover_port(&self) -> Result<u16> {
+	/// The project's route on the hub, without the scheme
+	fn route(&self) -> Result<String> {
 		let project_path = project::resolve(
 			self.project_flag
 				.clone()
@@ -120,26 +111,16 @@ impl Watch {
 				.unwrap_or_default(),
 		)?;
 
-		if project_path.exists() {
-			if let Ok(canonical) = daemon::canonical_project(&project_path) {
-				let state_dir = daemon::state_dir(None)?;
-				let paths = daemon::runtime_paths(&state_dir, &canonical);
-
-				if let Ok(Some(record)) = daemon::read_record(&paths.record) {
-					return Ok(record.port);
-				}
-			}
-
-			Config::load_workspace(project_path.get_parent());
-
-			if let Ok(project) = Project::load(&project_path) {
-				if let Some(port) = project.port {
-					return Ok(port);
-				}
-			}
+		if !project_path.exists() {
+			bail!(
+				"No project file at {}; pass --project <path>",
+				project_path.to_string().bold()
+			);
 		}
 
-		Ok(Config::new().port)
+		let canonical = daemon::canonical_project(&project_path)?;
+
+		Ok(format!("127.0.0.1:{}/p/{}", hub::port(), hub::route_key(&canonical)))
 	}
 
 	fn print_frame(&self, frame: &Value, text: &str) {

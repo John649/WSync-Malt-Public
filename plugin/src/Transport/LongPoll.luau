@@ -32,7 +32,14 @@ LongPoll.__index = LongPoll
 --- constant (Design §5.1). Without it, the strict semver gate applies
 --- unchanged. `helloScope` is the hello's sync scope (Design §7.0); nil =
 --- full.
-function LongPoll.new(host: string, port: number, https: boolean, helloProtocol: number?, helloScope: string?)
+function LongPoll.new(
+	host: string,
+	port: number,
+	https: boolean,
+	helloProtocol: number?,
+	helloScope: string?,
+	base: string?
+)
 	local self = setmetatable({}, LongPoll)
 
 	self.kind = "LongPoll" :: "LongPoll"
@@ -44,6 +51,8 @@ function LongPoll.new(host: string, port: number, https: boolean, helloProtocol:
 	self.host = host
 	self.port = port
 	self.https = https
+	-- The daemon's route on the hub (`/p/<route>`), or empty on its own port
+	self.base = base or ""
 	self.__onStatus = nil :: ((status: Types.TransportStatus) -> ())?
 
 	return self
@@ -51,7 +60,7 @@ end
 
 function LongPoll:getUrl(endpoint: string?): string
 	local protocol = self.https and "https" or "http"
-	return `{protocol}://{self.host}:{self.port}/{endpoint or ""}`
+	return `{protocol}://{self.host}:{self.port}{self.base}/{endpoint or ""}`
 end
 
 --- Register a status listener. Long-polling has no internal reconnect

@@ -4426,6 +4426,8 @@ dependencies = [
  "futures-util",
  "glob",
  "globenv",
+ "hyper 1.6.0",
+ "hyper-util",
  "include_dir",
  "json-formatter",
  "json2lua",

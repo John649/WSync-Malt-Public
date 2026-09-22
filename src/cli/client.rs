@@ -1,9 +1,10 @@
 //! Shared plumbing for the live command surface (Design §10.1–10.2).
 //!
 //! Every live command targets a daemon the same way: `--project` selects the
-//! project, the project's runtime record supplies the port, and `GET /hello`
-//! confirms the daemon on that port actually serves that project before a
-//! single op is sent. `--port` overrides port discovery, never project identity.
+//! project, the project names its route on the hub (src/hub), and `GET /hello`
+//! through that route confirms the daemon answering it serves that project
+//! before a single op is sent. `--port` goes straight to a daemon's own port
+//! instead of through the hub; it never overrides project identity.
 //!
 //! Remote ops go through `POST /request` with the 5 s default remote-op
 //! timeout. Transport failures, plugin errors, and daemon-side timeouts all
@@ -33,7 +34,8 @@ use serde_json::{json, Value};
 use std::{
 	io::{self, Write},
 	path::PathBuf,
-	time::Duration,
+	thread,
+	time::{Duration, Instant},
 };
 
 use crate::{
@@ -41,7 +43,7 @@ use crate::{
 	config::Config,
 	daemon::{self, RuntimeRecord},
 	ext::PathExt,
-	project::{self, Project},
+	hub, project,
 };
 
 /// Default remote-op timeout (Design §10.1, Appendix C)
@@ -55,6 +57,10 @@ const HTTP_SLACK_MS: u64 = 3000;
 /// How long `GET /hello` discovery probes wait
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
+/// How long a command waits for daemons to register with a hub it had to
+/// start (a daemon retries every quarter second)
+const HUB_REGISTER_GRACE: Duration = Duration::from_secs(3);
+
 /// `--project`/`--port`/`--place` targeting, flattened into every live
 /// command
 #[derive(Args, Debug, Clone, Default)]
@@ -63,36 +69,74 @@ pub struct Targeting {
 	#[arg(long, value_name = "PATH")]
 	pub project: Option<PathBuf>,
 
-	/// Daemon port (defaults to the project's runtime record)
+	/// Talk to the daemon on this port directly instead of through the hub
 	#[arg(short = 'P', long, value_name = "PORT")]
 	pub port: Option<u16>,
 }
 
-/// Where the port a command talks to came from — reported in diagnostics so
-/// "nothing answers" is always traceable to a concrete guess
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PortSource {
-	Flag,
-	Record,
-	ProjectFile,
-	Config,
-	/// `--place <id>` resolved to this daemon (docs/places.md)
-	Place,
+/// How a live command reaches its daemon
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+	/// Through the hub, at the route the project's canonical path names. The
+	/// default: it does not change when the daemon restarts on another port
+	Hub { key: String },
+	/// Straight to a daemon's own port (`--port`)
+	Port(u16),
 }
 
-impl PortSource {
-	pub fn as_str(self) -> &'static str {
+impl Route {
+	pub fn for_project(canonical: &str) -> Self {
+		Route::Hub {
+			key: hub::route_key(canonical),
+		}
+	}
+
+	/// What every daemon path is appended to
+	pub fn base(&self) -> String {
 		match self {
-			PortSource::Flag => "--port",
-			PortSource::Record => "runtime record",
-			PortSource::ProjectFile => "project file",
-			PortSource::Config => "config default",
-			PortSource::Place => "--place",
+			Route::Hub { key } => hub::url(&format!("/p/{key}")),
+			Route::Port(port) => format!("http://127.0.0.1:{port}"),
+		}
+	}
+
+	/// The port, when the route is one
+	pub fn port(&self) -> Option<u16> {
+		match self {
+			Route::Hub { .. } => None,
+			Route::Port(port) => Some(*port),
+		}
+	}
+
+	pub fn describe(&self) -> String {
+		match self {
+			Route::Hub { key } => format!("hub route {key} on 127.0.0.1:{}", hub::port()),
+			Route::Port(port) => format!("port {port}"),
 		}
 	}
 }
 
-/// The resolved project + port a live command addresses, before any daemon
+/// Where the route a command takes came from — reported in diagnostics so
+/// "nothing answers" is always traceable to a concrete choice
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteSource {
+	Flag,
+	/// The project's own route on the hub
+	Hub,
+	/// `--place <id>` resolved to this daemon (docs/places.md)
+	Place,
+}
+
+impl RouteSource {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			RouteSource::Flag => "--port",
+			RouteSource::Hub => "hub",
+			RouteSource::Place => "--place",
+		}
+	}
+}
+
+/// The resolved project + route a live command addresses, before any daemon
 /// is known to answer
 pub struct Target {
 	pub project_path: PathBuf,
@@ -101,14 +145,14 @@ pub struct Target {
 	pub canonical: Option<String>,
 	pub state_dir: PathBuf,
 	pub record: Option<RuntimeRecord>,
-	pub port: u16,
-	pub port_source: PortSource,
+	pub route: Route,
+	pub source: RouteSource,
 }
 
 impl Target {
-	/// Discovery chain: `--port` first, then the project's runtime record
-	/// (the authoritative registry), then the project file's `port`, then the
-	/// config default
+	/// `--port` when given, otherwise the project's route on the hub. The
+	/// runtime record is read for diagnostics only; it never decides where a
+	/// request goes
 	pub fn resolve(targeting: &Targeting) -> Result<Self> {
 		// `--place <id>` is a global option rather than a field here, so that
 		// every command that already targets a daemon gains it without a
@@ -142,29 +186,22 @@ impl Target {
 			daemon::read_record(&paths.record).unwrap_or_default()
 		});
 
-		let (port, port_source) = match targeting.port {
-			Some(port) => (port, PortSource::Flag),
-			None => match &record {
-				Some(record) => (record.port, PortSource::Record),
-				None => {
-					let project_port = if project_exists {
-						Project::load(&project_path).ok().and_then(|project| project.port)
-					} else {
-						None
-					};
-
-					match project_port {
-						Some(port) => (port, PortSource::ProjectFile),
-						None => (Config::new().port, PortSource::Config),
-					}
-				}
-			},
+		let (route, source) = match targeting.port {
+			Some(port) => (Route::Port(port), RouteSource::Flag),
+			// A path with no project file has no route of its own; the hub
+			// answers the empty key with "no daemon", and `Client::open`
+			// names the missing project file
+			None => (
+				Route::for_project(canonical.as_deref().unwrap_or_default()),
+				RouteSource::Hub,
+			),
 		};
 
 		debug!(
-			"Live target: project {} on port {port} (from the {})",
+			"Live target: project {} at {} (from the {})",
 			project_path.to_string(),
-			port_source.as_str()
+			route.describe(),
+			source.as_str()
 		);
 
 		Ok(Self {
@@ -173,8 +210,8 @@ impl Target {
 			canonical,
 			state_dir,
 			record,
-			port,
-			port_source,
+			route,
+			source,
 		})
 	}
 
@@ -199,12 +236,7 @@ impl Target {
 		let record =
 			daemon::read_record(&daemon::runtime_paths(&state_dir, &chosen.canonical).record).unwrap_or_default();
 
-		debug!(
-			"Live target: {} served by {} on port {}",
-			place.describe(),
-			chosen.project,
-			chosen.port
-		);
+		debug!("Live target: {} served by {}", place.describe(), chosen.project);
 
 		Ok(Self {
 			project_path,
@@ -212,8 +244,8 @@ impl Target {
 			canonical: Some(chosen.canonical.clone()),
 			state_dir,
 			record,
-			port: chosen.port,
-			port_source: PortSource::Place,
+			route: Route::for_project(&chosen.canonical),
+			source: RouteSource::Place,
 		})
 	}
 
@@ -235,11 +267,41 @@ impl Target {
 			// would turn "endpoint not implemented" into a bogus 200
 			.redirect(reqwest::redirect::Policy::none())
 			.build()?
-			.get(format!("http://localhost:{}/hello", self.port))
+			.get(format!("{}/hello", self.route.base()))
 			.send()?
 			.error_for_status()?;
 
 		Ok(response.json()?)
+	}
+
+	/// [`Self::probe`], allowing for a hub that is not up yet. Every daemon
+	/// keeps a hub running, so a missing hub is one being restarted: start
+	/// it here too and give the daemons a moment to register again
+	pub fn probe_patiently(&self) -> Result<Hello> {
+		let first = match self.probe() {
+			Ok(hello) => return Ok(hello),
+			Err(err) => err,
+		};
+
+		if !matches!(self.route, Route::Hub { .. }) || hub::probe().is_some() {
+			return Err(first);
+		}
+
+		if hub::ensure_running().is_err() {
+			return Err(first);
+		}
+
+		let deadline = Instant::now() + HUB_REGISTER_GRACE;
+
+		while Instant::now() < deadline {
+			thread::sleep(Duration::from_millis(100));
+
+			if let Ok(hello) = self.probe() {
+				return Ok(hello);
+			}
+		}
+
+		Err(first)
 	}
 
 	pub fn writes_log(&self) -> PathBuf {
@@ -473,11 +535,11 @@ impl Client {
 	pub fn connect(targeting: &Targeting) -> Result<Self> {
 		let target = Target::resolve(targeting)?;
 
-		let hello = target.probe().with_context(|| {
+		let hello = target.probe_patiently().with_context(|| {
 			format!(
-				"No WSync daemon answers on port {} (from the {}). Start one with `{}`",
-				target.port,
-				target.port_source.as_str(),
+				"No WSync daemon serves {} (at {}). Start one with `{}`",
+				target.project_path.to_string(),
+				target.route.describe(),
 				"wsync daemon start --project <path>".bold()
 			)
 		})?;
@@ -495,8 +557,8 @@ impl Client {
 		{
 			if &hello.canonical_project != canonical {
 				let complaint = format!(
-					"Port {} serves a different project ({}), not {}",
-					target.port,
+					"The daemon at {} serves a different project ({}), not {}",
+					target.route.describe(),
 					hello.project.bold(),
 					target.project_path.to_string().bold()
 				);
@@ -520,12 +582,15 @@ impl Client {
 		})
 	}
 
+	/// The port the daemon itself listens on, as it reports it. Informational:
+	/// requests go through [`Route::base`]
 	pub fn port(&self) -> u16 {
-		self.target.port
+		self.hello.port
 	}
 
-	fn url(&self, path: &str) -> String {
-		format!("http://localhost:{}{path}", self.target.port)
+	/// Where this client's requests go, with `path` appended
+	pub fn url(&self, path: &str) -> String {
+		format!("{}{path}", self.target.route.base())
 	}
 
 	/// One remote op over `POST /request`. Plugin and transport failures are
@@ -577,8 +642,8 @@ impl Client {
 			Err(error) => {
 				return failure(
 					format!(
-						"Failed to receive op `{op}` reply from daemon on port {}: {error}",
-						self.target.port
+						"Failed to receive op `{op}` reply from the daemon at {}: {error}",
+						self.target.route.describe()
 					),
 					error.is_connect(),
 				)
@@ -616,22 +681,23 @@ impl Client {
 	}
 
 	pub fn get_endpoint(&self, path: &str) -> Result<Endpoint> {
-		let response = self
-			.http
-			.get(self.url(path))
-			.send()
-			.with_context(|| format!("Failed to reach {path} on the daemon at port {}", self.target.port))?;
+		let response = self.http.get(self.url(path)).send().with_context(|| {
+			format!(
+				"Failed to reach {path} on the daemon at {}",
+				self.target.route.describe()
+			)
+		})?;
 
 		Ok(Self::endpoint(response))
 	}
 
 	pub fn post_endpoint(&self, path: &str, body: &Value) -> Result<Endpoint> {
-		let response = self
-			.http
-			.post(self.url(path))
-			.json(body)
-			.send()
-			.with_context(|| format!("Failed to reach {path} on the daemon at port {}", self.target.port))?;
+		let response = self.http.post(self.url(path)).json(body).send().with_context(|| {
+			format!(
+				"Failed to reach {path} on the daemon at {}",
+				self.target.route.describe()
+			)
+		})?;
 
 		Ok(Self::endpoint(response))
 	}

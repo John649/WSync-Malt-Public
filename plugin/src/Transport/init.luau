@@ -76,9 +76,17 @@ local Transport = {}
 --- Probe `GET /hello` (JSON, Design §5.2). Resolves the decoded hello, or
 --- nil when the address does not answer with a wsync/1 identity (including
 --- connection failures — the caller decides how to proceed).
-function Transport.hello(host: string, port: number, https: boolean?): Promise.TypedPromise<Types.DaemonHello?>
+---
+--- `base` is the path every daemon route hangs off: `/p/<route>` for a daemon
+--- reached through the hub, empty for one reached on its own port.
+function Transport.hello(
+	host: string,
+	port: number,
+	https: boolean?,
+	base: string?
+): Promise.TypedPromise<Types.DaemonHello?>
 	local protocol = https and "https" or "http"
-	local url = `{protocol}://{host}:{port}/hello`
+	local url = `{protocol}://{host}:{port}{base or ""}/hello`
 
 	return Http.getJson(url)
 		:andThen(function(response)
@@ -101,9 +109,9 @@ end
 --- Pick and construct the transport for an address (never rejects — when
 --- nothing is listening, LongPoll is returned and its first request will
 --- produce the proper connection error).
-function Transport.detect(host: string, port: number, https: boolean): Promise.TypedPromise<Transport>
+function Transport.detect(host: string, port: number, https: boolean, base: string?): Promise.TypedPromise<Transport>
 	return Promise.new(function(resolve)
-		local hello = Transport.hello(host, port, https):expect()
+		local hello = Transport.hello(host, port, https, base):expect()
 
 		--- Stamp the boot id the probe saw onto whatever transport we build,
 		--- so Core can tell a restarted daemon from the one it was talking to.
@@ -118,7 +126,7 @@ function Transport.detect(host: string, port: number, https: boolean): Promise.T
 		if hello and hello.protocol >= 1 then
 			if WebSocket.isSupported() then
 				Log.info(`Using WebSocket transport (daemon protocol {hello.protocol})`)
-				return resolve(stamped(WebSocket.new(host, port, https, hello.scope)))
+				return resolve(stamped(WebSocket.new(host, port, https, hello.scope, base)))
 			end
 
 			Log.warn(
@@ -130,13 +138,13 @@ function Transport.detect(host: string, port: number, https: boolean): Promise.T
 			-- already identified as wsync/1 via `/hello`, so the long-poll
 			-- path accepts it by protocol and Core treats the msgpack
 			-- `/details` version as informational.
-			return resolve(stamped(LongPoll.new(host, port, https, hello.protocol, hello.scope)))
+			return resolve(stamped(LongPoll.new(host, port, https, hello.protocol, hello.scope, base)))
 		end
 
 		Log.info("Daemon did not answer the wsync/1 hello probe, using the long-poll transport")
 
 		-- No `/hello`: behavior unchanged — strict `/details` semver gating
-		return resolve(stamped(LongPoll.new(host, port, https)))
+		return resolve(stamped(LongPoll.new(host, port, https, nil, nil, base)))
 	end)
 end
 

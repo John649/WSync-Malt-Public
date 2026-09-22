@@ -139,11 +139,12 @@ impl RepairTree {
 				checks.push(Check::pass(
 					"daemon",
 					format!(
-						"port {} answers (v{}, PID {}, from the {})",
-						target.port,
+						"{} answers (v{}, PID {}, port {}, from the {})",
+						target.route.describe(),
 						hello.version,
 						hello.pid,
-						target.port_source.as_str()
+						hello.port,
+						target.source.as_str()
 					),
 				));
 
@@ -153,9 +154,9 @@ impl RepairTree {
 				checks.push(Check::fail(
 					"daemon",
 					format!(
-						"no daemon answers on port {} (from the {}) — start one with `wsync daemon start --project <path>`",
-						target.port,
-						target.port_source.as_str()
+						"no daemon answers at {} (from the {}) — start one with `wsync daemon start --project <path>`",
+						target.route.describe(),
+						target.source.as_str()
 					),
 				));
 
@@ -196,7 +197,8 @@ impl RepairTree {
 			print_json(&json!({
 				"ok": failed.is_empty(),
 				"project": target.project_path.to_string(),
-				"port": target.port,
+				"port": hello.as_ref().map(|hello| hello.port).or(target.route.port()),
+				"address": target.route.base(),
 				"checks": checks
 					.iter()
 					.map(|check| json!({ "id": check.id, "status": check.status, "detail": check.detail }))

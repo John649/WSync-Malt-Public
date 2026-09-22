@@ -32,11 +32,9 @@
 --     clone opened from an `.rbxl` reports `game.GameId == 0`, so the id has
 --     to travel on the marker; `apply` falls back to the live `game.GameId`
 --     when the attribute is absent.
---   * optional number attribute `DaemonPort` — the port the branch's own
---     daemon listens on. Discovery probes it FIRST, so a clone connects
---     without walking the 7978-7990 scan past a dozen dead ports. It is a
---     shortcut, not an override: the port still has to rank MATCH_EXACT, and
---     a clone that finds nothing exact still refuses rather than guessing.
+--   A clone finds its daemon through the hub by the branch name alone: only
+--   a daemon whose `/hello` names the same branch ranks at all. Clones made
+--   before the hub also carry a `DaemonPort` attribute; nothing reads it.
 
 local ServerStorage = game:GetService("ServerStorage")
 
@@ -50,14 +48,11 @@ local Branch = {}
 Branch.MARKER_NAME = "WSyncBranch"
 Branch.MARKER_CLASS = "StringValue"
 Branch.GAME_ID_ATTRIBUTE = "GameId"
-Branch.DAEMON_PORT_ATTRIBUTE = "DaemonPort"
 Branch.PLACE_ID_ATTRIBUTE = "PlaceId"
 
 export type Identity = {
 	name: string,
 	syntheticPlaceId: number,
-	--- The branch daemon's port, when the marker names it.
-	daemonPort: number?,
 }
 
 --- FNV-1a, 64-bit, over the UTF-8 bytes of the branch name, masked to 53 bits
@@ -133,17 +128,9 @@ function Branch.detect(_target: DataModel?): Identity?
 			return nil
 		end
 
-		local daemonPort: number? = nil
-		local port = marker:GetAttribute(Branch.DAEMON_PORT_ATTRIBUTE)
-
-		if type(port) == "number" and port % 1 == 0 and port > 0 and port < 65536 then
-			daemonPort = port
-		end
-
 		return {
 			name = name,
 			syntheticPlaceId = Branch.syntheticPlaceId(name),
-			daemonPort = daemonPort,
 		}
 	end)
 

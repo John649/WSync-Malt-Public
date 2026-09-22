@@ -1,8 +1,7 @@
 //! Engine-side lifecycle contracts the desktop app and Studio plugin rely on
 //! (Design §3.2): daemons bind the IPv4 loopback that every desktop probe
-//! targets, and a portless `daemon start` scans the configured port range
-//! instead of hard-erroring when the default port already serves another
-//! project.
+//! targets, and a portless `daemon start` takes a free port from the OS
+//! instead of competing for a fixed range.
 
 mod common;
 
@@ -161,39 +160,27 @@ fn hello_on(port: u16) -> Value {
 		.expect("/hello must answer with the hello document")
 }
 
-/// Design §3.2: default port 7978, scan range 7978–7990. A second project's
-/// portless `daemon start` must scan past the occupied default instead of
-/// hard-erroring — the exact flow behind the desktop broker's auto-serve,
-/// where the hard error meant only one project could ever be served.
-/// The range is remapped to 17978–17990 through the sandbox's global config
-/// so real daemons on this machine can never collide with the test
+/// A portless `daemon start` binds whatever port the OS hands out, so two
+/// projects never collide and there is no range to run out of: everything
+/// reaches a daemon through the hub (tests/hub.rs), not by its port
 #[test]
-fn portless_daemon_start_scans_the_port_range() {
+fn portless_daemon_start_takes_a_free_port() {
 	let sandbox = CliSandbox::new();
-
-	fs::write(
-		sandbox.home.path().join(".wsync").join("config.toml"),
-		"check_updates = false\ninstall_plugin = false\nport = 17978\nport_scan_max = 17990\n",
-	)
-	.unwrap();
 
 	let project_a = place_project(sandbox.work.path(), "fixture-a", 5550001);
 	let project_b = place_project(sandbox.work.path(), "fixture-b", 5550002);
 	let project_c = place_project(sandbox.work.path(), "fixture-c", 5550003);
 
-	// The first portless start takes the default port
 	let (_daemon_a, report_a) = start_daemon_process(&sandbox, &project_a);
-	assert_eq!(report_a["port"], 17978, "the first daemon must take the default port");
-
-	// The second portless start scans to the next free port
 	let (_daemon_b, report_b) = start_daemon_process(&sandbox, &project_b);
-	assert_eq!(
-		report_b["port"], 17979,
-		"a portless start must scan past a default port serving another project"
-	);
+
+	let port_a = report_a["port"].as_u64().unwrap() as u16;
+	let port_b = report_b["port"].as_u64().unwrap() as u16;
+
+	assert_ne!(port_a, port_b);
 
 	// Both daemons answer the desktop-style IPv4 probe with their own project
-	for (port, project) in [(17978u16, &project_a), (17979, &project_b)] {
+	for (port, project) in [(port_a, &project_a), (port_b, &project_b)] {
 		let hello = hello_on(port);
 
 		assert_eq!(
@@ -203,14 +190,17 @@ fn portless_daemon_start_scans_the_port_range() {
 		);
 	}
 
-	// An explicitly pinned port stays a hard error — only portless starts scan
+	let port_a = port_a.to_string();
+
+	// A pinned port is exactly that port: one serving another project is a
+	// hard error, never a quiet move elsewhere
 	let output = sandbox.run(&[
 		"daemon",
 		"start",
 		"--project",
 		&project_c.to_string_lossy(),
 		"--port",
-		"17978",
+		&port_a,
 		"--managed-by",
 		"test",
 		"--raw",

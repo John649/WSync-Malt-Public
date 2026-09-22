@@ -1137,7 +1137,7 @@ function Journal.fetchBlob(blobId: string): (string?, string?)
 	end
 
 	local scheme = if (endpoint :: any).https then "https" else "http"
-	local url = `{scheme}://{(endpoint :: any).host}:{(endpoint :: any).port}/journal/blob/{blobId}`
+	local url = `{scheme}://{(endpoint :: any).host}:{(endpoint :: any).port}{(endpoint :: any).base}/journal/blob/{blobId}`
 
 	local ok, body = pcall(function()
 		return Http.getJson(url):expect().Body
@@ -1177,7 +1177,8 @@ function Journal.pushBlob(blobId: string): (boolean, string?)
 	end
 
 	local scheme = if (endpoint :: any).https then "https" else "http"
-	local url = `{scheme}://{(endpoint :: any).host}:{(endpoint :: any).port}/journal/blob/{blobId}?encoding=base64`
+	local url =
+		`{scheme}://{(endpoint :: any).host}:{(endpoint :: any).port}{(endpoint :: any).base}/journal/blob/{blobId}?encoding=base64`
 
 	local ok, err = pcall(function()
 		Http.postText(url, Base64.encode(buffer.tostring(entry.bytes)), "text/plain"):expect()
@@ -1322,13 +1323,13 @@ end
 --- Where `POST /journal/append` goes. Core stamps it once the transport has
 --- resolved, so the journal always follows the daemon discovery actually
 --- connected to rather than the Settings values.
-function Journal.setEndpoint(host: string?, port: (string | number)?, https: boolean?)
+function Journal.setEndpoint(host: string?, port: (string | number)?, https: boolean?, base: string?)
 	if host == nil or port == nil then
 		endpoint = nil
 		return
 	end
 
-	endpoint = { host = host, port = tostring(port), https = https == true }
+	endpoint = { host = host, port = tostring(port), https = https == true, base = base or "" }
 end
 
 local function drain(): { Event }
@@ -1391,7 +1392,7 @@ function Journal.flush(): { flushed: number, pending: number }
 	end
 
 	local scheme = if endpoint.https then "https" else "http"
-	local url = `{scheme}://{endpoint.host}:{endpoint.port}/journal/append`
+	local url = `{scheme}://{endpoint.host}:{endpoint.port}{endpoint.base}/journal/append`
 
 	-- In sequence order and in bounded pieces. A piece that fails goes back
 	-- along with everything after it, so the stream never receives a later

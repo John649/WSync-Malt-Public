@@ -469,9 +469,9 @@ impl Lint {
 			Ok(hello) => hello,
 			Err(_) => {
 				report.fallback_reason = Some(format!(
-					"no daemon answers on port {} (from the {})",
-					target.port,
-					target.port_source.as_str()
+					"no daemon answers at {} (from the {})",
+					target.route.describe(),
+					target.source.as_str()
 				));
 
 				return None;
@@ -483,8 +483,9 @@ impl Lint {
 		if let Some(canonical) = &target.canonical {
 			if &hello.canonical_project != canonical {
 				report.fallback_reason = Some(format!(
-					"the daemon on port {} serves a different project ({})",
-					target.port, hello.project
+					"the daemon at {} serves a different project ({})",
+					target.route.describe(),
+					hello.project
 				));
 
 				return None;

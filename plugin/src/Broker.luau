@@ -1,13 +1,15 @@
 --!strict
 -- Pure rules for the desktop-broker Create Project flow (Design §9.2 as
--- amended; pinned wave-5 contract). The broker is the desktop app's helper
--- listening on `127.0.0.1:7968-7971`; its `GET /hello` answers
--- `{broker: true, projectInit: true}`, and `POST /projects/init` creates a
--- project from place *metadata only* — never a filesystem path.
+-- amended; pinned wave-5 contract). The broker is the desktop app's helper; it
+-- registers with the WSync hub and is reached through it at `/broker`. Its
+-- `GET /hello` answers `{broker: true, projectInit: true}`, and
+-- `POST /projects/init` creates a project from place *metadata only* — never
+-- a filesystem path.
 --
 -- `POST /places/attach` is the second route (docs/places.md — "Attach from
 -- Studio"): a place with no daemon is handed a throwaway one, with no click
--- and nothing written to disk, and the answer is the port to connect to. It
+-- and nothing written to disk, and the answer is the hub route to connect
+-- to. It
 -- may also answer `{disabled: true}`, which is not a failure — it is the
 -- user having switched the flow off, and the caller falls back to the
 -- ordinary no-daemon card.
@@ -20,11 +22,8 @@
 
 local Broker = {}
 
-Broker.PORT_MIN = 7968
-Broker.PORT_MAX = 7971
-
--- After a successful init, re-scan the daemon range until the new project's
--- daemon appears: bounded, cancellable (Discovery.waitForDaemon).
+-- After a successful init, ask the hub again until the new project's daemon
+-- appears: bounded, cancellable (Discovery.waitForDaemon).
 Broker.WAIT_ATTEMPTS = 15
 Broker.WAIT_DELAY_SECONDS = 2
 
@@ -50,7 +49,8 @@ export type InitOk = {
 --- A daemon the attach route started for this window. `placeKey` is present
 --- only for an unpublished place, which is the only kind that needs one.
 export type AttachOk = {
-	port: number,
+	--- The scratch daemon's route on the hub
+	route: string,
 	project: string?,
 	placeKey: string?,
 	key: string?,
@@ -152,7 +152,7 @@ function Broker.shapeAttachRequest(place: PlaceInfo, sessionId: any): { [string]
 	return body
 end
 
---- Parse a `/places/attach` response body. Returns the `{port, …}` on
+--- Parse a `/places/attach` response body. Returns the `{route, …}` on
 --- success; nil plus a reason otherwise. `disabled` is the second return's
 --- own case: the route answered, the user has the flow switched off, and the
 --- caller falls back rather than showing an error.
@@ -177,14 +177,14 @@ function Broker.parseAttachResponse(value: any): (AttachOk?, string?, boolean)
 			false
 	end
 
-	local port = value.port
+	local route = value.route
 
-	if not isCountingNumber(port) or port <= 0 or port >= 65536 then
-		return nil, "the WSync app did not name a port to connect to", false
+	if type(route) ~= "string" or route == "" or route:find("[^%w]") ~= nil then
+		return nil, "the WSync app did not name a route to connect to", false
 	end
 
 	return {
-		port = port :: number,
+		route = route :: string,
 		project = if type(value.project) == "string" then value.project else nil,
 		placeKey = if type(value.placeKey) == "string" and value.placeKey ~= "" then value.placeKey else nil,
 		key = if type(value.key) == "string" and value.key ~= "" then value.key else nil,

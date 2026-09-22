@@ -76,6 +76,10 @@ impl Sandbox {
 			.env("HOME", self.home.path())
 			.env("USERPROFILE", self.home.path())
 			.env("WSYNC_STATE_DIR", self.state.path())
+			// Never the real hub, and never a real Studio: these tests reach their
+			// daemons by --port, and port 1 is one nothing can bind
+			.env("WSYNC_HUB_PORT", "1")
+			.env("WSYNC_NO_STUDIO_LAUNCH", "1")
 			.env("NO_COLOR", "1")
 			.env_remove("RUST_LOG")
 			.env_remove("RUST_VERBOSE")

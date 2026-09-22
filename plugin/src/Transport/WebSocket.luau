@@ -226,7 +226,7 @@ function WebSocket.isSupported(): boolean
 	return success and supported == true
 end
 
-function WebSocket.new(host: string, port: number, https: boolean, scope: string?)
+function WebSocket.new(host: string, port: number, https: boolean, scope: string?, base: string?)
 	local self = setmetatable({}, WebSocket)
 
 	self.kind = "WebSocket" :: "WebSocket"
@@ -246,6 +246,10 @@ function WebSocket.new(host: string, port: number, https: boolean, scope: string
 	self.host = host
 	self.port = port
 	self.https = https
+	-- The daemon's route on the hub (`/p/<route>`), or empty on its own port.
+	-- The route names the project, not the process, so a reconnect after the
+	-- daemon restarted on another port lands on it all the same
+	self.base = base or ""
 
 	self.__alive = true
 	self.__connected = false
@@ -264,12 +268,12 @@ end
 
 function WebSocket:getHttpUrl(endpoint: string?): string
 	local protocol = self.https and "https" or "http"
-	return `{protocol}://{self.host}:{self.port}/{endpoint or ""}`
+	return `{protocol}://{self.host}:{self.port}{self.base}/{endpoint or ""}`
 end
 
 function WebSocket:getWsUrl(): string
 	local protocol = self.https and "wss" or "ws"
-	return `{protocol}://{self.host}:{self.port}/ws`
+	return `{protocol}://{self.host}:{self.port}{self.base}/ws`
 end
 
 --- Register a status listener (connect/reconnect lifecycle incl. the visible
@@ -484,7 +488,9 @@ end
 
 --- Force a full re-init through Core: enqueue a typed `Disconnect` and drop
 --- the socket. When `fatal` is true the transport never reconnects again.
-function WebSocket:__fail(reason: string, fatal: boolean)
+--- `resync` says the daemon at this address is a different boot, which a
+--- fresh connect to the same address resolves (App reconnects on its own)
+function WebSocket:__fail(reason: string, fatal: boolean, resync: boolean?)
 	if fatal then
 		self.__fatalError = Error.new(Error.HandshakeFailed, reason)
 	end
@@ -493,6 +499,7 @@ function WebSocket:__fail(reason: string, fatal: boolean)
 		Disconnect = {
 			message = reason,
 			fatal = fatal,
+			resync = resync == true,
 		},
 	} :: any)
 
@@ -550,9 +557,10 @@ function WebSocket:__handleFrame(frame: { [string]: any }, resolveHello: ((frame
 		local reason = tostring(frame.reason or "Server requested a disconnect")
 		local retryable = frame.retryable ~= false
 
-		-- A branch clone answers to exactly one daemon, on a port the marker
-		-- names; that daemon being stopped is a restart in progress (a binary
-		-- swap, `branch up`), never a reason to give up and wait for a click
+		-- A branch clone answers to exactly one daemon, the one naming its
+		-- branch; that daemon being stopped is a restart in progress (a binary
+		-- swap, `branch up`), never a reason to give up and wait for a click.
+		-- (Daemons built with the hub already say retryable for a stop.)
 		if not retryable and Branch.current() ~= nil then
 			retryable = true
 			Log.info("Branch clone: treating the daemon stop as a restart and retrying")
@@ -836,7 +844,7 @@ function WebSocket:__connect(): Promise.Promise
 		local probedBoot = self:__probeBootId()
 
 		if probedBoot ~= nil and self.bootId ~= nil and probedBoot ~= self.bootId then
-			self:__fail("The daemon restarted — reconnect to resync", false)
+			self:__fail("The daemon restarted — reconnect to resync", false, true)
 			return reject(Error.new(Error.HandshakeFailed, "daemon boot changed"))
 		end
 
@@ -849,7 +857,7 @@ function WebSocket:__connect(): Promise.Promise
 		if self.__detailsFingerprint and self.__detailsFingerprint ~= fingerprint then
 			-- The daemon restarted or switched projects while we were away;
 			-- our buffer Refs no longer mean anything. Force a full re-init.
-			self:__fail("Server session changed while disconnected — reconnect to resync", false)
+			self:__fail("Server session changed while disconnected — reconnect to resync", false, true)
 			return reject(Error.new(Error.HandshakeFailed, "server session changed"))
 		end
 
@@ -913,7 +921,7 @@ function WebSocket:__probeBootId(): string?
 	local scheme = if self.https then "https" else "http"
 
 	local ok, hello = pcall(function()
-		return Http.getJson(`{scheme}://{self.host}:{self.port}/hello`):expect():decode()
+		return Http.getJson(`{scheme}://{self.host}:{self.port}{self.base}/hello`):expect():decode()
 	end)
 
 	if not ok or type(hello) ~= "table" then

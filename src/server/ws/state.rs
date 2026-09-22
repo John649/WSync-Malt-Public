@@ -371,12 +371,20 @@ impl WsState {
 
 	/// Asks every connected WS client to close with a typed shutdown frame
 	/// (daemon stop path). Long-poll clients are notified through the queue's
-	/// `Disconnect` message instead
+	/// `Disconnect` message instead.
+	///
+	/// The frame says retry. A client reached this daemon through its route on
+	/// the hub, and that route names the project rather than this process: the
+	/// only thing a retry can ever reach is this project's next daemon (a
+	/// restart, `branch up`, a binary swap), and the client's boot check makes
+	/// it resync against that one. Before the hub, a retry went to a port that
+	/// any other project's daemon could take next, which is why this used to
+	/// say stop
 	pub fn broadcast_close(&self, reason: &str, code: &str) {
 		let close = CloseReason {
 			reason: reason.to_owned(),
 			code: code.to_owned(),
-			retryable: false,
+			retryable: true,
 		};
 
 		{

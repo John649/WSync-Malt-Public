@@ -80,6 +80,9 @@ function App.new()
 	-- only ever read as scan candidates (Design §9.4 as amended)
 	self.host = Config:get("Host")
 	self.port = Config:get("Port")
+	-- The daemon's route on the hub (`/p/<route>`), or empty for a daemon
+	-- reached on its own port
+	self.base = ""
 	-- Bumped on every connect/disconnect; stale async flows (pending
 	-- connects) check it and abort
 	self.connectGeneration = 0
@@ -411,10 +414,10 @@ function App:flowAction()
 		self:dispatch({ kind = "confirm" })
 	elseif name == "no-broker" or name == "error" then
 		-- Retry is the user asking again, which is the one thing that puts an
-		-- automatic attach back on the table — and drops the port the last
-		-- one handed us, so a dead scratch daemon is not probed forever
+		-- automatic attach back on the table — and drops the route the last
+		-- one handed us, so a dead scratch daemon is not asked for forever
 		self.attachTried = false
-		Discovery.setSessionPort(nil)
+		Discovery.setSessionRoute(nil)
 
 		self:dispatch({ kind = "retry" })
 	end
@@ -425,9 +428,9 @@ function App:flowBack()
 	self:dispatch({ kind = "back" })
 end
 
---- Probe the candidate list (Settings `Host:Port` first, then the local
---- range); no match falls through to the broker probe and the Create Project
---- offer (explicit two-step confirm, never automatic).
+--- Ask the Settings `Host:Port` and the hub for this place's daemon; no match
+--- falls through to the broker and the Create Project offer (explicit
+--- two-step confirm, never automatic).
 function App:__runScan(state)
 	local generation = state.generation
 
@@ -448,13 +451,13 @@ function App:__runScan(state)
 			-- connect is diagnosable from the Output window
 			Log.stage(
 				`Connect: discovery matched '{match.hello.project or match.hello.name}'`
-					.. ` on {match.host}:{match.port}`
+					.. ` at {match.host}:{match.port}{match.base}`
 			)
 
 			-- A daemon that names a `placeKey` is how this place will be found
 			-- next time, and one that says it is ephemeral is a temporary
 			-- attach the Connected page has to be honest about
-			self:__rememberPlace(match.hello.placeKey, match.port)
+			self:__rememberPlace(match.hello.placeKey)
 			self.attachNote:set(Policy.temporaryNote(match.hello))
 
 			self:dispatch({
@@ -462,6 +465,7 @@ function App:__runScan(state)
 				generation = generation,
 				host = match.host,
 				port = match.port,
+				base = match.base,
 				project = match.hello.project or match.hello.name,
 			})
 
@@ -515,7 +519,7 @@ function App:__mayAttach(broker): boolean
 end
 
 --- Ask the desktop app for a throwaway daemon for this place, then connect to
---- the port it answers with (docs/places.md — "Attach from Studio"). A
+--- the route it answers with (docs/places.md — "Attach from Studio"). A
 --- refusal is not an error: the card falls back to the ordinary no-daemon
 --- offer, which is exactly what it would have shown without the attach.
 function App:__runAttach(state)
@@ -544,20 +548,22 @@ function App:__runAttach(state)
 		end
 
 		-- Trusted for this session only, and never written into the place: the
-		-- scratch daemon claims no ids, so the port IS the identity, and it
+		-- scratch daemon claims no ids, so the route IS the identity, and it
 		-- must not outlive the window that asked for it (Policy.rankHello).
-		Discovery.setSessionPort(attached.port)
+		Discovery.setSessionRoute(attached.route)
 		self.attachBroker = broker
 		self.attachNote:set(if attached.ephemeral == false then nil else Policy.temporaryNote({ ephemeral = true }))
-		self:__rememberPlace(attached.placeKey, attached.port)
+		self:__rememberPlace(attached.placeKey)
 
-		Log.stage(`Connect: attached temporarily on port {attached.port}`)
+		Log.stage(`Connect: attached temporarily at route {attached.route}`)
 
+		-- The scratch daemon is reached through the same hub the broker was
 		self:dispatch({
 			kind = "attach-ok",
 			generation = generation,
-			host = Policy.LOCAL_HOST,
-			port = attached.port,
+			host = broker.host,
+			port = broker.port,
+			base = `/p/{attached.route}`,
 			project = attached.key or attached.project,
 		})
 	end)
@@ -566,12 +572,12 @@ end
 --- Note the `placeKey` a daemon claims, to be written into the place once the
 --- connection actually succeeds. Nothing is touched here: a key from a daemon
 --- we never managed to talk to is not something to remember.
-function App:__rememberPlace(key, port)
+function App:__rememberPlace(key)
 	if type(key) ~= "string" or key == "" then
 		return
 	end
 
-	self.pendingPlaceKey = { key = key, port = port }
+	self.pendingPlaceKey = { key = key }
 end
 
 --- Write the place marker, once, after a connect to a project that names a
@@ -590,13 +596,13 @@ function App:__writePlaceMarker()
 	end
 
 	if Place.key() == pending.key then
-		-- Already marked, but the port may have moved
-		Place.remember(pending.key, pending.port)
+		-- Already marked; this also clears a port a pre-hub build left on it
+		Place.remember(pending.key)
 
 		return
 	end
 
-	if Place.remember(pending.key, pending.port) then
+	if Place.remember(pending.key) then
 		Log.info(`Place key '{pending.key}' remembered in {Place.MARKER_NAME}; save the place to keep it`)
 	end
 end
@@ -607,12 +613,13 @@ end
 function App:__beginConnect(state)
 	self.host = state.host
 	self.port = state.port
+	self.base = state.base or ""
 
 	self.connectGeneration += 1
 	self.transportStatus:set(nil)
 	self.diskReview:set(nil)
 
-	self:__connectTo(state.host, state.port, self.connectGeneration)
+	self:__connectTo(state.host, state.port, self.base, self.connectGeneration)
 end
 
 --- POST the open place's metadata to the desktop broker (pinned wave-5
@@ -665,13 +672,14 @@ function App:__runWait(state)
 			-- place has no ids of its own. Remember it here as the scan path
 			-- does, or the marker is never written and the place forgets which
 			-- project it belongs to the moment it closes (docs/places.md)
-			self:__rememberPlace(match.hello.placeKey, match.port)
+			self:__rememberPlace(match.hello.placeKey)
 
 			self:dispatch({
 				kind = "wait-found",
 				generation = generation,
 				host = match.host,
 				port = match.port,
+				base = match.base,
 				project = match.hello.project or match.hello.name,
 			})
 		else
@@ -680,12 +688,12 @@ function App:__runWait(state)
 	end)
 end
 
-function App:__connectTo(host: string, port: number, generation: number)
+function App:__connectTo(host: string, port: number, base: string, generation: number)
 	local project = Value({})
 	local canceled = false
 	local loading = true
 
-	self.core = Core.new(host, port)
+	self.core = Core.new(host, port, base)
 
 	task.spawn(function()
 		task.wait(0.2)
@@ -812,15 +820,17 @@ function App:__connectTo(host: string, port: number, generation: number)
 		if status.kind == "reconnecting" then
 			-- A temporary daemon that stays gone is gone for good: it stops
 			-- itself once its window leaves, and nothing restarts it. Past a
-			-- few attempts the port is dropped and discovery runs again, which
+			-- few attempts the route is dropped and discovery runs again, which
 			-- finds whatever serves this place now (a real project's daemon,
 			-- or a fresh attach) instead of counting down forever
-			if Discovery.sessionPort ~= nil and (status.attempt or 0) >= 4 then
+			if Discovery.sessionRoute ~= nil and (status.attempt or 0) >= 4 then
 				Log.stage("Reconnect: the temporary daemon is gone; scanning again")
-				Discovery.setSessionPort(nil)
+				Discovery.setSessionRoute(nil)
 				self.attachTried = false
+				-- The disconnect leaves the machine idle, and from idle only a
+				-- start runs a scan (a retry would be silently ignored there)
 				self:disconnect(true)
-				self:dispatch({ kind = "retry" })
+				self:dispatch({ kind = "start" })
 
 				return
 			end
@@ -887,7 +897,14 @@ function App:__connectTo(host: string, port: number, generation: number)
 		-- Studio, and nothing it still held could be pulled or serialized
 		local branchClone = Branch.current() ~= nil
 
-		if (Config:get("AutoReconnect") or branchClone) and not Core.wasFatal(err) then
+		-- A restarted daemon is back at the same route by the time this runs
+		-- (the transport only learns of the new boot by reaching it), so a
+		-- window that was connected comes straight back whatever
+		-- AutoReconnect says: the setting is about waiting out failures, and
+		-- this is not one
+		local resync = Core.wasResync(err)
+
+		if (Config:get("AutoReconnect") or branchClone or resync) and not Core.wasFatal(err) then
 			task.wait(RECONNECT_INTERVAL)
 
 			if self.lastUpdate + RECONNECT_INTERVAL <= os.clock() then
@@ -917,7 +934,7 @@ function App:makePermanent()
 	-- throwaway daemon by key, and the create asks the app for a project
 	-- with no key of its own, so the app mints one and the plugin writes it
 	-- back on the connect that follows (docs/places.md)
-	Discovery.setSessionPort(nil)
+	Discovery.setSessionRoute(nil)
 	Place.forget()
 	self.attachNote:set(nil)
 	self:disconnect(true)
@@ -930,7 +947,7 @@ end
 --- any disconnect in between would otherwise leave the card claiming the
 --- wrong thing — and the "Make permanent" button rides on this note.
 function App:__refreshTemporaryNote()
-	local host, port = self.host, self.port
+	local host, port, base = self.host, self.port, self.base
 
 	if host == nil or port == nil then
 		return
@@ -938,10 +955,10 @@ function App:__refreshTemporaryNote()
 
 	task.spawn(function()
 		local ok, hello = pcall(function()
-			return Discovery.hello(host, port):expect()
+			return Discovery.hello(host, port, base):expect()
 		end)
 
-		if not ok or self.host ~= host or self.port ~= port then
+		if not ok or self.host ~= host or self.port ~= port or self.base ~= base then
 			return
 		end
 
@@ -957,7 +974,7 @@ function App:disconnect(cancel: boolean?)
 	self.attachNote:set(nil)
 	self.pendingPlaceKey = nil
 
-	-- The attach port deliberately survives a disconnect: a reconnect probes
+	-- The attach route deliberately survives a disconnect: a reconnect ranks
 	-- it first and reattaches to the daemon still serving this window. When
 	-- that daemon is gone the scan finds nothing, the card returns to the
 	-- discovery states, and only Retry asks for a new attach.

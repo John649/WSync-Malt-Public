@@ -582,7 +582,9 @@ async fn stopping_daemon_notifies_ws_clients_with_typed_shutdown() {
 		.expect("no shutdown frame on daemon stop");
 
 	assert_eq!(shutdown["code"], "DAEMON_STOPPING");
-	assert_eq!(shutdown["retryable"], false);
+	// Retry: the client reached this daemon by its project's hub route, so a
+	// retry can only reach this project's next daemon (src/hub)
+	assert_eq!(shutdown["retryable"], true);
 
 	assert!(daemon.wait_for_exit(Duration::from_secs(10)));
 }

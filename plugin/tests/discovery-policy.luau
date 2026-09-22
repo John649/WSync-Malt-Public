@@ -4,10 +4,10 @@
 -- harness/loader.luau.
 --
 -- What is covered: the `placeKey` marker rank that makes an unpublished place
--- routable at all, the session-port hint an attach is trusted by, the branch
--- rules staying untouched by both, the candidate ordering those hints imply,
--- the attach states in the connection machine, and the request/response shapes
--- the attach route is spoken to with.
+-- routable at all, the session-route hint an attach is trusted by, the branch
+-- rules staying untouched by both, where a scan looks and how a hub's
+-- listing becomes candidates, the attach states in the connection machine,
+-- and the request/response shapes the attach route is spoken to with.
 
 local Policy = require(ref("Policy"))
 local Broker = require(ref("Broker"))
@@ -36,8 +36,8 @@ local function place(fields: { [string]: any }): Policy.PlaceIdentity
 	return (identity :: any) :: Policy.PlaceIdentity
 end
 
-local function at(port: number): Policy.Candidate
-	return { host = "127.0.0.1", port = port, https = false }
+local function at(route: string): Policy.Candidate
+	return { host = "127.0.0.1", port = Policy.HUB_PORT, https = false, base = `/p/{route}`, route = route }
 end
 
 --------------------------------------------------------------------------------
@@ -109,20 +109,20 @@ do
 end
 
 --------------------------------------------------------------------------------
-print("the session-port hint")
+print("the session-route hint")
 --------------------------------------------------------------------------------
 
 do
-	local attached = place({ sessionPort = 7979 })
+	local attached = place({ sessionRoute = "0123456789abcdef" })
 
 	expect(
-		Policy.rankHello({}, attached, at(7979)) == Policy.MATCH_EXACT,
-		"the port the app handed this window is exact, though the daemon claims nothing"
+		Policy.rankHello({}, attached, at("0123456789abcdef")) == Policy.MATCH_EXACT,
+		"the route the app handed this window is exact, though the daemon claims nothing"
 	)
 
 	expect(
-		Policy.rankHello({}, attached, at(7980)) == Policy.MATCH_WEAK,
-		"...and only that port: every other claimless daemon ranks as it always did"
+		Policy.rankHello({}, attached, at("fedcba9876543210")) == Policy.MATCH_WEAK,
+		"...and only that route: every other claimless daemon ranks as it always did"
 	)
 
 	expect(
@@ -131,18 +131,31 @@ do
 	)
 
 	expect(
-		Policy.rankHello({}, attached, { host = "example.com", port = 7979, https = false }) == Policy.MATCH_WEAK,
-		"the hint is a loopback port, not a port number anywhere in the world"
+		Policy.rankHello({}, attached, {
+			host = "example.com",
+			port = Policy.HUB_PORT,
+			https = false,
+			base = "/p/0123456789abcdef",
+			route = "0123456789abcdef",
+		}) == Policy.MATCH_WEAK,
+		"the hint is a route on this machine's hub, not on any hub in the world"
 	)
 
 	expect(
-		Policy.rankHello({ branch = "ui-pass" }, attached, at(7979)) == Policy.MATCH_NONE,
+		Policy.rankHello({}, attached, { host = "127.0.0.1", port = 7979, https = false, base = "" })
+			== Policy.MATCH_WEAK,
+		"a daemon reached on its own port has no route, so it can never be the attach"
+	)
+
+	expect(
+		Policy.rankHello({ branch = "ui-pass" }, attached, at("0123456789abcdef")) == Policy.MATCH_NONE,
 		"the mirror rule still wins: an unmarked window never binds to a branch daemon"
 	)
 
 	expect(
-		Policy.rankHello({ gameId = 999 }, place({ gameId = 42, sessionPort = 7979 }), at(7979)) == Policy.MATCH_EXACT,
-		"a published place that asked for an attach trusts the port it was given"
+		Policy.rankHello({ gameId = 999 }, place({ gameId = 42, sessionRoute = "0123456789abcdef" }), at("0123456789abcdef"))
+			== Policy.MATCH_EXACT,
+		"a published place that asked for an attach trusts the route it was given"
 	)
 end
 
@@ -155,74 +168,84 @@ do
 		branch = true,
 		branchName = "ui-pass",
 		placeKey = "my-level-ab12cd34",
-		sessionPort = 7979,
+		sessionRoute = "0123456789abcdef",
 	})
 
 	expect(
-		Policy.rankHello({ branch = "ui-pass" }, clone, at(7990)) == Policy.MATCH_EXACT,
+		Policy.rankHello({ branch = "ui-pass" }, clone, at("1111111111111111")) == Policy.MATCH_EXACT,
 		"a clone still matches the daemon that names its branch"
 	)
 
 	expect(
-		Policy.rankHello({ placeKey = "my-level-ab12cd34" }, clone, at(7979)) == Policy.MATCH_NONE,
-		"neither a matching key nor the session port reaches a clone: only its branch does"
+		Policy.rankHello({ placeKey = "my-level-ab12cd34" }, clone, at("0123456789abcdef")) == Policy.MATCH_NONE,
+		"neither a matching key nor the session route reaches a clone: only its branch does"
 	)
 
 	expect(
-		Policy.rankHello({ gameId = 0, placeIds = {} }, clone, at(7979)) == Policy.MATCH_NONE,
+		Policy.rankHello({ gameId = 0, placeIds = {} }, clone, at("0123456789abcdef")) == Policy.MATCH_NONE,
 		"...and a clone whose branch daemon is absent still refuses rather than falling through"
 	)
 end
 
 --------------------------------------------------------------------------------
-print("candidate ordering")
+print("where a scan looks")
 --------------------------------------------------------------------------------
 
 do
-	local list = Policy.candidates({
-		host = "127.0.0.1",
-		port = 7985,
-		autoDiscover = true,
-		sessionPort = 7979,
-		branchPort = 7981,
-		markerPort = 7982,
-	})
+	local default = Policy.sources({ host = "localhost", port = Policy.HUB_PORT, autoDiscover = true })
 
-	expect(list[1].port == 7979, "the session port is probed first")
-	expect(list[2].port == 7981, "then the branch port")
-	expect(list[3].port == 7982, "then the marker port")
-	expect(list[4].port == 7985, "then the Settings address")
+	expect(#default == 1, "the default Settings address is the hub, asked once")
+	expect(default[1].host == "127.0.0.1", "...on the IPv4 loopback the hub binds, whatever Host says")
 
-	local seen: { [number]: number } = {}
+	local pinned = Policy.sources({ host = "127.0.0.1", port = 7985, autoDiscover = true })
 
-	for _, candidate in list do
-		seen[candidate.port] = (seen[candidate.port] or 0) + 1
-	end
+	expect(#pinned == 2, "a Settings address that is not the hub is asked, and then the hub")
+	expect(pinned[1].port == 7985 and pinned[2].port == Policy.HUB_PORT, "...in that order")
 
-	local duplicated = false
+	local manual = Policy.sources({ host = "10.0.0.5", port = 9000, autoDiscover = false })
 
-	for _, count in seen do
-		if count > 1 then
-			duplicated = true
-		end
-	end
+	expect(#manual == 1 and manual[1].host == "10.0.0.5", "manual mode is still the Settings address alone")
 
-	expect(not duplicated, "no port is probed twice, however many hints name it")
-	-- Every hint here, and the Settings port, already fall inside the scan
-	-- range: so the whole list is that range, each port exactly once
+	expect(Policy.isHubHello({ hub = true, hubProtocol = 1 }), "a hub's hello is recognised")
+	expect(not Policy.isHubHello({ protocol = 1 }), "...and a daemon's is not")
+end
+
+--------------------------------------------------------------------------------
+print("a hub's listing")
+--------------------------------------------------------------------------------
+
+do
+	local hub = { host = "127.0.0.1", port = Policy.HUB_PORT, https = false }
+
+	local candidates, hellos = Policy.fromListing({
+		daemons = {
+			{ route = "aaaaaaaaaaaaaaaa", hello = { protocol = 1, gameId = 42, placeIds = { 7 } } },
+			{ route = "bbbbbbbbbbbbbbbb", hello = nil },
+			{ route = "../../etc", hello = { protocol = 1 } },
+			{ route = "cccccccccccccccc", hello = { name = "no protocol" } },
+			{ route = "dddddddddddddddd", hello = { protocol = 1, branch = "ui-pass" } },
+		},
+	}, hub)
+
+	expect(#candidates == 2 and #hellos == 2, "only daemons that answered, with a usable route, become candidates")
+	expect(candidates[1].base == "/p/aaaaaaaaaaaaaaaa", "a candidate is reached at its route on the hub")
+	expect(candidates[1].port == Policy.HUB_PORT and candidates[1].route == "aaaaaaaaaaaaaaaa", "...through the hub")
+	expect(hellos[2].branch == "ui-pass", "hellos line up with their candidates")
+
+	local published = place({ gameId = 42, placeId = 7 })
+
 	expect(
-		#list == Policy.PORT_MAX - Policy.PORT_MIN + 1,
-		"hints inside the scan range reorder it rather than lengthening it"
+		Policy.bestIndex(hellos, #candidates, published, candidates) == 1,
+		"main's daemon wins for main's window, and the branch daemon never does"
 	)
 
-	-- A hint that IS the Settings address is not a second candidate
-	local same = Policy.candidates({ host = "localhost", port = 7979, autoDiscover = false, sessionPort = 7979 })
+	local clone = place({ gameId = 42, placeId = 7, branch = true, branchName = "ui-pass" })
 
-	expect(#same == 1 and same[1].port == 7979, "a hint equal to the Settings address collapses into one probe")
+	expect(Policy.bestIndex(hellos, #candidates, clone, candidates) == 2, "the clone takes its branch daemon")
 
-	local none = Policy.candidates({ host = "10.0.0.5", port = 9000, autoDiscover = false })
+	local empty = Policy.fromListing(nil, hub)
 
-	expect(#none == 1 and none[1].host == "10.0.0.5", "manual mode is still the Settings candidate alone")
+	expect(#empty == 0, "no listing is no candidates")
 end
 
 --------------------------------------------------------------------------------
@@ -236,7 +259,7 @@ do
 	state, effect = Policy.step(state, { kind = "start" })
 	expect(state.name == "scanning" and effect == "scan", "start scans")
 
-	local broker = { host = "127.0.0.1", port = 7968 }
+	local broker = { host = "127.0.0.1", port = Policy.HUB_PORT, base = "/broker" }
 	local scanning = state
 
 	state, effect = Policy.step(state, { kind = "scan-none-attach", generation = state.generation, broker = broker })
@@ -249,11 +272,12 @@ do
 		kind = "attach-ok",
 		generation = state.generation,
 		host = "127.0.0.1",
-		port = 7979,
+		port = Policy.HUB_PORT,
+		base = "/p/0123456789abcdef",
 		project = "unpublished-my-level-ab12cd34",
 	})
-	expect(state.name == "found" and effect == "connect", "the answer connects straight to the port")
-	expect(state.port == 7979 and state.temporary == true, "...and the connection is marked temporary")
+	expect(state.name == "found" and effect == "connect", "the answer connects straight to the route")
+	expect(state.base == "/p/0123456789abcdef" and state.temporary == true, "...and the connection is marked temporary")
 
 	-- A refusal is the ordinary no-daemon card, not an error page
 	local refused, refusedEffect = Policy.step(attaching, { kind = "attach-none", generation = attaching.generation })
@@ -286,11 +310,17 @@ do
 	expect(string.find(attaching.status, "nothing is written to disk") ~= nil, "...and says what temporary means")
 	expect(attaching.action == "Cancel", "an attach can be called off")
 
-	local temporary = Policy.describe({ name = "found", generation = 1, port = 7979, temporary = true }, env)
+	local temporary =
+		Policy.describe({ name = "found", generation = 1, port = 7960, base = "/p/0123456789abcdef", temporary = true }, env)
 	expect(string.find(temporary.status, "Attached temporarily") ~= nil, "a temporary connect says so while connecting")
 
-	local ordinary = Policy.describe({ name = "found", generation = 1, port = 7979, project = "dungeon" }, env)
-	expect(string.find(ordinary.status, "Found 'dungeon'") ~= nil, "an ordinary connect is unchanged")
+	local ordinary =
+		Policy.describe({ name = "found", generation = 1, port = 7960, base = "/p/0123456789abcdef", project = "dungeon" }, env)
+	expect(string.find(ordinary.status, "Found 'dungeon'") ~= nil, "an ordinary connect names the project")
+	expect(string.find(ordinary.status, "port") == nil, "...and no port: a hub route has none worth showing")
+
+	local direct = Policy.describe({ name = "found", generation = 1, port = 7985, base = "", project = "dungeon" }, env)
+	expect(string.find(direct.status, "port 7985") ~= nil, "a daemon reached on its own port says which")
 
 	expect(Policy.temporaryNote({ ephemeral = true }) ~= nil, "an ephemeral daemon earns the connected-card note")
 	expect(Policy.temporaryNote({ ephemeral = false }) == nil, "an ordinary daemon does not")
@@ -320,13 +350,13 @@ do
 
 	local ok, failure, disabled = Broker.parseAttachResponse({
 		ok = true,
-		port = 7979,
+		route = "0123456789abcdef",
 		project = "C:/p/default.project.json",
 		placeKey = "my-level-ab12cd34",
 		key = "unpublished-my-level-ab12cd34",
 		ephemeral = true,
 	})
-	expect(ok ~= nil and ok.port == 7979, "a good answer yields the port to connect to")
+	expect(ok ~= nil and ok.route == "0123456789abcdef", "a good answer yields the route to connect to")
 	expect(ok.placeKey == "my-level-ab12cd34", "...and the key to remember in the place")
 	expect(failure == nil and disabled == false, "...with nothing to report")
 
@@ -334,8 +364,8 @@ do
 	expect(off == nil and offDisabled == true, "a switched-off app is reported as switched off")
 	expect(type(offMessage) == "string", "...with something to say about it")
 
-	local bad, badMessage, badDisabled = Broker.parseAttachResponse({ ok = true, port = 0 })
-	expect(bad == nil and badDisabled == false, "an answer with no usable port is a failure")
+	local bad, badMessage, badDisabled = Broker.parseAttachResponse({ ok = true, port = 7979 })
+	expect(bad == nil and badDisabled == false, "an answer with a port but no route is a failure")
 	expect(type(badMessage) == "string", "...and says so")
 
 	expect(Broker.parseAttachResponse("nope") == nil, "and so is an answer that is not an object")

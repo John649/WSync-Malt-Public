@@ -6,13 +6,12 @@
 -- This module owns every decision that does not need a socket or a Roblox
 -- API:
 --
---   * candidate ordering  — the port this window was handed (a branch
---                           clone's marker, a place marker's `DaemonPort`,
---                           an attach the desktop app just made), then the
---                           Settings `Host:Port` override, then
---                           `127.0.0.1:7978-7990` (deduplicated); with
---                           `AutoDiscover = false` the Settings candidate is
---                           the whole list (pure manual mode)
+--   * where to look       — the Settings `Host:Port` override, then the WSync
+--                           hub on `127.0.0.1:7960` (src/hub in the engine),
+--                           which lists every daemon on the machine with its
+--                           live `/hello`; with `AutoDiscover = false` the
+--                           Settings address is the only place asked (pure
+--                           manual mode)
 --   * matching            — strict-GameId ranking of `/hello` responses
 --                           against the open place
 --   * the state machine   — idle → scanning → found/create-ready/no-broker,
@@ -30,8 +29,11 @@
 local Policy = {}
 
 Policy.LOCAL_HOST = "127.0.0.1"
-Policy.PORT_MIN = 7978
-Policy.PORT_MAX = 7990
+
+--- The hub's port (the engine's `hub::DEFAULT_PORT`). Every daemon registers
+--- with the hub and is reached through it at `/p/<route>`; no daemon has a
+--- port anyone needs to know
+Policy.HUB_PORT = 7960
 
 -- Match ranks, higher wins; the scan may stop early at MATCH_EXACT.
 Policy.MATCH_NONE = 0
@@ -39,7 +41,21 @@ Policy.MATCH_WEAK = 1 -- claimless daemon for an unpublished place, or a placeId
 Policy.MATCH_GAME = 2 -- gameId matches, no placeIds claim
 Policy.MATCH_EXACT = 3 -- gameId and placeId both match
 
+--- A daemon discovery can connect to
 export type Candidate = {
+	host: string,
+	port: number,
+	https: boolean,
+	--- The path every one of the daemon's routes hangs off: `/p/<route>` for a
+	--- daemon reached through the hub, empty for one on its own port
+	base: string,
+	--- The daemon's route on the hub, when it was reached through one. It
+	--- names the project, so it outlives a daemon restart on another port
+	route: string?,
+}
+
+--- An address discovery asks: a hub, or a daemon on its own port
+export type Source = {
 	host: string,
 	port: number,
 	https: boolean,
@@ -50,20 +66,6 @@ export type Settings = {
 	port: number,
 	https: boolean?,
 	autoDiscover: boolean,
-	--- A branch clone's own daemon port, taken from the clone's marker. When
-	--- present it is probed FIRST: the branch daemon is the only one that can
-	--- match a clone, so walking the shared scan range to reach it is a dozen
-	--- pointless connection refusals on every boot. Ranking is unchanged — it
-	--- still has to come back MATCH_EXACT.
-	branchPort: number?,
-	--- The port the desktop app's attach route handed THIS window for THIS
-	--- session (docs/places.md). Probed first and trusted exactly, because
-	--- the daemon on the other end was started for this Studio and claims no
-	--- ids to be recognised by.
-	sessionPort: number?,
-	--- The port the place's own `WSyncPlace` marker names, when it names one.
-	--- Same shortcut as `branchPort`, same rule: still has to rank exact.
-	markerPort: number?,
 }
 
 export type PlaceIdentity = {
@@ -81,10 +83,10 @@ export type PlaceIdentity = {
 	--- names the same key ranks EXACT, which is the only way a place with no
 	--- ids is told apart from every other place with no ids.
 	placeKey: string?,
-	--- The port the desktop app's attach route handed this window this
-	--- session. A daemon answering there is this window's own, whatever it
+	--- The hub route the desktop app's attach route handed this window this
+	--- session. The daemon behind it is this window's own, whatever it
 	--- claims — see `rankHello`.
-	sessionPort: number?,
+	sessionRoute: string?,
 }
 
 export type HelloClaim = {
@@ -107,60 +109,80 @@ function Policy.isLoopback(host: string): boolean
 	return hostname == "localhost" or hostname == "127.0.0.1" or hostname == "0.0.0.0"
 end
 
---- The ordered `/hello` probe list: the Settings `Host:Port` override first
---- (it participates in discovery, so pointing it at a remote daemon needs no
---- extra UI), then the local range — minus the Settings address when it
---- already falls inside it. `autoDiscover = false` restricts the scan to the
---- Settings candidate alone.
-function Policy.candidates(settings: Settings): { Candidate }
-	local list: { Candidate } = {}
-	local seen: { [number]: boolean } = {}
+--- The addresses a scan asks, in order: the Settings `Host:Port` override
+--- first (a hub there lists its daemons; a daemon there is a candidate of its
+--- own, which is how a remote or pinned daemon is reached), then the local
+--- hub unless the Settings address already is it. `autoDiscover = false`
+--- asks the Settings address alone.
+function Policy.sources(settings: Settings): { Source }
+	local settingsIsHub = Policy.isLoopback(settings.host) and settings.port == Policy.HUB_PORT
 
-	--- The hinted loopback ports, in the order they are trusted: the one this
-	--- session was handed, the branch clone's own, the place marker's.
-	local function hint(port: number?)
-		if port ~= nil and not seen[port] then
-			seen[port] = true
-
-			table.insert(list, {
-				host = Policy.LOCAL_HOST,
-				port = port,
-				https = false,
-			})
-		end
-	end
-
-	hint(settings.sessionPort)
-	hint(settings.branchPort)
-	hint(settings.markerPort)
-
-	local settingsIsHinted = Policy.isLoopback(settings.host) and seen[settings.port] == true
-
-	if not settingsIsHinted then
-		table.insert(list, {
-			host = settings.host,
+	local list: { Source } = {
+		{
+			-- The hub binds the IPv4 loopback only, and `localhost` resolves to
+			-- ::1 first on macOS
+			host = if settingsIsHub then Policy.LOCAL_HOST else settings.host,
 			port = settings.port,
-			https = settings.https == true,
+			https = settings.https == true and not settingsIsHub,
+		},
+	}
+
+	if settings.autoDiscover and not settingsIsHub then
+		table.insert(list, {
+			host = Policy.LOCAL_HOST,
+			port = Policy.HUB_PORT,
+			https = false,
 		})
 	end
 
-	if not settings.autoDiscover then
-		return list
-	end
-
-	local coveredPort = if Policy.isLoopback(settings.host) then settings.port else nil
-
-	for port = Policy.PORT_MIN, Policy.PORT_MAX do
-		if port ~= coveredPort and not seen[port] then
-			table.insert(list, {
-				host = Policy.LOCAL_HOST,
-				port = port,
-				https = false,
-			})
-		end
-	end
-
 	return list
+end
+
+--- Whether a decoded `/hello` is a hub's rather than a daemon's. A hub's hello
+--- carries no numeric `protocol`, so an older plugin never took it for a daemon
+function Policy.isHubHello(value: any): boolean
+	return type(value) == "table" and value.hub == true
+end
+
+--- The candidates a hub's `GET /daemons` names, each with the `/hello` the hub
+--- fetched for it. A daemon that did not answer the hub is left out: there is
+--- nothing to rank it by. Returns the candidates and their hellos, index for
+--- index.
+function Policy.fromListing(listing: any, hub: Source): ({ Candidate }, { HelloClaim })
+	local candidates: { Candidate } = {}
+	local hellos: { HelloClaim } = {}
+
+	if type(listing) ~= "table" or type(listing.daemons) ~= "table" then
+		return candidates, hellos
+	end
+
+	for _, entry in listing.daemons do
+		if type(entry) ~= "table" then
+			continue
+		end
+
+		local route = entry.route
+		local hello = entry.hello
+
+		if type(route) ~= "string" or route == "" or route:find("[^%w]") ~= nil then
+			continue
+		end
+
+		if type(hello) ~= "table" or type(hello.protocol) ~= "number" then
+			continue
+		end
+
+		table.insert(candidates, {
+			host = hub.host,
+			port = hub.port,
+			https = hub.https,
+			base = `/p/{route}`,
+			route = route,
+		})
+		table.insert(hellos, hello)
+	end
+
+	return candidates, hellos
 end
 
 --- Rank a daemon's `/hello` claim against the open place (strict GameId):
@@ -178,7 +200,7 @@ end
 --- agree on; ids alone would leave the clone weak against every daemon and
 --- the refusal below would then refuse them all.
 --- `candidate` is where this hello came from, when the caller knows: it is
---- what makes the session-port hint meaningful, since the hint is about an
+--- what makes the session-route hint meaningful, since the hint is about an
 --- address rather than about anything the daemon says.
 function Policy.rankHello(hello: HelloClaim, place: PlaceIdentity, candidate: Candidate?): number
 	if place.branch ~= true then
@@ -190,14 +212,16 @@ function Policy.rankHello(hello: HelloClaim, place: PlaceIdentity, candidate: Ca
 		end
 
 		-- The session hint: the desktop app started this daemon for THIS
-		-- Studio window and told us the port. It claims no ids — it was made
+		-- Studio window and told us its route. It claims no ids — it was made
 		-- for a place that has none — so nothing below would ever rank it;
 		-- what makes it exact is that we asked for it. Session state, never
-		-- written into the place, so it dies with the window.
+		-- written into the place, so it dies with the window. A route names a
+		-- project rather than a port, so a port some other daemon took over
+		-- can never be mistaken for it
 		if
 			candidate ~= nil
-			and place.sessionPort ~= nil
-			and candidate.port == place.sessionPort
+			and place.sessionRoute ~= nil
+			and candidate.route == place.sessionRoute
 			and Policy.isLoopback(candidate.host)
 		then
 			return Policy.MATCH_EXACT
@@ -284,11 +308,9 @@ function Policy.rankStrict(hello: HelloClaim, place: PlaceIdentity): number
 	return Policy.MATCH_NONE
 end
 
---- The index of the best-ranked hello in a batch of probe results, and its
---- rank. Ties go to the earlier candidate, which is what keeps the candidate
---- ordering meaningful once the probes run concurrently: among equally weak
---- matches the Settings address still wins, and a branch's own daemon port
---- still wins over everything, because both are first in the list.
+--- The index of the best-ranked hello in a batch of candidates, and its rank.
+--- Ties go to the earlier candidate: among equally weak matches the Settings
+--- address wins, because it is asked first.
 ---
 --- `hellos` is sparse — a candidate that did not answer has no entry — so the
 --- walk is driven by `count` rather than by `#hellos`. `candidates` is the
@@ -343,6 +365,7 @@ export type State = {
 	-- found: the daemon to connect to
 	host: string?,
 	port: number?,
+	base: string?,
 	project: string?,
 	-- create flow: the broker match the request goes to (opaque to the machine)
 	broker: any?,
@@ -387,6 +410,7 @@ export type Event = {
 	generation: number?,
 	host: string?,
 	port: number?,
+	base: string?,
 	project: string?,
 	broker: any?,
 	known: boolean?,
@@ -505,6 +529,7 @@ function Policy.step(state: State, event: Event): (State, Effect?)
 				return make("found", state.generation, {
 					host = event.host,
 					port = event.port,
+					base = event.base,
 					project = event.project,
 				}),
 					"connect"
@@ -535,6 +560,7 @@ function Policy.step(state: State, event: Event): (State, Effect?)
 				return make("found", state.generation, {
 					host = event.host,
 					port = event.port,
+					base = event.base,
 					project = event.project,
 					temporary = true,
 				}),
@@ -579,6 +605,7 @@ function Policy.step(state: State, event: Event): (State, Effect?)
 				return make("found", state.generation, {
 					host = event.host,
 					port = event.port,
+					base = event.base,
 					project = event.project,
 				}),
 					"connect"
@@ -625,7 +652,7 @@ function Policy.describe(state: State, env: Env): Descriptor
 	if name == "idle" then
 		return {
 			status = if env.autoDiscover
-				then `Auto-discover {Policy.LOCAL_HOST}:{Policy.PORT_MIN}–{Policy.PORT_MAX}`
+				then `Auto-discover through the WSync hub ({Policy.LOCAL_HOST}:{Policy.HUB_PORT})`
 				else `Connect to {env.host}:{env.port}`,
 			dot = "neutral" :: Dot,
 			action = "Connect",
@@ -634,7 +661,7 @@ function Policy.describe(state: State, env: Env): Descriptor
 	elseif name == "scanning" then
 		return {
 			status = if env.autoDiscover
-				then `Scanning localhost {Policy.PORT_MIN}–{Policy.PORT_MAX}…`
+				then "Asking the WSync hub for this place's daemon…"
 				else `Probing {env.host}:{env.port}…`,
 			dot = "neutral" :: Dot,
 			action = "Cancel",
@@ -651,14 +678,17 @@ function Policy.describe(state: State, env: Env): Descriptor
 		}
 	elseif name == "found" then
 		local project = state.project or "project"
-		local where = if state.host == nil or Policy.isLoopback(state.host :: string)
-			then `port {state.port}`
-			else `{state.host}:{state.port}`
+		-- A daemon reached through the hub has no address worth showing; one
+		-- reached on its own (the Settings override) does
+		local where = if state.base ~= nil and state.base ~= ""
+			then ""
+			elseif state.host == nil or Policy.isLoopback(state.host :: string) then ` on port {state.port}`
+			else ` on {state.host}:{state.port}`
 
 		return {
 			status = if state.temporary
-				then `Attached temporarily on {where} — connecting…`
-				else `Found '{project}' on {where} — connecting…`,
+				then `Attached temporarily{where} — connecting…`
+				else `Found '{project}'{where} — connecting…`,
 			dot = "green" :: Dot,
 			action = "Cancel",
 			back = false,

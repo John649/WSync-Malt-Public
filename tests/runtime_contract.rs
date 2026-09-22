@@ -26,6 +26,10 @@ fn command(home: &TempDir, args: &[&str]) -> Output {
 		.env("HOME", home.path())
 		.env("USERPROFILE", home.path())
 		.env("WSYNC_STATE_DIR", home.path().join("state"))
+		// Never the real hub, and never a real Studio: these tests reach their
+		// daemons by --port, and port 1 is one nothing can bind
+		.env("WSYNC_HUB_PORT", "1")
+		.env("WSYNC_NO_STUDIO_LAUNCH", "1")
 		.env("NO_COLOR", "1")
 		.env("HTTP_PROXY", "http://127.0.0.1:1")
 		.env("HTTPS_PROXY", "http://127.0.0.1:1")

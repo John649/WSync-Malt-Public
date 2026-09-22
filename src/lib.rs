@@ -11,6 +11,7 @@ pub mod daemon;
 pub mod docsgen;
 pub mod ext;
 pub mod glob;
+pub mod hub;
 pub mod installer;
 pub mod integration;
 pub mod logger;

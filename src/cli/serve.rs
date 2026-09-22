@@ -2,13 +2,21 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use colored::Colorize;
 use log::{debug, info};
-use std::{path::PathBuf, process, sync::Arc, thread};
+use std::{
+	path::PathBuf,
+	process,
+	sync::{
+		atomic::{AtomicU16, Ordering},
+		Arc,
+	},
+	thread,
+};
 
 use crate::{
 	config::Config,
 	core::Core,
 	ext::PathExt,
-	integration,
+	hub, integration,
 	program::{Program, ProgramName},
 	project::{self, Project},
 	server::{self, Server, ServerIdentity},
@@ -117,35 +125,12 @@ impl Serve {
 
 		let core = Core::new(project, true)?;
 		let host = self.host.unwrap_or(core.host().unwrap_or(config.host.clone()));
-		let mut port = self.port.unwrap_or(core.port().unwrap_or(config.port));
+		// No pin means whatever port the OS hands out: the hub is how
+		// everything reaches this daemon (src/hub)
+		let port = self.port.or(core.port()).unwrap_or(0);
 
-		if !server::is_port_free(&host, port) {
-			if config.scan_ports {
-				let max_port = config.port_scan_max.max(port);
-
-				if let Some(new_port) = server::get_free_port(&host, port, max_port) {
-					wsync_warn!(
-						"Port {} is already in use, using {} instead!",
-						port.to_string().bold(),
-						new_port.to_string().bold()
-					);
-
-					port = new_port;
-				} else {
-					bail!(
-						"No free port found in range {}-{}! Increase the {} setting to scan further",
-						port.to_string().bold(),
-						max_port.to_string().bold(),
-						"port_scan_max".bold()
-					);
-				}
-			} else {
-				bail!(
-					"Port {} is already in use! Enable {} setting to use first available port automatically",
-					port.to_string().bold(),
-					"scan_ports".bold()
-				);
-			}
+		if port != 0 && !server::is_port_free(&host, port) {
+			bail!("Port {} is already in use", port.to_string().bold());
 		}
 
 		let core = Arc::new(core);
@@ -173,23 +158,35 @@ impl Serve {
 			});
 		}
 
-		sessions::add(
-			self.session,
-			Some(host.clone()),
-			Some(port),
-			process::id(),
-			config.run_async,
-		)?;
+		let server = Server::new(core, &host, port, ServerIdentity::unmanaged()).with_hub(true);
+		let bound = Arc::new(AtomicU16::new(port));
 
-		let server = Server::new(core, &host, port, ServerIdentity::unmanaged());
+		let ready: Box<dyn FnOnce(u16) + Send> = {
+			let host = host.clone();
+			let bound = bound.clone();
+			let session = self.session.clone();
+			let run_async = config.run_async;
 
-		wsync_info!(
-			"Serving on: {}, project: {}",
-			server::format_address(&host, port).bold(),
-			project_path.to_string().bold()
-		);
+			Box::new(move |port| {
+				bound.store(port, Ordering::Relaxed);
 
-		server.start(None)?;
+				if let Err(err) = sessions::add(session, Some(host.clone()), Some(port), process::id(), run_async) {
+					wsync_warn!("Failed to record this session: {}", err);
+				}
+
+				wsync_info!(
+					"Serving on: {} (through the hub at {}), project: {}",
+					server::format_address(&host, port).bold(),
+					hub::url("").bold(),
+					project_path.to_string().bold()
+				);
+			})
+		};
+
+		drop(config);
+		server.start(Some(ready))?;
+
+		let port = bound.load(Ordering::Relaxed);
 
 		// Graceful stop (`/stop` route): remove this session's entry
 		if let Ok(Some(session)) = sessions::get(None, Some(host.clone()), Some(port)) {

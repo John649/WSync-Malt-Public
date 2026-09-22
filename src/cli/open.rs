@@ -28,7 +28,9 @@ use crate::{
 		client::{print_json, Targeting},
 		live, places, spawn,
 	},
+	daemon,
 	ext::PathExt,
+	hub,
 	project::{self, Project},
 	studio, wsync_info,
 };
@@ -139,9 +141,16 @@ impl Open {
 		// scratch roots from outside
 		let scratch = places::is_scratch_dir(&workspace);
 
+		// The route the daemon for this project will be reached at on the hub,
+		// which is what the desktop app hands the plugin that asked
+		let route = daemon::canonical_project(&project)
+			.ok()
+			.map(|canonical| hub::route_key(&canonical));
+
 		print_json(&json!({
 			"ok": true,
 			"project": project.to_string(),
+			"route": route,
 			"workspace": workspace.to_string(),
 			"name": places::scratch_project_name(place_id, self.place_key.as_deref()),
 			"placeId": place_id,
@@ -172,6 +181,17 @@ impl Open {
 	}
 
 	fn open_place(self, place_id: Option<u64>) -> Result<()> {
+		// `--port` picks the daemon a Studio selection goes to. A place is
+		// opened by id, and a stray `--port` here almost always means the
+		// selection paths were left off
+		if self.targeting.port.is_some() {
+			bail!(
+				"`--port` belongs to selecting Studio paths (`{}`); `wsync open` without paths launches Studio \
+				 on a place and takes no --port",
+				"wsync open <STUDIO-PATH>... --port <PORT>".bold()
+			);
+		}
+
 		// `--project` is both a way to name the place (its first
 		// servePlaceIds entry) and the fallback source for the universe
 		let project = match &self.targeting.project {
@@ -246,11 +266,15 @@ impl Open {
 				"url": url,
 				"daemon": serving.as_ref().map(|candidate| json!({
 					"project": candidate.project,
+					"route": hub::route_key(&candidate.canonical),
 					"port": candidate.port,
 					"branch": candidate.branch,
 				})),
 				"attached": attached.as_ref().map(|attached| json!({
 					"project": attached.project.to_string(),
+					"route": daemon::canonical_project(&attached.project)
+						.ok()
+						.map(|canonical| hub::route_key(&canonical)),
 					"port": attached.port,
 					"pid": attached.pid,
 					"ephemeral": attached.ephemeral,

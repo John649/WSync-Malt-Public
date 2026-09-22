@@ -19,6 +19,9 @@ local Error = {
 	UnknownEvent = "Received an unknown event from the server: $1, with data: $2",
 	Disconnected = "Disconnected from the server: $1",
 	ServerShutdown = "The server refused the connection: $1",
+	-- The daemon behind this window's address is a new boot: its route on the
+	-- hub is the same, but every ref this window holds is gone
+	Resync = "The daemon restarted: $1",
 	DivergenceFailed = "Failed to resolve the initial divergence with the server: $1",
 	-- Process errors
 	DecodeFailed = "Failed to decode snapshot property: $1 with value: $2",

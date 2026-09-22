@@ -68,7 +68,7 @@ local SETTINGS_DATA: { { Title: string, Settings: { SettingData } } } = {
 			{
 				Setting = "AutoDiscover",
 				Name = "Auto Discover",
-				Description = "Also scan localhost 7978–7990 for a matching daemon; disable to probe Host/Port only",
+				Description = "Also ask the WSync hub on 127.0.0.1:7960 for this place's daemon; disable to use Host/Port only",
 			},
 			{
 				Setting = "Https",

@@ -34,8 +34,6 @@ pub enum ConfigKind {
 pub struct Config {
 	/// Default server host name
 	pub host: String,
-	/// Default server port number
-	pub port: u16,
 	/// Default project template (place, model, etc.)
 	pub template: String,
 	/// Default project license (SPDX identifier)
@@ -51,8 +49,6 @@ pub struct Config {
 
 	/// Run WSync asynchronously, freeing up the terminal
 	pub run_async: bool,
-	/// Scan for the first available port if selected one is in use
-	pub scan_ports: bool,
 	/// Automatically detect project type
 	pub detect_project: bool,
 	/// Use smart path resolver when running commands
@@ -110,8 +106,6 @@ pub struct Config {
 	// NOTE(phase-1): the Argon-protocol HTTP endpoints are served regardless
 	// of this flag until the WSync WebSocket protocol lands in phase 2
 	pub compat_argon: bool,
-	/// Highest port checked when scanning for a free or discoverable port
-	pub port_scan_max: u16,
 	/// Route connect-time divergence prompts to the desktop app when running
 	// TODO(phase-6): consumed by the desktop app divergence modal flow
 	pub auto_open_app_modal: bool,
@@ -125,7 +119,6 @@ impl Default for Config {
 	fn default() -> Self {
 		Self {
 			host: String::from("localhost"),
-			port: 7978,
 			template: String::from("place"),
 			license: String::from("Apache-2.0"),
 			include_docs: false,
@@ -134,7 +127,6 @@ impl Default for Config {
 			use_selene: false,
 
 			run_async: false,
-			scan_ports: true,
 			detect_project: true,
 			smart_paths: false,
 			with_sourcemap: false,
@@ -162,7 +154,6 @@ impl Default for Config {
 			syncback_model_json: false,
 			conflict_engine: true,
 			compat_argon: false,
-			port_scan_max: 7990,
 			auto_open_app_modal: true,
 
 			kind: ConfigKind::default(),

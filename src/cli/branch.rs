@@ -95,8 +95,9 @@ use std::{
 
 use crate::{
 	cli::client::{print_json, truncate, Client, Envelope, Target, Targeting},
-	docsgen,
+	daemon, docsgen,
 	ext::PathExt,
+	hub,
 	server::journal::{finish_decision, FinishDecision},
 	wsync_info, wsync_warn,
 };
@@ -111,9 +112,6 @@ const MARKER_NAME: &str = "WSyncBranch";
 /// clone opened from an `.rbxl` reports `game.GameId == 0`
 const GAME_ID_ATTRIBUTE: &str = "GameId";
 
-/// Number attribute on the marker naming the branch daemon's port, so the
-/// plugin's discovery tries it before it ranks anything
-const DAEMON_PORT_ATTRIBUTE: &str = "DaemonPort";
 /// The real place id, so the clone can claim it on boot (`SetPlaceId`) and
 /// DataStores, MessagingService and every place-keyed API behave as on main.
 /// The branch is told apart by the marker's Value alone
@@ -278,10 +276,13 @@ impl Record {
 		self.worktree().join(main_project.get_name())
 	}
 
+	/// The branch daemon, reached through the hub by its worktree project.
+	/// `daemon_port` is what it last bound, kept for `branch ls`; nothing is
+	/// sent to it, so a daemon restarted on another port is still found
 	fn targeting(&self, main_project: &Path) -> Targeting {
 		Targeting {
 			project: Some(self.project(main_project)),
-			port: self.daemon_port,
+			port: None,
 		}
 	}
 }
@@ -596,15 +597,15 @@ impl New {
 		clock.mark("project", "");
 
 		// (6) the branch's own daemon. It only needs the worktree, so it starts
-		// before the clone is assembled — and its port goes into the clone's
-		// marker, which is how the branch plugin finds it without ranking
+		// before the clone is assembled. The clone's marker names the branch,
+		// and that is how the branch plugin picks this daemon out of the hub
 		let (port, daemon_pid) = spawn_daemon(&project)?;
 		record.daemon_port = Some(port);
 		record.write(&root)?;
 		clock.mark("daemon", &format!("port {port}"));
 
 		// (7) the clone, then Studio on it the moment the file is there
-		assemble_place(&services, &name, game_id, place_id, Some(port), &place, raw)?;
+		assemble_place(&services, &name, game_id, place_id, &place, raw)?;
 		clock.mark("assemble", "");
 
 		let studio_pid = launch_studio(&place)?;
@@ -659,7 +660,7 @@ impl Ls {
 				continue;
 			};
 
-			let daemon = record.daemon_port.is_some_and(daemon_answers);
+			let daemon = daemon_answers(&record.project(&main.project));
 			let studio = record.studio_pid.is_some_and(process_alive);
 			let dirty = git_out(&record.worktree(), &["status", "--porcelain"])
 				.map(|out| !out.trim().is_empty())
@@ -936,7 +937,7 @@ impl Finish {
 		// The branch daemon serves the journal and the blobs, and a daemon
 		// is the one part of a branch that can simply be started again: its
 		// state is the directory. A Studio is never launched from here
-		if !record.daemon_port.is_some_and(daemon_answers) {
+		if !daemon_answers(&record.project(&main.project)) {
 			let project = record.project(&main.project);
 			let (port, _) = spawn_daemon(&project)?;
 
@@ -1694,6 +1695,8 @@ fn disinherit_std_handles() {
 /// Once `studio::launch` answers `Result<u32>` this whole function collapses
 /// into a call to it
 fn launch_studio(place: &Path) -> Result<u32> {
+	crate::studio::ensure_launch_allowed()?;
+
 	let studio = roblox_install::RobloxStudio::locate()
 		.context("Failed to locate Roblox Studio")?
 		.application_path()
@@ -1718,27 +1721,22 @@ fn launch_studio(place: &Path) -> Result<u32> {
 	Ok(child.id())
 }
 
-fn daemon_answers(port: u16) -> bool {
-	probe_hello(port).is_some()
-}
+/// Whether the daemon serving `project` answers through the hub, as itself
+fn daemon_answers(project: &Path) -> bool {
+	let Ok(canonical) = daemon::canonical_project(project) else {
+		return false;
+	};
 
-/// `GET /hello` on a port, as raw JSON. Enough to tell one daemon's identity
-/// from another's without the live-command targeting machinery, which insists
-/// on a project it can already name
-fn probe_hello(port: u16) -> Option<Value> {
 	reqwest::blocking::Client::builder()
 		.no_proxy()
 		.timeout(Duration::from_millis(1500))
 		.redirect(reqwest::redirect::Policy::none())
 		.build()
-		.ok()?
-		.get(format!("http://localhost:{port}/hello"))
-		.send()
-		.ok()?
-		.error_for_status()
-		.ok()?
-		.json()
 		.ok()
+		.and_then(|client| client.get(format!("{}/hello", hub::route_url(&canonical))).send().ok())
+		.and_then(|response| response.error_for_status().ok())
+		.and_then(|response| response.json::<Value>().ok())
+		.is_some_and(|hello| hello.get("canonicalProject").and_then(Value::as_str) == Some(canonical.as_str()))
 }
 
 /// Waits for a plugin to connect to a daemon: a `ping` that comes back
@@ -1775,7 +1773,7 @@ fn wait_for_plugin(client: &Client, patience: Duration) -> Result<()> {
 fn adopt(client: &Client, record: &Record, root: &Path, raw: bool) -> Result<()> {
 	// The plugin asks its own daemon for the shape, so it has to be there
 	// first — and a daemon that restarted since `new` serves a fresh store
-	push_shape(record, root)?;
+	push_shape(client, record, root)?;
 
 	let mut args = json!({ "checkpoint": record.checkpoint, "count": record.count });
 
@@ -1870,8 +1868,8 @@ fn render_side(value: &Value) -> String {
 /// Puts the checkpoint shape on the branch's OWN daemon under the id main's
 /// plugin gave it, so `branch_adopt` can fetch it from there. Idempotent, and
 /// a no-op for a checkpoint that carried no shape
-fn push_shape(record: &Record, root: &Path) -> Result<bool> {
-	let (Some(shape), Some(port)) = (record.shape_blob.as_deref(), record.daemon_port) else {
+fn push_shape(client: &Client, record: &Record, root: &Path) -> Result<bool> {
+	let Some(shape) = record.shape_blob.as_deref() else {
 		return Ok(false);
 	};
 
@@ -1879,7 +1877,7 @@ fn push_shape(record: &Record, root: &Path) -> Result<bool> {
 	let payload =
 		fs::read(&file).with_context(|| format!("Failed to read the checkpoint shape {}", file.to_string()))?;
 
-	upload_blob(port, shape, &payload)?;
+	upload_blob(client, shape, &payload)?;
 
 	Ok(true)
 }
@@ -1887,22 +1885,23 @@ fn push_shape(record: &Record, root: &Path) -> Result<bool> {
 /// `POST /journal/blob/<id>` — the raw bytes, verbatim. The daemon keeps
 /// blobs beside the journal that names them precisely because the plugin
 /// that made them is usually gone by the time something reads them
-fn upload_blob(port: u16, id: &str, payload: &[u8]) -> Result<()> {
+fn upload_blob(client: &Client, id: &str, payload: &[u8]) -> Result<()> {
+	let daemon = client.target.route.describe();
 	let response = reqwest::blocking::Client::builder()
 		.no_proxy()
 		.timeout(Duration::from_secs(30))
 		.redirect(reqwest::redirect::Policy::none())
 		.build()?
-		.post(format!("http://localhost:{port}/journal/blob/{id}"))
+		.post(client.url(&format!("/journal/blob/{id}")))
 		.body(payload.to_vec())
 		.send()
-		.with_context(|| format!("Failed to upload blob {id} to the branch daemon on port {port}"))?;
+		.with_context(|| format!("Failed to upload blob {id} to the branch daemon at {daemon}"))?;
 
 	let status = response.status();
 
 	if !status.is_success() {
 		bail!(
-			"The branch daemon on port {port} refused blob {id} (HTTP {status}): {}",
+			"The branch daemon at {daemon} refused blob {id} (HTTP {status}): {}",
 			truncate(&response.text().unwrap_or_default(), 200)
 		);
 	}
@@ -1914,15 +1913,20 @@ fn upload_blob(port: u16, id: &str, payload: &[u8]) -> Result<()> {
 /// or `None` when it never got them. This is the copy a merge prefers: it
 /// needs no Studio, which is the whole point of the daemon pulling blobs as
 /// the events that name them are appended
-fn download_blob(port: u16, id: &str) -> Result<Option<Vec<u8>>> {
+fn download_blob(client: &Client, id: &str) -> Result<Option<Vec<u8>>> {
 	let response = reqwest::blocking::Client::builder()
 		.no_proxy()
 		.timeout(Duration::from_secs(30))
 		.redirect(reqwest::redirect::Policy::none())
 		.build()?
-		.get(format!("http://localhost:{port}/journal/blob/{id}"))
+		.get(client.url(&format!("/journal/blob/{id}")))
 		.send()
-		.with_context(|| format!("Failed to read blob {id} from the daemon on port {port}"))?;
+		.with_context(|| {
+			format!(
+				"Failed to read blob {id} from the daemon at {}",
+				client.target.route.describe()
+			)
+		})?;
 
 	if !response.status().is_success() {
 		return Ok(None);
@@ -1936,7 +1940,7 @@ fn download_blob(port: u16, id: &str) -> Result<Option<Vec<u8>>> {
 fn restart(record: &mut Record, root: &Path, project: &Path, budget: usize, workspace: &Path) -> Result<Vec<String>> {
 	let mut restarted = Vec::new();
 
-	if !record.daemon_port.is_some_and(daemon_answers) {
+	if !daemon_answers(project) {
 		let (port, _) = spawn_daemon(project)?;
 
 		record.daemon_port = Some(port);
@@ -1967,7 +1971,7 @@ fn close(record: &mut Record, root: &Path, main_project: &Path) -> Result<(bool,
 		_ => false,
 	};
 
-	let daemon = record.daemon_port.is_some_and(daemon_answers);
+	let daemon = daemon_answers(&record.project(main_project));
 
 	if daemon {
 		let binary = env::current_exe().context("Failed to locate the running wsync executable")?;
@@ -2233,8 +2237,6 @@ fn collect_blobs(client: &Client, journal: &Value, source: BlobSource, raw: bool
 		.cloned()
 		.unwrap_or_default();
 
-	let port = client.port();
-
 	for (owner, ids) in crate::server::journal::blob_groups(&events) {
 		if ids.iter().any(|id| blobs.get(id).and_then(Value::as_str).is_some()) {
 			continue;
@@ -2247,14 +2249,17 @@ fn collect_blobs(client: &Client, journal: &Value, source: BlobSource, raw: bool
 		let mut refusal = None;
 
 		for id in ids.iter().rev() {
-			match download_blob(port, id) {
+			match download_blob(client, id) {
 				Ok(Some(bytes)) => {
 					payload = Some(bytes);
 					break;
 				}
 				Ok(None) => {}
 				Err(error) => {
-					wsync_warn!("Could not read journal blob {id} from the daemon on port {port}: {error}");
+					wsync_warn!(
+						"Could not read journal blob {id} from the daemon at {}: {error}",
+						client.target.route.describe()
+					);
 				}
 			}
 
@@ -2290,7 +2295,7 @@ fn collect_blobs(client: &Client, journal: &Value, source: BlobSource, raw: bool
 					// names, so a rerun after `branch pick` — or after this
 					// Studio closes — reads it from disk like any other
 					if let Some(newest) = ids.last() {
-						if let Err(error) = upload_blob(port, newest, &bytes) {
+						if let Err(error) = upload_blob(client, newest, &bytes) {
 							wsync_warn!("The recaptured blob for {owner} was not stored beside the journal: {error}");
 						}
 					}
@@ -3069,7 +3074,6 @@ fn assemble_place(
 	name: &str,
 	game_id: Option<u64>,
 	place_id: Option<u64>,
-	daemon_port: Option<u16>,
 	out: &Path,
 	raw: bool,
 ) -> Result<()> {
@@ -3116,10 +3120,6 @@ fn assemble_place(
 
 	if let Some(place_id) = place_id {
 		attributes.insert(PLACE_ID_ATTRIBUTE.to_owned(), Variant::Float64(place_id as f64));
-	}
-
-	if let Some(port) = daemon_port {
-		attributes.insert(DAEMON_PORT_ATTRIBUTE.to_owned(), Variant::Float64(f64::from(port)));
 	}
 
 	if attributes.iter().next().is_some() {

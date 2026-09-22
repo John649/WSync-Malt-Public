@@ -621,6 +621,37 @@ pub struct CliSandbox {
 	pub state: TempDir,
 	/// Scratch space for input files and `-o` targets
 	pub work: TempDir,
+	/// The hub port every run in this sandbox uses (`WSYNC_HUB_PORT`), so a
+	/// daemon a test starts never registers with the developer's real hub
+	pub hub_port: u16,
+}
+
+/// A loopback port nothing listens on right now
+pub fn free_port() -> u16 {
+	std::net::TcpListener::bind(("127.0.0.1", 0))
+		.and_then(|listener| listener.local_addr())
+		.map(|address| address.port())
+		.expect("failed to find a free port")
+}
+
+impl Drop for CliSandbox {
+	/// A hub a test started would otherwise linger for its idle minute
+	fn drop(&mut self) {
+		let hello = reqwest::blocking::Client::builder()
+			.timeout(Duration::from_millis(500))
+			.build()
+			.ok()
+			.and_then(|client| client.get(self.hub_url("/hello")).send().ok())
+			.and_then(|response| response.json::<Value>().ok());
+
+		if let Some(hello) = hello {
+			if hello["hub"] == true {
+				if let Some(pid) = hello["pid"].as_u64() {
+					wsync::util::kill_process(pid as u32);
+				}
+			}
+		}
+	}
 }
 
 impl CliSandbox {
@@ -649,7 +680,13 @@ impl CliSandbox {
 			home,
 			state: temp("wsync-cli-state-"),
 			work: temp("wsync-cli-work-"),
+			hub_port: free_port(),
 		}
+	}
+
+	/// `http://127.0.0.1:<sandbox hub>` plus `path`
+	pub fn hub_url(&self, path: &str) -> String {
+		format!("http://127.0.0.1:{}{path}", self.hub_port)
 	}
 
 	pub fn run(&self, args: &[&str]) -> std::process::Output {
@@ -658,6 +695,8 @@ impl CliSandbox {
 			.env("HOME", self.home.path())
 			.env("USERPROFILE", self.home.path())
 			.env("WSYNC_STATE_DIR", self.state.path())
+			.env("WSYNC_HUB_PORT", self.hub_port.to_string())
+			.env("WSYNC_NO_STUDIO_LAUNCH", "1")
 			.env("NO_COLOR", "1")
 			.env_remove("RUST_LOG")
 			.env_remove("RUST_VERBOSE")
@@ -676,6 +715,8 @@ impl CliSandbox {
 			.env("HOME", self.home.path())
 			.env("USERPROFILE", self.home.path())
 			.env("WSYNC_STATE_DIR", self.state.path())
+			.env("WSYNC_HUB_PORT", self.hub_port.to_string())
+			.env("WSYNC_NO_STUDIO_LAUNCH", "1")
 			.env("NO_COLOR", "1")
 			.env_remove("RUST_LOG")
 			.env_remove("RUST_VERBOSE");
@@ -697,6 +738,8 @@ impl CliSandbox {
 			.env("HOME", self.home.path())
 			.env("USERPROFILE", self.home.path())
 			.env("WSYNC_STATE_DIR", self.state.path())
+			.env("WSYNC_HUB_PORT", self.hub_port.to_string())
+			.env("WSYNC_NO_STUDIO_LAUNCH", "1")
 			.env("NO_COLOR", "1")
 			.env_remove("RUST_LOG")
 			.env_remove("RUST_VERBOSE")
@@ -724,6 +767,8 @@ impl CliSandbox {
 			.env("HOME", self.home.path())
 			.env("USERPROFILE", self.home.path())
 			.env("WSYNC_STATE_DIR", self.state.path())
+			.env("WSYNC_HUB_PORT", self.hub_port.to_string())
+			.env("WSYNC_NO_STUDIO_LAUNCH", "1")
 			.env("NO_COLOR", "1")
 			.env_remove("RUST_LOG")
 			.env_remove("RUST_VERBOSE")

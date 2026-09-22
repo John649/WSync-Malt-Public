@@ -92,7 +92,7 @@ return function(props: Props): { Instance }
 					-- Address line doubles as the transport status readout
 					-- (reconnect backoff countdown, Design §9.4)
 					Text = Computed(function(use)
-						return use(props.App.transportStatus) or `{props.App.host}:{props.App.port}`
+						return use(props.App.transportStatus) or `{props.App.host}:{props.App.port}{props.App.base}`
 					end),
 					TextSize = Theme.TextSize.Small,
 					Font = Theme.Fonts.Mono,

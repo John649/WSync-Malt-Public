@@ -52,7 +52,9 @@ type Config = {
 local DEFAULTS = {
 	InitialSyncPriority = "Server",
 	Host = "localhost",
-	Port = 7978,
+	-- The WSync hub (Discovery.HUB_PORT): Host/Port name where discovery asks
+	-- first, and by default that is the hub every daemon registers with
+	Port = 7960,
 	AutoConnect = true,
 	AutoReconnect = false,
 	AutoDiscover = true,

@@ -20,6 +20,7 @@ use crate::{
 	constants::{MAX_PAYLOAD_SIZE, WALKER_STACK_SIZE},
 	core::{changes::Changes, Core},
 	daemon::{self, DaemonLog},
+	hub,
 	project::ProjectDetails,
 };
 
@@ -91,6 +92,10 @@ pub struct ExecuteCode {
 #[derive(Debug, Clone, Serialize)]
 pub struct Disconnect {
 	pub message: String,
+	/// The daemon itself is stopping, as opposed to the processor parking
+	/// one client. A WS client is told to retry the first and not the second
+	#[serde(skip)]
+	pub stopping: bool,
 }
 
 #[derive(Deserialize, Debug)]
@@ -160,6 +165,9 @@ pub struct Server {
 	state_dir: Option<PathBuf>,
 	/// Scratch place daemon: self-terminates once Studio goes away
 	ephemeral: bool,
+	/// Register with the hub (src/hub) for as long as the server runs. Off
+	/// for embedded and test servers, which are addressed by their port
+	hub: bool,
 }
 
 impl Server {
@@ -171,7 +179,15 @@ impl Server {
 			identity,
 			state_dir: None,
 			ephemeral: false,
+			hub: false,
 		}
+	}
+
+	/// Registers this daemon with the hub once it listens, and keeps it
+	/// registered (starting a hub when none answers) until it stops
+	pub fn with_hub(mut self, hub: bool) -> Self {
+		self.hub = hub;
+		self
 	}
 
 	/// Pins the state directory instead of resolving the platform default
@@ -302,6 +318,22 @@ impl Server {
 
 		lifecycle::spawn_watchdog(state.clone());
 		lifecycle::spawn_ephemeral_watchdog(state.clone());
+
+		if self.hub {
+			let canonical_project = daemon::canonical_project(&self.core.project().path)
+				.unwrap_or_else(|_| self.core.project().path.to_string_lossy().into_owned());
+
+			tokio::spawn(hub::attach::hold(
+				hub::attach::Registration {
+					canonical_project,
+					port,
+					boot_id: self.identity.boot_id.clone(),
+					pid: std::process::id(),
+				},
+				state.lifecycle.subscribe(),
+				self.identity.journal.clone(),
+			));
+		}
 
 		// The msgpack (Argon-protocol) routes below are protocol v1's
 		// fallback transport and are served unconditionally; `compat_argon`
@@ -438,6 +470,7 @@ impl Server {
 					.push(
 						Disconnect {
 							message: format!("Daemon stopping: {reason}"),
+							stopping: true,
 						},
 						None,
 					)

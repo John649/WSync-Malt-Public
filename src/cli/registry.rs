@@ -271,8 +271,9 @@ impl Context {
 		let daemon = match &hello {
 			Some(hello) => json!({
 				"reachable": true,
-				"port": target.port,
-				"portSource": target.port_source.as_str(),
+				"port": hello.port,
+				"portSource": target.source.as_str(),
+				"address": target.route.base(),
 				"version": hello.version,
 				"protocol": hello.protocol,
 				"pid": hello.pid,
@@ -284,8 +285,9 @@ impl Context {
 			}),
 			None => json!({
 				"reachable": false,
-				"port": target.port,
-				"portSource": target.port_source.as_str(),
+				"port": target.route.port(),
+				"portSource": target.source.as_str(),
+				"address": target.route.base(),
 				"note": "no daemon answers — start one with `wsync daemon start --project <path>`",
 			}),
 		};

@@ -51,11 +51,11 @@ Divergence.__index = Divergence
 
 Divergence.Protocol = Protocol
 
-function Divergence.new(tree: any, host: string, port: number, https: boolean?)
+function Divergence.new(tree: any, host: string, port: number, https: boolean?, base: string?)
 	local self = setmetatable({}, Divergence)
 
 	self.tree = tree
-	self.baseUrl = `{https and "https" or "http"}://{host}:{port}`
+	self.baseUrl = `{https and "https" or "http"}://{host}:{port}{base or ""}`
 	self.pendingRemovals = {} :: { [string]: Instance }
 	self.pendingRefs = {} :: { [Instance]: string }
 

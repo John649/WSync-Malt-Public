@@ -1,12 +1,27 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use roblox_install::RobloxStudio;
 use std::{
+	env,
 	path::PathBuf,
 	process::{Command, Stdio},
 };
 
 #[cfg(target_os = "windows")]
 use winsafe::{co::SW, EnumWindows};
+
+/// Set to anything non-empty to make every Studio launch fail instead. The
+/// test sandbox sets it: a test exercising `wsync open` or `branch new` must
+/// never open Roblox Studio on the machine running the suite
+pub const NO_LAUNCH_ENV: &str = "WSYNC_NO_STUDIO_LAUNCH";
+
+/// Refuses when [`NO_LAUNCH_ENV`] is set
+pub fn ensure_launch_allowed() -> Result<()> {
+	if env::var_os(NO_LAUNCH_ENV).is_some_and(|value| !value.is_empty()) {
+		bail!("Studio launches are disabled in this environment ({NO_LAUNCH_ENV} is set)");
+	}
+
+	Ok(())
+}
 
 /// Launches Studio and returns the pid of the process that was spawned.
 ///
@@ -16,6 +31,8 @@ use winsafe::{co::SW, EnumWindows};
 /// on the window that eventually appears — a caller that needs the window
 /// still has to look for it.
 pub fn launch(path: Option<PathBuf>) -> Result<u32> {
+	ensure_launch_allowed()?;
+
 	let studio_path = RobloxStudio::locate()?.application_path().to_owned();
 
 	let child = Command::new(studio_path)
@@ -46,6 +63,8 @@ pub fn edit_place_url(place_id: u64, universe_id: u64) -> String {
 /// the binary cannot be located but the URL scheme is registered (in which
 /// case the pid belongs to the launcher, not to Studio).
 pub fn launch_url(url: &str) -> Result<u32> {
+	ensure_launch_allowed()?;
+
 	if let Ok(studio) = RobloxStudio::locate() {
 		let child = Command::new(studio.application_path())
 			.arg(url)

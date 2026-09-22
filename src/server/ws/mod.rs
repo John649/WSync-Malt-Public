@@ -545,7 +545,8 @@ fn daemon_stopping(
 	let reason = shutdown_rx.borrow().clone();
 
 	if let Some(reason) = reason {
-		*close_frame = Some(ServerFrame::shutdown(&reason, shutdown::DAEMON_STOPPING, false).to_text());
+		// Retryable: see `WsState::broadcast_close`
+		*close_frame = Some(ServerFrame::shutdown(&reason, shutdown::DAEMON_STOPPING, true).to_text());
 		true
 	} else {
 		false
@@ -614,12 +615,21 @@ fn bridge(queue: Arc<Queue>, queue_id: u32, frames: mpsc::Sender<String>, close:
 			}
 			Message::Disconnect(disconnect) => {
 				// The processor parked this client (e.g. declined changes
-				// threshold); forward as a typed shutdown and end the bridge
+				// threshold), or the daemon is stopping; forward as a typed
+				// shutdown and end the bridge. A stop says retry for the same
+				// reason `WsState::broadcast_close` does, and whichever of the
+				// two reaches the client first has to say the same thing
+				let (code, retryable) = if disconnect.stopping {
+					(shutdown::DAEMON_STOPPING, true)
+				} else {
+					(shutdown::OUT_OF_SYNC, false)
+				};
+
 				close
 					.send(Some(CloseReason {
 						reason: disconnect.message,
-						code: shutdown::OUT_OF_SYNC.into(),
-						retryable: false,
+						code: code.into(),
+						retryable,
 					}))
 					.ok();
 

@@ -52,7 +52,7 @@ local Core = {
 }
 Core.__index = Core
 
-function Core.new(host: string?, port: string?)
+function Core.new(host: string?, port: string?, base: string?)
 	local self = setmetatable({}, Core)
 
 	self.project = nil
@@ -63,6 +63,9 @@ function Core.new(host: string?, port: string?)
 
 	self.host = host or Config:get("Host")
 	self.port = port or Config:get("Port")
+	-- The daemon's route on the hub (`/p/<route>`), appended to every URL; empty
+	-- for a daemon reached on its own port (the Settings address)
+	self.base = base or ""
 
 	self.tree = Tree.new()
 	-- Transport and processor are created in `run` — picking the transport
@@ -133,14 +136,14 @@ function Core:run(): Promise.Promise
 
 		Log.trace("Detecting transport..")
 
-		local transport = Transport.detect(self.host, self.port, Config:get("Https")):expect()
+		local transport = Transport.detect(self.host, self.port, Config:get("Https"), self.base):expect()
 		self.transport = transport
 		self.processor = Processor.new(self.tree, transport)
 
 		-- The journal pushes its batches to the daemon discovery actually
 		-- resolved (`POST /journal/append`), not to the Settings address
 		-- (docs/branches.md — "Journal").
-		Journal.setEndpoint(self.host, self.port, Config:get("Https") == true)
+		Journal.setEndpoint(self.host, self.port, Config:get("Https") == true, self.base)
 
 		transport:onStatus(function(status)
 			-- Lazy disk-review re-check (Design §7.0): a review resolved in
@@ -382,6 +385,13 @@ function Core.wasFatal(err: Error.Error)
 	return err == Error.ServerShutdown
 end
 
+--- The daemon this window reached was replaced by a new boot at the same
+--- address. Its route on the hub names the project, so connecting again
+--- reaches the replacement: this is a resync, not a failure to wait out
+function Core.wasResync(err: Error.Error)
+	return err == Error.Resync
+end
+
 -- Internal functions
 
 function Core:__verifyProject(project: Types.Project, initial: boolean?): Promise.Promise
@@ -460,6 +470,8 @@ function Core:__startSyncLoop()
 			if kind == "Disconnect" then
 				if data.fatal then
 					reject(Error.new(Error.ServerShutdown, data.message))
+				elseif data.resync then
+					reject(Error.new(Error.Resync, data.message))
 				else
 					reject(Error.new(Error.Disconnected, data.message))
 				end
@@ -597,7 +609,7 @@ function Core:__resolveDivergence(changes: Types.Changes, initialSyncPriority: s
 			return resolve()
 		end
 
-		local divergence = Divergence.new(self.tree, self.host, self.port, Config:get("Https"))
+		local divergence = Divergence.new(self.tree, self.host, self.port, Config:get("Https"), self.base)
 		self.divergence = divergence
 
 		Log.trace("Uploading the divergence set..")
@@ -801,6 +813,8 @@ function Core:__awaitAppDecision(divergence, choiceId: string)
 				elseif kind == "Disconnect" then
 					if data.fatal then
 						return halt(Error.new(Error.ServerShutdown, data.message))
+					elseif data.resync then
+						return halt(Error.new(Error.Resync, data.message))
 					else
 						return halt(Error.new(Error.Disconnected, data.message))
 					end
@@ -922,7 +936,7 @@ function Core:__fetchReview()
 		return
 	end
 
-	local url = `{Config:get("Https") and "https" or "http"}://{self.host}:{self.port}/review`
+	local url = `{Config:get("Https") and "https" or "http"}://{self.host}:{self.port}{self.base}/review`
 
 	task.spawn(function()
 		local ok, response = Http.getJson(url):await()

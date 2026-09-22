@@ -1,10 +1,12 @@
--- Daemon discovery (Design §9.4 / §3.3) and the desktop-broker Create
--- Project flow (Design §9.2 as amended; pinned wave-5 contract).
+-- Daemon discovery (Design §9.4 / §3.3, amended for the hub) and the
+-- desktop-broker Create Project flow (Design §9.2 as amended).
 --
--- Discovery is the connection flow (user-ruled Ro-Sync model): `scan` probes
--- an ordered candidate list — the Settings `Host:Port` override first, then
--- `127.0.0.1:7978-7990` (deduplicated) — with `GET /hello` and matches the
--- responses against the open place:
+-- Every daemon on the machine registers with the WSync hub on
+-- `127.0.0.1:7960` (the engine's src/hub), and the hub's `GET /daemons`
+-- lists them all with their live `/hello`. So a scan is one request, not a
+-- sweep of a port range: the Settings `Host:Port` is asked first (a hub there
+-- lists its daemons, a daemon there is a candidate of its own), then the
+-- local hub, and the answers are ranked against the open place:
 --
 --   * published place  — only daemons whose `gameId` equals `game.GameId`
 --                        (preferring one whose `placeIds` include
@@ -12,36 +14,36 @@
 --   * marked place      — whatever its ids, a daemon whose project names the
 --                        same `placeKey` as the place's `ServerStorage/
 --                        WSyncPlace` marker matches exactly (docs/places.md)
+--   * branch clone      — only the daemon that names the clone's branch
 --   * unpublished place — the first responding daemon with no gameId claim
 --
--- `AutoDiscover = false` restricts the scan to the Settings candidate alone
--- (pure manual mode). Candidate ordering, ranking and the connection state
--- machine live in `Policy` (require-free, standalone-testable); this module
--- owns the HTTP side and the Roblox globals. A gameId mismatch is NOT
--- resolved here: connecting to a non-matching daemon keeps Argon's existing
--- GameId/PlaceIds prompt behavior.
+-- A daemon found through the hub is connected to through it as well, at its
+-- route `/p/<route>`. The route names the project, not the process, so a
+-- daemon that restarts on another port is still at the same address.
 --
--- Create Project (pinned): when the scan finds no matching daemon, App
--- probes `127.0.0.1:7968-7971` for the desktop broker (`findBroker`). A
--- broker hello (`{broker: true, projectInit: true}`) surfaces the explicit
--- Create Project flow — never automatic. For a NEW game it is the two-step
--- confirm; when the hello's `games` list already names this GameId
--- (`brokerKnowsGame`) the button reads "Serve Project" and one click POSTs
--- straight away, because the broker's existing-gameId rule adopts and serves
--- the project it already has instead of creating a duplicate. Either way the
--- POST carries place *metadata only* (never a filesystem path) to
--- `/projects/init` (`createProject`), then `waitForDaemon` re-scans the
--- candidate list with bounded, cancellable retries until the project's
--- daemon answers (the broker stamps the project's gameId, so the strict
--- match holds).
+-- `AutoDiscover = false` asks the Settings address alone (pure manual mode).
+-- Ranking and the connection state machine live in `Policy` (require-free,
+-- standalone-testable); this module owns the HTTP side and the Roblox
+-- globals.
+--
+-- Create Project: when nothing matches, App asks the hub for the desktop
+-- app's broker (`findBroker`), which registers with the hub and is reached
+-- at `/broker`. A broker hello (`{broker: true, projectInit: true}`)
+-- surfaces the explicit Create Project flow — never automatic. For a NEW game
+-- it is the two-step confirm; when the hello's `games` list already names
+-- this GameId (`brokerKnowsGame`) the button reads "Serve Project" and one
+-- click POSTs straight away. Either way the POST carries place *metadata
+-- only* (never a filesystem path) to `/projects/init`, then `waitForDaemon`
+-- scans again with bounded, cancellable retries until the project's daemon
+-- answers.
 --
 -- Attach (docs/places.md): when the broker also advertises `attach: true`,
 -- the no-daemon case does not stop at an offer. `attachPlace` asks for a
--- throwaway daemon for the open place and connects to the port it answers
+-- throwaway daemon for the open place and connects to the route it answers
 -- with — no click, nothing written to disk, and the whole thing gone when the
--- window closes. The port is trusted for this session alone (`sessionPort`),
--- because a scratch daemon for an unpublished place claims no ids that any
--- ranking rule could recognise it by.
+-- window closes. The route is trusted for this session alone
+-- (`sessionRoute`), because a scratch daemon for an unpublished place claims
+-- no ids that any ranking rule could recognise it by.
 
 local WSync = script:FindFirstAncestor("WSync")
 
@@ -64,51 +66,44 @@ local Policy = require(script.Policy)
 export type Match = {
 	host: string,
 	port: number,
+	--- `/p/<route>` through the hub, empty for a daemon on its own port
+	base: string,
 	hello: Types.DaemonHello,
 }
 
 export type BrokerMatch = {
 	host: string,
 	port: number,
+	--- Where the broker's routes hang off: `/broker` on the hub
+	base: string,
 	hello: { [string]: any },
 }
 
 local Discovery = {}
 
 Discovery.Policy = Policy
-Discovery.PORT_MIN = Policy.PORT_MIN
-Discovery.PORT_MAX = Policy.PORT_MAX
-Discovery.BROKER_PORT_MIN = Broker.PORT_MIN
-Discovery.BROKER_PORT_MAX = Broker.PORT_MAX
+Discovery.HUB_PORT = Policy.HUB_PORT
 
---- The ordered probe list for this scan, built from the live Settings values
---- (Policy owns the ordering and the dedup rules).
-local function candidates(): { Policy.Candidate }
-	local identity = Branch.current()
-
-	return Policy.candidates({
+--- Where this scan looks, from the live Settings values (Policy owns the
+--- ordering).
+local function sources(): { Policy.Source }
+	return Policy.sources({
 		host = tostring(Config:get("Host")),
 		port = tonumber(Config:get("Port")) or Config:getDefault("Port"),
 		https = Config:get("Https") == true,
 		autoDiscover = Config:get("AutoDiscover") == true,
-		branchPort = if identity ~= nil then identity.daemonPort else nil,
-		sessionPort = Discovery.sessionPort,
-		-- A branch clone answers only to its branch daemon, so a place marker
-		-- left behind on the place it was cloned from must not pull the scan
-		-- at a daemon it can never match
-		markerPort = if identity == nil then Place.daemonPort() else nil,
 	})
 end
 
---- The port the desktop app's attach route handed THIS Studio window. Session
---- state on purpose: it is never written into the place, so it cannot outlive
---- the window or reach another one, and a daemon that answers there is only
---- trusted while this value stands (`Policy.rankHello`).
-Discovery.sessionPort = nil :: number?
+--- The hub route the desktop app's attach route handed THIS Studio window.
+--- Session state on purpose: it is never written into the place, so it
+--- cannot outlive the window or reach another one, and a daemon behind it is
+--- only trusted while this value stands (`Policy.rankHello`).
+Discovery.sessionRoute = nil :: string?
 
---- Remember (or forget, with nil) the attach port for this session.
-function Discovery.setSessionPort(port: number?)
-	Discovery.sessionPort = port
+--- Remember (or forget, with nil) the attach route for this session.
+function Discovery.setSessionRoute(route: string?)
+	Discovery.sessionRoute = route
 end
 
 --- The open place as the ranking rules see it. A branch clone is whatever
@@ -125,127 +120,116 @@ function Discovery.identity(): Policy.PlaceIdentity
 		-- The marker rules for a branch clone are untouched: a clone ranks on
 		-- its branch name and nothing else, so a place key is not even read
 		placeKey = if identity == nil then Place.key() else nil,
-		sessionPort = if identity == nil then Discovery.sessionPort else nil,
+		sessionRoute = if identity == nil then Discovery.sessionRoute else nil,
 	}
 end
 
---- How long the whole concurrent probe pass may take. On Windows every probe
---- of a CLOSED localhost port costs about two seconds (HttpService reports
---- ConnectFail only after its own connect timeout), so a sequential walk of
---- the thirteen candidates cost 24 s or more whenever nothing ranked exact
---- early — which is every unpublished place, because `gameId == 0` can rank
---- no higher than MATCH_WEAK unless a daemon claims the placeId outright.
---- Probing concurrently turns that wall-clock cost from the SUM of the
---- timeouts into the MAX of them.
-Discovery.SCAN_DEADLINE_SECONDS = 3
--- Large clones can queue localhost requests behind Studio's asset loading.
--- Their daemon already exists, so allow startup requests time to complete.
+--- `GET` a JSON document, or nil on any failure
+local function getJson(url: string): any
+	return Http.getJson(url)
+		:andThen(function(response)
+			local ok, decoded = pcall(function()
+				return response:decode()
+			end)
+
+			return if ok then decoded else nil
+		end)
+		:catch(function()
+			return nil
+		end)
+		:expect()
+end
+
+local function origin(source: Policy.Source): string
+	return `{if source.https then "https" else "http"}://{source.host}:{source.port}`
+end
+
+--- Ask one address what it is, and what it can reach: a hub answers with
+--- every daemon it routes to, a daemon with itself
+local function ask(source: Policy.Source): ({ Policy.Candidate }, { Types.DaemonHello })
+	local hello = getJson(`{origin(source)}/hello`)
+
+	if Policy.isHubHello(hello) then
+		local listing = getJson(`{origin(source)}/daemons`)
+		local candidates, hellos = Policy.fromListing(listing, source)
+
+		Log.debug(`Discovery: the hub on {source.host}:{source.port} routes to {#candidates} daemon(s)`)
+
+		return candidates, hellos :: any
+	end
+
+	if type(hello) == "table" and type(hello.protocol) == "number" then
+		return {
+			{
+				host = source.host,
+				port = source.port,
+				https = source.https,
+				base = "",
+			},
+		}, { hello :: Types.DaemonHello }
+	end
+
+	return {}, {}
+end
+
+--- Find the daemon for the open place. Resolves a `Match` or nil; never
+--- rejects. `shouldContinue` aborts the scan early (e.g. on cancel).
+---
+--- On a branch clone a daemon may still be registering while Studio loads the
+--- clone (large clones queue localhost requests behind asset loading), so a
+--- clone keeps asking for up to `BRANCH_SCAN_DEADLINE_SECONDS` before giving
+--- up; anything else is answered by the first pass.
 Discovery.BRANCH_SCAN_DEADLINE_SECONDS = 30
 
---- Probe the candidate list for a daemon matching the open place. Resolves a
---- `Match` or nil; never rejects. `shouldContinue` aborts the scan early
---- (e.g. on cancel).
----
---- Every candidate is probed at once and the results are ranked together, ties
---- going to the earlier candidate (`Policy.bestIndex`), so the ordering the
---- candidate list encodes — a branch's own daemon port first, then the
---- Settings address, then the scan range — still decides between equals. The
---- pass ends early the moment an exact match is certain: as soon as an
---- unbroken prefix of the list has answered and one of those answers ranks
---- exact, nothing later can beat it and nothing earlier is outstanding.
 function Discovery.scan(shouldContinue: (() -> boolean)?): Promise.TypedPromise<Match?>
 	local function continuing(): boolean
 		return not shouldContinue or shouldContinue()
 	end
 
 	return Promise.new(function(resolve)
-		-- On a branch clone `game.PlaceId` is the synthetic id Branch.apply
-		-- stamped at boot, and `branch` makes Policy refuse anything below an
-		-- exact match, so the clone never attaches to main's daemon.
 		local place = Discovery.identity()
+		local deadline = os.clock() + (if place.branch then Discovery.BRANCH_SCAN_DEADLINE_SECONDS else 0)
 
-		local list = candidates()
-		local total = #list
+		while true do
+			local candidates: { Policy.Candidate } = {}
+			local hellos: { Types.DaemonHello } = {}
 
-		local hellos: { [number]: Types.DaemonHello? } = {}
-		local answered: { [number]: boolean } = {}
-		local outstanding = total
-
-		local function matchAt(index: number): Match
-			local candidate = list[index]
-
-			return {
-				host = candidate.host,
-				port = candidate.port,
-				hello = hellos[index] :: Types.DaemonHello,
-			}
-		end
-
-		for index, candidate in list do
-			task.spawn(function()
-				local ok, hello = pcall(function()
-					return Transport.hello(candidate.host, candidate.port, candidate.https):expect()
-				end)
-
-				if ok and hello ~= nil then
-					hellos[index] = hello
-
-					Log.debug(`Discovery: daemon '{hello.project or hello.name}' on {candidate.host}:{candidate.port}`)
+			for _, source in sources() do
+				if not continuing() then
+					return resolve(nil)
 				end
 
-				answered[index] = true
-				outstanding -= 1
-			end)
-		end
+				local found, answers = ask(source)
 
-		--- The first candidate that is certainly the winner: an exact match
-		--- inside the answered prefix. Anything after it ranks no higher, and
-		--- anything before it has already been seen.
-		local function settledExact(): number?
-			for index = 1, total do
-				if not answered[index] then
-					return nil
-				end
-
-				local hello = hellos[index]
-
-				if hello ~= nil and Policy.rankHello(hello, place, list[index]) >= Policy.MATCH_EXACT then
-					return index
+				for index, candidate in found do
+					table.insert(candidates, candidate)
+					table.insert(hellos, answers[index])
 				end
 			end
 
-			return nil
-		end
-
-		local deadline = os.clock()
-			+ (if place.branch then Discovery.BRANCH_SCAN_DEADLINE_SECONDS else Discovery.SCAN_DEADLINE_SECONDS)
-
-		while outstanding > 0 do
 			if not continuing() then
 				return resolve(nil)
 			end
 
-			local early = settledExact()
+			local best = Policy.bestIndex(hellos :: any, #candidates, place, candidates)
 
-			if early ~= nil then
-				return resolve(matchAt(early))
+			if best ~= nil then
+				local candidate = candidates[best]
+
+				return resolve({
+					host = candidate.host,
+					port = candidate.port,
+					base = candidate.base,
+					hello = hellos[best],
+				})
 			end
 
 			if os.clock() >= deadline then
-				Log.debug(`Discovery: {outstanding} of {total} probes still outstanding at the deadline`)
-				break
+				return resolve(nil)
 			end
 
-			task.wait()
+			task.wait(1)
 		end
-
-		if not continuing() then
-			return resolve(nil)
-		end
-
-		local bestIndex = Policy.bestIndex(hellos, total, place, list)
-
-		return resolve(if bestIndex ~= nil then matchAt(bestIndex) else nil)
 	end)
 end
 
@@ -278,40 +262,27 @@ function Discovery.brokerKnowsGame(hello: { [string]: any }): boolean
 	return false
 end
 
---- Probe the broker port range. Resolves a `BrokerMatch` when a hello
---- answers `{broker: true, projectInit: true}`, nil otherwise; never
---- rejects.
+--- Ask the hub for the desktop app's broker. Resolves a `BrokerMatch` when
+--- one is registered and answers `{broker: true, projectInit: true}`, nil
+--- otherwise; never rejects.
 function Discovery.findBroker(shouldContinue: (() -> boolean)?)
-	local function continuing(): boolean
-		return not shouldContinue or shouldContinue()
-	end
-
 	return Promise.new(function(resolve)
-		for port = Broker.PORT_MIN, Broker.PORT_MAX do
-			if not continuing() then
+		for _, source in sources() do
+			if shouldContinue and not shouldContinue() then
 				return resolve(nil)
 			end
 
-			local hello: { [string]: any }? = Http.getJson(`http://{Policy.LOCAL_HOST}:{port}/hello`)
-				:andThen(function(response)
-					local ok, decoded = pcall(function()
-						return response:decode()
-					end)
+			local listing = getJson(`{origin(source)}/daemons`)
+			local broker = if type(listing) == "table" then listing.broker else nil
 
-					return if ok then decoded else nil
-				end)
-				:catch(function()
-					return nil
-				end)
-				:expect()
-
-			if hello ~= nil and Broker.isBrokerHello(hello) then
-				Log.debug(`Discovery: project-init broker on port {port}`)
+			if type(broker) == "table" and Broker.isBrokerHello(broker.hello) then
+				Log.debug(`Discovery: project-init broker registered with the hub on port {source.port}`)
 
 				return resolve({
-					host = Policy.LOCAL_HOST,
-					port = port,
-					hello = hello :: { [string]: any },
+					host = source.host,
+					port = source.port,
+					base = if type(broker.base) == "string" then broker.base else "/broker",
+					hello = broker.hello :: { [string]: any },
 				})
 			end
 		end
@@ -379,7 +350,7 @@ function Discovery.createProject(broker: BrokerMatch)
 		end
 
 		local responseOk, response = pcall(function()
-			return Http.postJson(`http://{broker.host}:{broker.port}/projects/init`, body):expect()
+			return Http.postJson(`http://{broker.host}:{broker.port}{broker.base}/projects/init`, body):expect()
 		end)
 
 		if not responseOk then
@@ -406,16 +377,16 @@ function Discovery.createProject(broker: BrokerMatch)
 	end)
 end
 
+--- One daemon's `/hello`, for an address already known. The card uses it to
+--- ask the daemon it is connected to whether it is a throwaway, which is a
+--- fact of the daemon rather than of how this window reached it.
+function Discovery.hello(host: string, port: number, base: string?)
+	return Transport.hello(host, port, false, base)
+end
+
 --- `POST /places/attach` to the broker for the open place (docs/places.md).
 --- Resolves one table — `{attached}` on success, `{message, disabled}` when
 --- the app refused or has the flow switched off. Never rejects: a refusal is
---- One daemon's `/hello`, for a host and port already known. The card uses
---- it to ask the daemon it is connected to whether it is a throwaway, which
---- is a fact of the daemon rather than of how this window reached it.
-function Discovery.hello(host: string, port: number)
-	return Transport.hello(host, port, false)
-end
-
 --- a fall-back to the ordinary no-daemon card, not an error page.
 function Discovery.attachPlace(broker: BrokerMatch)
 	return Promise.new(function(resolve)
@@ -426,7 +397,7 @@ function Discovery.attachPlace(broker: BrokerMatch)
 		end
 
 		local responseOk, response = pcall(function()
-			return Http.postJson(`http://{broker.host}:{broker.port}/places/attach`, body):expect()
+			return Http.postJson(`http://{broker.host}:{broker.port}{broker.base}/places/attach`, body):expect()
 		end)
 
 		if not responseOk then
@@ -447,13 +418,13 @@ function Discovery.attachPlace(broker: BrokerMatch)
 			return resolve({ message = failure or "the WSync app refused the attach", disabled = disabled })
 		end
 
-		Log.info(`Attach: temporary daemon on port {attached.port}`)
+		Log.info(`Attach: temporary daemon at route {attached.route}`)
 
 		return resolve({ attached = attached })
 	end)
 end
 
---- Re-scan the candidate list until a matching daemon appears: bounded
+--- Scan again until a matching daemon appears: bounded
 --- (`Broker.WAIT_ATTEMPTS` scans, `Broker.WAIT_DELAY_SECONDS` apart) and
 --- cancellable via `shouldContinue`. Resolves the `Match` or nil when the
 --- attempts run out or the wait is cancelled. `onAttempt` reports progress.
