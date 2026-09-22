@@ -85,12 +85,19 @@ fn shell_open(url: &str) -> Result<u32> {
 	{
 		// `start` is a cmd builtin, and the empty first argument is the
 		// window title it would otherwise take the URL for
-		let child = Command::new("cmd")
+		let mut command = Command::new("cmd");
+
+		command
 			.args(["/C", "start", "", url])
 			.stdin(Stdio::null())
 			.stdout(Stdio::null())
-			.stderr(Stdio::null())
-			.spawn()?;
+			.stderr(Stdio::null());
+
+		// `cmd` is a console program: started from the desktop app or a
+		// daemon it would open a terminal just to run `start`
+		crate::util::hide_console(&mut command);
+
+		let child = command.spawn()?;
 
 		Ok(child.id())
 	}

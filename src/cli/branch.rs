@@ -1512,9 +1512,10 @@ fn enforce_budget(workspace: &Path, budget: usize, wanted: &str) -> Result<()> {
 fn studio_count() -> usize {
 	#[cfg(windows)]
 	{
-		let output = Command::new("tasklist")
-			.args(["/FI", "IMAGENAME eq RobloxStudioBeta.exe", "/NH", "/FO", "CSV"])
-			.output();
+		let mut tasklist = Command::new("tasklist");
+		crate::util::hide_console(tasklist.args(["/FI", "IMAGENAME eq RobloxStudioBeta.exe", "/NH", "/FO", "CSV"]));
+
+		let output = tasklist.output();
 
 		output
 			.map(|out| {
@@ -1976,13 +1977,16 @@ fn close(record: &mut Record, root: &Path, main_project: &Path) -> Result<(bool,
 	if daemon {
 		let binary = env::current_exe().context("Failed to locate the running wsync executable")?;
 		let project = record.project(main_project);
-		let stopped = Command::new(&binary)
-			.args(["daemon", "stop", "--project"])
+		let mut stop = Command::new(&binary);
+
+		stop.args(["daemon", "stop", "--project"])
 			.arg(&project)
 			.stdin(Stdio::null())
 			.stdout(Stdio::null())
-			.stderr(Stdio::null())
-			.status();
+			.stderr(Stdio::null());
+		crate::util::hide_console(&mut stop);
+
+		let stopped = stop.status();
 
 		if !stopped.map(|status| status.success()).unwrap_or(false) {
 			wsync_warn!(
@@ -3299,11 +3303,12 @@ fn git_out(dir: &Path, args: &[&str]) -> Result<String> {
 /// failure is an outcome (`merge` stopping on conflicts, `branch -D` on a
 /// branch that is already gone)
 fn git_try(dir: &Path, args: &[&str]) -> Result<(bool, String, String)> {
-	let output = Command::new("git")
-		.arg("-C")
-		.arg(dir)
-		.args(args)
-		.stdin(Stdio::null())
+	let mut git = Command::new("git");
+
+	git.arg("-C").arg(dir).args(args).stdin(Stdio::null());
+	crate::util::hide_console(&mut git);
+
+	let output = git
 		.output()
 		.with_context(|| format!("Failed to run `git {}` in {}", args.join(" "), dir.to_string()))?;
 
@@ -3333,9 +3338,10 @@ fn process_alive(pid: u32) -> bool {
 
 	#[cfg(target_os = "windows")]
 	{
-		Command::new("TASKLIST")
-			.arg("/NH")
-			.args(["/FI", &format!("PID eq {pid}")])
+		let mut tasklist = Command::new("TASKLIST");
+		crate::util::hide_console(tasklist.arg("/NH").args(["/FI", &format!("PID eq {pid}")]));
+
+		tasklist
 			.output()
 			.map(|output| {
 				let listed = String::from_utf8_lossy(&output.stdout);
@@ -3352,13 +3358,15 @@ fn process_alive(pid: u32) -> bool {
 fn kill_tree(pid: u32) {
 	#[cfg(target_os = "windows")]
 	{
-		Command::new("taskkill")
+		let mut taskkill = Command::new("taskkill");
+
+		taskkill
 			.args(["/PID", &pid.to_string(), "/T", "/F"])
 			.stdin(Stdio::null())
 			.stdout(Stdio::null())
-			.stderr(Stdio::null())
-			.status()
-			.ok();
+			.stderr(Stdio::null());
+		crate::util::hide_console(&mut taskkill);
+		taskkill.status().ok();
 	}
 
 	#[cfg(not(target_os = "windows"))]
