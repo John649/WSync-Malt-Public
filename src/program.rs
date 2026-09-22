@@ -129,16 +129,24 @@ impl Program {
 		.to_owned();
 
 		#[cfg(target_os = "windows")]
-		if (self.program == ProgramName::Npm || self.program == ProgramName::Npx)
-			&& Command::new(package_manager)
-				.spawn()
-				.is_err_and(|err| err.kind() == ErrorKind::NotFound)
-		{
-			program += ".cmd";
+		if self.program == ProgramName::Npm || self.program == ProgramName::Npx {
+			let mut probe = Command::new(package_manager);
+			util::hide_console(&mut probe);
+
+			if probe.spawn().is_err_and(|err| err.kind() == ErrorKind::NotFound) {
+				program += ".cmd";
+			}
 		}
 
 		let mut command = Command::new(program);
 		command.current_dir(&self.current_dir).args(&self.args);
+
+		// These programs can be interactive (`npm create`), so they share a
+		// console when there is one. A daemon has none, and there the only
+		// alternative to no console is a new terminal window
+		if !util::has_console() {
+			util::hide_console(&mut command);
+		}
 
 		if util::env_verbosity() == LevelFilter::Off {
 			command.stdout(Stdio::null());

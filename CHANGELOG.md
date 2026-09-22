@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- On Windows, wsync no longer opens terminal windows. The desktop app now
+  starts `wsync daemon start` and `wsync open` without a console, so a daemon
+  it serves no longer keeps a terminal open for as long as it runs. A daemon
+  no longer flashes one for each `TASKLIST` it runs through `sessions.toml` at
+  startup. `TASKKILL`, git, `luau-lsp`, the Studio URL launch through
+  `cmd /C start` and the npm/npx/wally helpers do the same, the helpers only
+  when there is no console to share.
 - `wsync branch finish` no longer dies on an `add` whose blob expired out of
   the plugin before the daemon pulled it: the live branch Studio serializes
   the instance again (`journal_recapture`), and the daemon's own pull pass

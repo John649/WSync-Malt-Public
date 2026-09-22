@@ -42,6 +42,13 @@ use tokio::{
     time,
 };
 
+/// Windows `CREATE_NO_WINDOW`. The app has no console, so each console
+/// program it starts — `wsync` itself included — would otherwise get a
+/// terminal window of its own, and a daemon's stays open for as long as the
+/// daemon serves
+#[cfg(windows)]
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 use crate::{
     error::{HostError, HostResult},
     loopback,
@@ -563,6 +570,8 @@ impl DaemonRegistry {
             // Belt and braces beside the explicit kill paths: a dropped handle
             // must never leave an orphan daemon holding a port.
             .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
 
         let mut child = command
             .spawn()

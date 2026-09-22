@@ -1515,6 +1515,8 @@ async fn write_attach_project(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(crate::daemon::CREATE_NO_WINDOW);
 
     let output = match time::timeout(ATTACH_WRITE_TIMEOUT, command.output()).await {
         Ok(Ok(output)) => output,

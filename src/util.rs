@@ -43,7 +43,10 @@ pub fn relative_string(path: &std::path::Path, workspace_dir: &std::path::Path) 
 
 /// Returns the Git or local username of the current user
 pub fn get_username() -> String {
-	if let Ok(output) = Command::new("git").arg("config").arg("user.name").output() {
+	let mut git = Command::new("git");
+	hide_console(git.arg("config").arg("user.name"));
+
+	if let Ok(output) = git.output() {
 		let username = String::from_utf8_lossy(&output.stdout).trim().to_owned();
 
 		if !username.is_empty() {
@@ -76,6 +79,47 @@ pub fn is_script(class: &str) -> bool {
 	class == "Script" || class == "LocalScript" || class == "ModuleScript"
 }
 
+/// Windows `CREATE_NO_WINDOW` process-creation flag
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Keeps a console program this process starts from opening a console window.
+///
+/// On Windows a console program gets a console of its own whenever the process
+/// starting it has none, and a console is a window. A detached daemon, the hub
+/// and the desktop app have none, so every `TASKLIST` a daemon ran used to
+/// flash a terminal on screen. Whatever a helper prints is captured or
+/// discarded anyway, so it never needs one. A no-op on every other platform
+#[allow(unused_variables)]
+pub fn hide_console(command: &mut Command) {
+	#[cfg(target_os = "windows")]
+	{
+		use std::os::windows::process::CommandExt;
+
+		command.creation_flags(CREATE_NO_WINDOW);
+	}
+}
+
+/// Whether this process has a console window to share with what it starts.
+/// Always true off Windows, where the question does not come up
+pub fn has_console() -> bool {
+	#[cfg(target_os = "windows")]
+	{
+		extern "system" {
+			fn GetConsoleWindow() -> *mut std::ffi::c_void;
+		}
+
+		// SAFETY: takes no arguments and only reports this process's own
+		// console window, or null when it has none
+		unsafe { !GetConsoleWindow().is_null() }
+	}
+
+	#[cfg(not(target_os = "windows"))]
+	{
+		true
+	}
+}
+
 /// Kills the process with the given `pid`
 pub fn kill_process(pid: u32) {
 	#[cfg(not(target_os = "windows"))]
@@ -89,12 +133,11 @@ pub fn kill_process(pid: u32) {
 
 	// Kill both main and child processes
 	#[cfg(target_os = "windows")]
-	Command::new("TASKKILL")
-		.arg("/F")
-		.arg("/T")
-		.args(["/PID", &pid.to_string()])
-		.output()
-		.ok();
+	{
+		let mut taskkill = Command::new("TASKKILL");
+		hide_console(taskkill.arg("/F").arg("/T").args(["/PID", &pid.to_string()]));
+		taskkill.output().ok();
+	}
 }
 
 pub fn process_exists(pid: u32) -> bool {
@@ -109,10 +152,10 @@ pub fn process_exists(pid: u32) -> bool {
 
 	#[cfg(target_os = "windows")]
 	{
-		let output = Command::new("TASKLIST")
-			.arg("/NH")
-			.args(["/FI", &format!("PID eq {}", pid)])
-			.output();
+		let mut tasklist = Command::new("TASKLIST");
+		hide_console(tasklist.arg("/NH").args(["/FI", &format!("PID eq {}", pid)]));
+
+		let output = tasklist.output();
 
 		if let Ok(output) = output {
 			String::from_utf8_lossy(&output.stdout).contains("wsync.exe")

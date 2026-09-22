@@ -651,10 +651,17 @@ pub(crate) fn rebuild_dev_tree(plugin_dir: &Path) -> HostResult<()> {
         )));
     };
 
-    let output = std::process::Command::new(&node)
+    let mut command = std::process::Command::new(&node);
+    command
         .arg(&script)
         .current_dir(plugin_dir)
-        .env("PATH", &path_value)
+        .env("PATH", &path_value);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(crate::daemon::CREATE_NO_WINDOW);
+    }
+    let output = command
         .output()
         .map_err(|error| {
             HostError::io(format!("could not run {} {}: {error}", node.display(), script.display()))

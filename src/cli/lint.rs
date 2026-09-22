@@ -598,9 +598,12 @@ impl Lint {
 			}
 		}
 
-		let output = Command::new(&luau_lsp)
-			.args(&argv)
-			.current_dir(workspace)
+		let mut command = Command::new(&luau_lsp);
+
+		command.args(&argv).current_dir(workspace);
+		crate::util::hide_console(&mut command);
+
+		let output = command
 			.output()
 			.with_context(|| format!("Failed to run {} (from {lsp_source})", luau_lsp.to_string()))?;
 
@@ -860,11 +863,16 @@ impl Lint {
 
 		for level in COMPILE_LEVELS {
 			for batch in files.chunks(COMPILE_BATCH) {
-				let output = Command::new(&tool)
+				let mut command = Command::new(&tool);
+
+				command
 					.arg("--null")
 					.arg(level)
 					.args(batch.iter().map(|file| relative_to(file, workspace)))
-					.current_dir(workspace)
+					.current_dir(workspace);
+				crate::util::hide_console(&mut command);
+
+				let output = command
 					.output()
 					.with_context(|| format!("Failed to run {}", tool.to_string()))?;
 
