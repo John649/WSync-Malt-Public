@@ -182,13 +182,6 @@
       "contains": "Ro-Sync model)",
       "max": 1,
       "reason": "Same ruling citation on the pure policy module (strict GameId matching, state machine). Comment only."
-    },
-    {
-      "path": "plugin/src/Discovery/init.luau",
-      "token": "ro-sync",
-      "contains": "user-ruled Ro-Sync model",
-      "max": 1,
-      "reason": "Same ruling citation on the scan orchestrator. Comment only."
     }
   ]
 }

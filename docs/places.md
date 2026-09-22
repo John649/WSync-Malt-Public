@@ -20,22 +20,27 @@ a **place key**, carried on a marker in the place itself — see
 
 ## `wsync places`
 
-Lists every runtime record under the state directory (`%LOCALAPPDATA%\WSync\daemons\*.json`
-on Windows) and probes `GET /hello` on the port each one names. It starts,
-stops and writes nothing.
+Lists every daemon registered with the hub ([hub.md](hub.md)), each with the
+live `GET /hello` the hub fetched for it, then every runtime record under the
+state directory (`%LOCALAPPDATA%\WSync\daemons\*.json` on Windows) whose
+daemon is not registered. It starts, stops and writes nothing.
 
 ```
-PROJECT                        PORT  GAME     PLACES      KEY                 BRANCH   MANAGED BY  PLUGIN      KIND
-DungeonDemo                    7970  5550001  128374926   -                   main     cli         WSync (ws)  project
-DungeonDemo                    7971  5550001  128374926   -                   ui-pass  cli         waiting     project
-place-88120033                 7973  4410902  88120033    -                   main     cli         WSync (ws)  attach (ephemeral)
-unpublished-my-level-ab12cd34  7974  -        -           my-level-ab12cd34   main     desktop     WSync (ws)  attach (ephemeral)
+PROJECT                        PORT   GAME     PLACES      KEY                 BRANCH   MANAGED BY  PLUGIN      KIND
+DungeonDemo                    51770  5550001  128374926   -                   main     cli         WSync (ws)  project
+DungeonDemo                    51784  5550001  128374926   -                   ui-pass  cli         waiting     project
+place-88120033                 52011  4410902  88120033    -                   main     cli         WSync (ws)  attach (ephemeral)
+unpublished-my-level-ab12cd34  52030  -        -           my-level-ab12cd34   main     desktop     WSync (ws)  attach (ephemeral)
 ```
 
+* **PORT** is the port the daemon happens to listen on. Nothing needs it:
+  every daemon is reached through the hub at its route.
 * **PLACES** comes from the daemon's own `/hello` when it answers, and from
   its project file's `servePlaceIds` when it does not. A record whose daemon
-  is gone is still listed, with `PLUGIN` reading `unreachable` — a stale
-  record should be visible, not silent.
+  is not registered with the hub is still listed, with `PLUGIN` reading
+  `unreachable` — a stale record should be visible, not silent. A daemon from
+  a build that predates the hub is listed this way too, and is reachable
+  again once restarted.
 * **PLUGIN** is `waiting` when the daemon is up but no Studio plugin has the
   bridge, and `<name> (ws|long-poll)` when one does.
 * **KEY** is the project's `placeKey`, when it sets one — the name an
@@ -57,7 +62,8 @@ wsync get --place 128374926 ReplicatedStorage/Shared/Config
 wsync tree --place 128374926 --branch ui-pass
 ```
 
-It resolves against every runtime record on the machine, in this order:
+It resolves against every daemon `wsync places` lists, in this order, and the
+command then reaches the chosen daemon through its hub route:
 
 1. keep every daemon whose claim includes the place id — its live `/hello`
    `placeIds`, or, for a daemon that does not answer, its project file's
@@ -163,8 +169,9 @@ Studio, and `wsync places` shows the project as `attach` rather than
 Studio opened on it. The other half is the case with no id and no command —
 somebody already has a place open, published or not, and wants it connected.
 
-When the plugin's discovery scan finds no daemon for the open place and the
-desktop app's broker is reachable, it attaches **automatically**. There is no
+When the plugin's discovery finds no daemon for the open place and the
+desktop app's broker is registered with the hub, it attaches
+**automatically**. There is no
 button: opening the place is the whole gesture. The card shows the connection
 with one extra line —
 
@@ -176,14 +183,19 @@ turning a temporary connection into a permanent project is still one click.
 ### The route
 
 ```
-POST http://127.0.0.1:<brokerPort>/places/attach
+POST http://127.0.0.1:7960/broker/places/attach
 { "placeId": 0, "gameId": 0, "name": "My Level", "sessionId": "<hex>" }
 
-200 { "ok": true, "port": 7979, "project": "<dir>/default.project.json",
+200 { "ok": true, "route": "66825c93325c1668", "port": 52030,
+      "project": "<dir>/default.project.json",
       "name": "unpublished-my-level-ab12cd34",
       "key": "unpublished-my-level-ab12cd34",
       "placeKey": "my-level-ab12cd34", "ephemeral": true }
 ```
+
+The broker registers with the hub and is reached through it at `/broker`.
+`route` is what the plugin connects to (`/p/<route>` on the hub); `port` is
+informational.
 
 * `placeId`/`gameId` are `0` for an unpublished place, which is the case the
   route exists for. `sessionId` is the plugin's per-window identity, 8–128 hex
@@ -221,16 +233,17 @@ up exactly as the `wsync open` scratch daemons above do. It is held under the
 project id `attach:<key>`, which nothing writes to `state.json` and which the
 Projects view ignores: an attach is not a project.
 
-### Why the port is trusted
+### Why the route is trusted
 
 A scratch daemon for an unpublished place claims no ids — there are none — so
-no ranking rule could recognise it. The plugin therefore trusts the port the
+no ranking rule could recognise it. The plugin therefore trusts the route the
 broker just handed *this* window, for *this* session, as an exact match. That
 hint is session state in the plugin: it is never written into the place, it
-cannot outlive the window, and it cannot reach another one.
+cannot outlive the window, and it cannot reach another one. A route names a
+project, not a port, so no other daemon can ever answer at it.
 
 It also survives a disconnect, so a reconnect finds the same daemon still
-serving this window. When that daemon is gone the scan finds nothing and the
+serving this window. When that daemon is gone discovery finds nothing and the
 card returns to the ordinary discovery states — one automatic attach per place
 per Studio session, so nothing can loop. **Retry** is what asks for another.
 
@@ -258,8 +271,9 @@ branch's daemon, and a place key on one is never even read.
 An unmarked unpublished place keeps today's behaviour: the first claimless
 daemon, weakly.
 
-The marker may also carry a number attribute `DaemonPort`, which discovery
-probes first. A shortcut, not an override — the port still has to rank exact.
+A marker written before the hub may also carry a number attribute
+`DaemonPort`. Nothing reads it; the plugin clears it the next time it
+remembers the key.
 
 ### Who writes it
 

@@ -47,7 +47,7 @@
     "wsync daemon start --project . --raw",
     "wsync daemon status --project . --raw",
     "wsync daemon stop --project . --timeout 10 --raw",
-    "wsync daemon restart --project . --port 7978 --timeout 10 --raw",
+    "wsync daemon restart --project . --timeout 10 --raw",
     "wsync daemon logs --project . --lines 100",
     "wsync daemon start --project . --game-id 123 --place-id 456 --raw"
   ],
@@ -55,8 +55,9 @@
     "Start and restart serve in the current process; they do not detach into a background child. A process manager can launch them as a background service. --raw emits a readiness JSON line and then the process continues serving.",
     "Start accepts --project, --port, --managed-by, --owner-token-env, --data-dir, --game-id, --group-id, repeated --place-id and --raw. Metadata flags persist those IDs into the project before startup.",
     "Restart accepts --project, --port, --managed-by, --owner-token-env, --data-dir, --timeout and --raw. It uses persisted project metadata and does not accept game/group/place ID flags. The timeout is the wait for the old daemon to stop.",
-    "Status accepts --project, --data-dir and --raw. Stop also accepts --timeout. Logs accepts --project, --data-dir and --lines; it prints text lines without a --raw mode.",
-    "A matching daemon already running for the project is reported instead of starting a duplicate. A requested port serving another project is an error. Restart prefers the previous daemon port.",
+    "Status accepts --project, --data-dir and --raw; --raw also reports `route` (the project's URL on the hub) and `routed` (whether the hub reaches this exact boot). Stop also accepts --timeout. Logs accepts --project, --data-dir and --lines; it prints text lines without a --raw mode.",
+    "A matching daemon already running for the project is reported instead of starting a duplicate; with --raw the answer carries `routed`, and a daemon the hub does not reach (one from an older build) has to be restarted. Without --port or a project-file `port`, the daemon binds whatever port the OS hands out. A pinned port that is taken or serving another project is an error — nothing scans for another. Restart does not keep the previous port; the project's hub route is what stays the same, so a connected Studio reconnects on its own.",
+    "Every daemon registers with the WSync hub on 127.0.0.1:7960 (`WSYNC_HUB_PORT` overrides) over a WebSocket it holds open, and starts the hub when none answers; the hub exits a minute after its last registration closes. Everything reaches the daemon at `http://127.0.0.1:7960/p/<route>`, where the route is the first 16 hex digits of the SHA-256 of the canonical project path. --port only pins the daemon's own port, for a client that cannot use a route, such as a stock Argon plugin.",
     "Stop verifies the exact live canonical project and boot ID before graceful shutdown. On graceful timeout it can use an OS-kill fallback only for that verified process; a stale PID record alone is insufficient.",
     "Runtime records live in the platform data directory under WSync/daemons, alongside start locks and lifecycle logs. The mutation audit log is WSync/writes.log.",
     "Desktop managers can supply an owner token through --owner-token-env <ENV>. Lifecycle JSON does not disclose the token. No --projects-root flag is implemented in this CLI family."

@@ -8,7 +8,7 @@ This repository currently contains the engine through **Phase 2** (see `Design.m
 
 ```sh
 wsync init my-place -T place        # scaffold a project
-wsync serve my-place                # serve it in the foreground (default port 7978)
+wsync serve my-place                # serve it in the foreground (reached through the hub on 7960)
 wsync daemon start --project my-place --raw   # machine-managed daemon (idempotent)
 wsync daemon status --project my-place --raw
 wsync watch my-place --compact      # live event feed over WebSocket
@@ -33,6 +33,10 @@ One daemon per project, loopback only. Two transports share one core sync bus, a
 ### Daemon lifecycle
 
 `wsync daemon start` makes the invoking process the daemon (foreground, machine-manageable): with `--raw` it prints exactly one JSON line (`{"ok":true,"port","pid","bootId","project","canonicalProject"}`) once serving, and reports `"alreadyRunning":true` idempotently when a matching daemon already runs. Runtime records live in the platform data dir (`WSync/daemons/<sha256(canonicalProject)>.json`, 0600, atomic; override with `--data-dir` or `WSYNC_STATE_DIR`) alongside an OS-exclusive `.start.lock` and a per-daemon lifecycle log (`wsync daemon logs`). Stopping verifies the live boot identity over `/hello` before anything is killed — a stale PID record is never authority to kill — and prefers graceful `/stop` with an OS-kill fallback.
+
+### The hub
+
+Every daemon is reached through one address, `http://127.0.0.1:7960/p/<route>/…`, where the route is the first 16 hex digits of the SHA-256 of the canonical project path — it names the project, so it survives a restart. A daemon binds whatever port the OS hands it (unless `--port` or the project file's `port` pins one; a pinned port that is taken is an error, nothing scans) and registers with the hub over a WebSocket it holds open for as long as it serves. Any wsync process that finds no hub starts one (`wsync daemon hub`); binding `7960` is the only lock (`WSYNC_HUB_PORT` moves it), and the hub exits after 60 s with nothing registered. It forwards HTTP and WebSocket upgrades, lists every registered daemon with its live `/hello` at `GET /daemons`, and refuses a `Host` that is not its own loopback address and any web-page `Origin`. The Studio plugin and `--project` go through the hub; `--port` talks to a daemon's own port directly (and is how a stock Argon plugin reaches a pinned one). See `docs/hub.md`.
 
 ## Attribution
 

@@ -6,8 +6,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **Every daemon is reached through one hub port** (docs/hub.md). Daemons
+  bind whatever port the OS hands them and register with the hub on
+  `127.0.0.1:7960` over a WebSocket they hold open, and everything reaches
+  them at `/p/<route>`, a route derived from the project path. So:
+  - the 13-port range can no longer run out;
+  - a dead runtime record can no longer point at another project's daemon;
+  - `daemon restart` no longer fails when its old port was taken;
+  - a branch daemon that comes back on another port is found by its clone
+    with nothing to edit.
+
+  Any wsync process that finds no hub starts one.
+- The Studio plugin asks the hub (one `GET /daemons`) instead of scanning
+  7978–7990, and connects through the daemon's route. Its default Port
+  setting is now the hub, 7960.
+- The desktop app's broker binds an OS-assigned port instead of 7968–7971,
+  registers with the hub, and is reached at `/broker`. Attach answers carry
+  the scratch daemon's `route`.
+- A Studio window whose daemon restarts reconnects on its own, whatever
+  AutoReconnect says. A stopping daemon now tells clients to retry, since a
+  retry can only reach the same project's next daemon.
+- `--project` commands go through the hub. `--port` still talks to a daemon
+  directly. `wsync places` and `--place` read the hub instead of sweeping
+  ports, and `wsync daemon status --raw` reports `routed` and `route`.
+- Branch clones no longer carry `DaemonPort` on their marker, and
+  `branch.json`'s `daemonPort` is informational.
+
+### Removed
+
+- The `port`, `scan_ports` and `port_scan_max` settings. Unknown keys in an
+  existing config file are ignored. A project file's `port` still pins that
+  project's daemon, and a pinned port that is taken is an error.
+
 ### Fixed
 
+- `wsync open --project <p> --port <n>` without Studio paths is refused
+  instead of launching Studio on the project's place. The test suite never
+  launches Studio (`WSYNC_NO_STUDIO_LAUNCH`) or touches the real hub
+  (`WSYNC_HUB_PORT`).
 - On Windows, wsync no longer opens terminal windows. The desktop app now
   starts `wsync daemon start` and `wsync open` without a console, so a daemon
   it serves no longer keeps a terminal open for as long as it runs. A daemon

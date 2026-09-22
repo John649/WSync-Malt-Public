@@ -12,7 +12,7 @@
   ],
   "notes": [
     "Connects to the daemon WebSocket as a watch-role client and prints received event/lifecycle frames. Protocol heartbeat ping/pong messages are handled internally.",
-    "Without --port, it discovers the daemon port from the project runtime record, then the project file, then configuration. --project and the positional project are alternatives.",
+    "Without --port, it connects through the project's route on the WSync hub (`ws://127.0.0.1:7960/p/<route>/ws`, docs/hub.md); --port connects to a daemon's own port instead. --project and the positional project are alternatives.",
     "--raw suppresses the status banner and prints NDJSON frames. --compact prints one-line human summaries; combining it with --raw still selects summaries.",
     "Use this for daemon/plugin events; wsync logs or wsync tail are the tools for Studio output."
   ]

@@ -46,23 +46,33 @@ wsync branch ls --project . --raw
 cat .wsync-branches/<name>/branch.json
 ```
 
-`branch.json` names the `checkpoint`, the `daemonPort`, the `studioPid`, the
-`worktree` and the `clone`. Then:
+`branch.json` names the `checkpoint`, the `studioPid`, the `worktree` and the
+`clone`. Its `daemonPort` is only what the daemon last bound: every daemon is
+reached through the hub (docs/hub.md) at a route that does not change when it
+restarts. Get the branch daemon's address once:
+
+```bash
+wsync daemon status --project <worktree>/<project>.json --raw   # "route": "http://127.0.0.1:7960/p/<route>"
+```
+
+`<branch>` below is that `route` value, and `<main>` is the same field for
+`--project .`. Then:
 
 | Question | How to answer it |
 | --- | --- |
-| Is the branch daemon up? | `curl -s http://localhost:<daemonPort>/hello` — its `branch` field must equal `<name>` |
+| Is the branch daemon up? | `curl -s <branch>/hello` — its `branch` field must equal `<name>`; a 404 means no daemon is registered for the worktree |
 | Is the branch Studio connected? | `wsync ping --project <worktree>/<project>.json` (an ok ping means the plugin is there) |
-| What does the journal hold? | `curl -s "http://localhost:<daemonPort>/journal?checkpoint=<checkpoint>"` → `events`, `blobsOnDisk`, `blobsMissing` |
-| What does the daemon owe? | `curl -s -X POST http://localhost:<daemonPort>/journal/pull` → runs one pull pass and answers `pending: [{id, owner, error}]` |
+| What does the journal hold? | `curl -s "<branch>/journal?checkpoint=<checkpoint>"` → `events`, `blobsOnDisk`, `blobsMissing` |
+| What does the daemon owe? | `curl -s -X POST <branch>/journal/pull` → runs one pull pass and answers `pending: [{id, owner, error}]` |
 | Blob index on disk | `cat <root>/journal/blobs.json`; the bytes are `<root>/journal/blobs/<id>` |
 | Branch daemon log | `wsync daemon logs --project <worktree>/<project>.json --lines 200` |
 | Is main mid-merge? | `git -C . rev-parse -q --verify MERGE_HEAD` (prints a hash when a merge is in progress) and `git -C . status --short` |
-| Is main's sync paused? | `curl -s http://localhost:<mainPort>/sync` → `{paused: true|false}` (main's port is in `wsync daemon status --project . --raw`) |
+| Is main's sync paused? | `curl -s <main>/sync` → `{paused: true|false}` |
 | Parked conflicts / decisions | `cat <root>/conflicts.json` and `cat <root>/decisions.json` |
 
 On Windows use PowerShell's `Invoke-RestMethod` in place of `curl`:
-`Invoke-RestMethod -Method Post http://localhost:<port>/journal/pull`.
+`Invoke-RestMethod -Method Post "<branch>/journal/pull"`, with `<branch>` from
+`(wsync daemon status --project <worktree>\<project>.json --raw | ConvertFrom-Json).route`.
 
 Write the answers down before touching anything. Every rung below names the
 answer that sends you to it.
@@ -172,7 +182,7 @@ Rebuild it in main by hand from those, then finish with
 - Conflicted files: resolve them **in the branch worktree**
   (`<worktree>`), stage nothing by hand in main, then rung 1.
 - To abandon the merge entirely: `git -C . merge --abort`, then
-  `curl -X POST http://localhost:<mainPort>/sync/resume`. Only do this if the
+  `curl -X POST <main>/sync/resume`. Only do this if the
   replay has not landed anything, or main keeps instances whose scripts it
   does not have.
 - A merge someone committed by hand is fine: `finish` sees no `MERGE_HEAD`
@@ -195,11 +205,13 @@ which restarts both halves.
 wsync daemon start --project <worktree>/<project>.json --raw
 ```
 
-It serves in the foreground and prints a readiness line with its port; put
-the port into `branch.json` as `daemonPort` if it changed. A port already
-serving another project is an error, not a retry. The daemon scans
-`7978–7990`; a clone binds only to the daemon whose `/hello` names its branch,
-so a wrong port cannot make it attach to main.
+It serves in the foreground and prints a readiness line, then registers with
+the hub; the clone finds it there by branch name, whatever port it bound.
+Nothing needs editing in `branch.json`. A clone binds only to the daemon whose
+`/hello` names its branch, so it can never attach to main. If the log says
+"The hub refused this daemon: … is already served by PID …", another daemon
+for the same worktree is still alive — stop it with
+`wsync daemon stop --project <worktree>/<project>.json` first.
 
 ## After the merge lands
 

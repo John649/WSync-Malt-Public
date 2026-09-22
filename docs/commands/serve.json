@@ -5,14 +5,14 @@
   "description": "Runs a local HTTP/WebSocket server with filesystem watching, optionally in an asynchronous child process.",
   "usage": "wsync serve [<project> [<session>] | --project <path>] [-H|--host <host>] [-P|--port <port>] [--sourcemap] [--ts] [-A|--async]",
   "examples": [
-    "wsync serve --project . --port 7978",
+    "wsync serve --project .",
     "wsync serve --project . --sourcemap",
-    "wsync serve . dev-session --port 7978 --async"
+    "wsync serve . dev-session --async"
   ],
   "notes": [
     "Runs in the foreground unless --async or the run_async configuration is enabled. --async spawns a WSync child process.",
     "--project is the named alternative to the positional project. Use the positional form when also supplying a session identifier; both project forms together are rejected.",
-    "Host/port come from explicit flags, then the project, then configuration. With scan_ports enabled, a busy port scans upward to port_scan_max. The process registers in ~/.wsync/sessions.toml for wsync stop.",
+    "The host comes from --host, then the project, then configuration. The port comes from --port, then the project file's `port`; with neither, the OS hands out a free one. A pinned port that is taken is an error — nothing scans for another. Either way the server registers with the WSync hub on 127.0.0.1:7960 (starting one if none answers), so Studio and the CLI reach it at its project route `/p/<route>` whatever port it bound. The process registers the port it actually bound in ~/.wsync/sessions.toml for wsync stop.",
     "--sourcemap keeps sourcemap.json regenerated from the live tree. --ts enables the roblox-ts watcher.",
     "For the project lifecycle record and manager authentication, use wsync daemon start. That command also stays in the current process while serving; launch it through your process manager when background operation is needed.",
     "Serve does not accept game/group/place metadata flags. Configure project metadata in the project file or use wsync daemon start --game-id/--group-id/--place-id."

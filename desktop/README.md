@@ -52,6 +52,7 @@ desktop/
       commands.rs             the whole IPC surface
       daemon.rs               sidecar lifecycle: spawn, registry, heartbeat, stop
       loopback.rs             the small HTTP/1.1 client used to reach 127.0.0.1
+      broker.rs hub.rs        the Studio project broker, and its registration with the WSync hub
       storage.rs error.rs     state.json, and the typed error crossing IPC
 ```
 
@@ -184,7 +185,7 @@ WSYNC_MOCK_ARGS="--no-resolve" WSYNC_DAEMON_PATH=… cargo tauri dev
 WSYNC_MOCK_ARGS="--event-interval 200" WSYNC_DAEMON_PATH=… cargo tauri dev
 
 # a daemon that refuses to start — renders the project-error card
-WSYNC_MOCK_ARGS="--fail 'port 7978 serves another project'" WSYNC_DAEMON_PATH=… cargo tauri dev
+WSYNC_MOCK_ARGS="--fail 'pinned port 7978 serves another project'" WSYNC_DAEMON_PATH=… cargo tauri dev
 
 # a daemon that was already running — the adopt path, which WSync never kills
 WSYNC_MOCK_ARGS="--already-running" WSYNC_DAEMON_PATH=… cargo tauri dev
@@ -353,9 +354,25 @@ rather than at the next poll.
 `loopback.rs` is the ~200-line HTTP/1.1 client behind all of this. It exists
 instead of a general HTTP stack because every call is plain HTTP to
 `127.0.0.1`: no TLS to configure, no connection pool to hand a socket belonging
-to a daemon that has since exited on the same scanned port, and — importantly —
-no `Origin` header, which is what puts these requests on the daemon's native
-loopback path rather than its browser-origin one (Design §5.2).
+to a daemon that has since exited on a port the OS then gave to something else,
+and — importantly — no `Origin` header, which is what puts these requests on
+the daemon's native loopback path rather than its browser-origin one (Design
+§5.2).
+
+**Ports and the hub.** A daemon binds whatever port the OS hands it unless
+`--port` pins one, and registers with the WSync hub on `127.0.0.1:7960`
+(`WSYNC_HUB_PORT` overrides; see `docs/hub.md`). The app talks to the daemons it
+starts on the port their ready line reports; Studio and the CLI reach the same
+daemon through the hub at `/p/<route>`, the route being derived from the
+canonical project path.
+
+**The broker.** While a Projects folder is authorized, `broker.rs` listens on an
+OS-assigned loopback port and `hub.rs` registers it with the hub as
+`kind: "broker"`, over a WebSocket held open for as long as the broker listens;
+when no hub answers, one is started from the bundled engine
+(`wsync daemon hub`). The plugin reaches the broker at `/broker` on the hub
+instead of scanning ports for it, and a `/places/attach` answer carries the
+scratch daemon's `route`, which is what the plugin connects to.
 
 ## The daemon WebSocket
 

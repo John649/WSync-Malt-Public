@@ -1,19 +1,22 @@
 //! The project broker (Design 8.4): Studio-triggered project creation.
 //!
-//! A loopback HTTP/1.1 listener on the first free port of `7968–7971`, running
-//! **only while a Projects folder is authorized in Settings**. It answers two
-//! routes and nothing else:
+//! A loopback HTTP/1.1 listener on whatever port the OS hands out, running
+//! **only while a Projects folder is authorized in Settings**. It registers
+//! with the WSync hub (`hub.rs`), which is where the Studio plugin finds it:
+//! the hub forwards `/broker/...` here. It answers these routes and nothing
+//! else:
 //!
 //! * `GET  /hello`          → `{broker, projectInit, attach, version}` — how the
-//!   plugin's port scan tells a broker from a daemon (Design 3.2).
+//!   hub confirms a registering broker is one (Design 3.2 as amended).
 //! * `POST /projects/init`  → `{ok, slug, status}` — the "Create Project" click.
 //!   The hello also carries `games`, the GameIds of registered projects, so
 //!   the plugin can offer "Serve Project" instead of a create for a game the
 //!   app already has.
-//! * `POST /places/attach`  → `{ok, port, project, ephemeral}` — **Attach**
-//!   (docs/places.md). No click: when discovery finds no daemon for the open
-//!   place and this broker is reachable, the plugin asks for a throwaway
-//!   daemon and connects to the port it answers with. Nothing is registered,
+//! * `POST /places/attach`  → `{ok, route, port, project, ephemeral}` —
+//!   **Attach** (docs/places.md). No click: when discovery finds no daemon for
+//!   the open place and this broker is reachable, the plugin asks for a
+//!   throwaway daemon and connects to the hub route it answers with. Nothing
+//!   is registered,
 //!   nothing is kept, and the whole thing disappears with the Studio window.
 //!   Switched off from Settings, the route answers `{disabled: true}` and the
 //!   plugin falls back to the ordinary no-daemon card.
@@ -98,15 +101,17 @@ use tokio::{
 
 use crate::{
     error::{HostError, HostResult},
-    storage,
+    hub, loopback, storage,
     templates::{self, ProjectFacts},
 };
 
 // -------------------------------------------------------------- constants --
 
-/// Design 3.2: the broker's own range, disjoint from the daemons' `7978–7990`
-/// and from both parents' ranges.
-pub(crate) const BROKER_PORTS: [u16; 4] = [7968, 7969, 7970, 7971];
+/// Whatever port the OS hands out. Nothing reaches the broker by its port: it
+/// registers with the WSync hub (`hub.rs`), and the Studio plugin finds it at
+/// `/broker` there. Before the hub it took one of 7968–7971, a range the
+/// plugin had to scan one closed port at a time.
+pub(crate) const BROKER_PORTS: [u16; 1] = [0];
 
 /// Request line plus headers. A plugin's POST is a few hundred bytes.
 const MAX_HEAD: usize = 8 * 1024;
@@ -428,6 +433,9 @@ struct Running {
     root: PathBuf,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
+    /// The broker's registration with the hub; aborting it takes the broker
+    /// off the hub
+    hub_link: JoinHandle<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -548,11 +556,13 @@ impl Broker {
             root.clone(),
             shutdown_rx,
         ));
+        let hub_link = tokio::spawn(hub::hold_broker(port));
         *guard = Some(Running {
             port,
             root,
             shutdown: Some(shutdown_tx),
             task,
+            hub_link,
         });
 
         let status = status_of(guard.as_ref(), "");
@@ -862,6 +872,8 @@ impl Broker {
                 json!({
                     "ok": true,
                     "port": attached.port,
+                    // What the plugin connects to: the daemon's route on the hub
+                    "route": attached.route,
                     "project": attached.project,
                     "name": attached.name,
                     "key": attached.key,
@@ -900,6 +912,7 @@ impl Broker {
 
                 return Ok(Attached {
                     port,
+                    route: daemon_route(port).await,
                     project: path,
                     name,
                     key: id,
@@ -941,6 +954,7 @@ impl Broker {
 
         Ok(Attached {
             port,
+            route: daemon_route(port).await,
             project: written.project,
             name: written.name,
             key,
@@ -1049,8 +1063,19 @@ async fn accept_loop(
     }
 }
 
+/// The route the daemon on `port` is reached at through the hub, from the
+/// canonical project its own `/hello` reports.
+async fn daemon_route(port: u16) -> Option<String> {
+    let response = loopback::get(port, "/hello", Duration::from_secs(2)).await.ok()?;
+    let hello = response.json()?;
+    let canonical = hello.get("canonicalProject")?.as_str()?;
+
+    Some(hub::route_key(canonical))
+}
+
 async fn shutdown(running: Option<Running>) {
     let Some(mut running) = running else { return };
+    running.hub_link.abort();
     if let Some(signal) = running.shutdown.take() {
         let _ = signal.send(());
     }
@@ -1065,7 +1090,11 @@ async fn bind_first_free(ports: &[u16]) -> HostResult<(TcpListener, u16)> {
     let mut last = None;
     for port in ports {
         match TcpListener::bind((Ipv4Addr::LOCALHOST, *port)).await {
-            Ok(listener) => return Ok((listener, *port)),
+            // Port 0 means "any": the port that matters is the one it got
+            Ok(listener) => {
+                let bound = listener.local_addr().map(|address| address.port()).unwrap_or(*port);
+                return Ok((listener, bound));
+            }
             Err(error) => last = Some(error),
         }
     }
@@ -1346,6 +1375,9 @@ impl AttachRequest {
 #[derive(Debug)]
 struct Attached {
     port: u16,
+    /// The daemon's route on the hub, from its own `/hello`. `None` only for
+    /// a daemon that did not answer, which the plugin reports as a refusal
+    route: Option<String>,
     project: String,
     name: String,
     key: String,
@@ -2229,8 +2261,8 @@ mod tests {
     // --- pure rules ---------------------------------------------------------
 
     #[test]
-    fn the_port_range_is_the_one_design_3_2_pins() {
-        assert_eq!(BROKER_PORTS, [7968, 7969, 7970, 7971]);
+    fn the_broker_takes_whatever_port_it_is_given() {
+        assert_eq!(BROKER_PORTS, [0]);
     }
 
     #[test]

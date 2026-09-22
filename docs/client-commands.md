@@ -195,7 +195,7 @@ wsync daemon <start|status|stop|restart|logs> [--project <path>] [options]
 wsync daemon start --project . --raw
 wsync daemon status --project . --raw
 wsync daemon stop --project . --timeout 10 --raw
-wsync daemon restart --project . --port 7978 --timeout 10 --raw
+wsync daemon restart --project . --timeout 10 --raw
 wsync daemon logs --project . --lines 100
 wsync daemon start --project . --game-id 123 --place-id 456 --raw
 ```
@@ -205,8 +205,9 @@ wsync daemon start --project . --game-id 123 --place-id 456 --raw
 - Start and restart serve in the current process; they do not detach into a background child. A process manager can launch them as a background service. --raw emits a readiness JSON line and then the process continues serving.
 - Start accepts --project, --port, --managed-by, --owner-token-env, --data-dir, --game-id, --group-id, repeated --place-id and --raw. Metadata flags persist those IDs into the project before startup.
 - Restart accepts --project, --port, --managed-by, --owner-token-env, --data-dir, --timeout and --raw. It uses persisted project metadata and does not accept game/group/place ID flags. The timeout is the wait for the old daemon to stop.
-- Status accepts --project, --data-dir and --raw. Stop also accepts --timeout. Logs accepts --project, --data-dir and --lines; it prints text lines without a --raw mode.
-- A matching daemon already running for the project is reported instead of starting a duplicate. A requested port serving another project is an error. Restart prefers the previous daemon port.
+- Status accepts --project, --data-dir and --raw; --raw also reports `route` (the project's URL on the hub) and `routed` (whether the hub reaches this exact boot). Stop also accepts --timeout. Logs accepts --project, --data-dir and --lines; it prints text lines without a --raw mode.
+- A matching daemon already running for the project is reported instead of starting a duplicate; with --raw the answer carries `routed`, and a daemon the hub does not reach (one from an older build) has to be restarted. Without --port or a project-file `port`, the daemon binds whatever port the OS hands out. A pinned port that is taken or serving another project is an error — nothing scans for another. Restart does not keep the previous port; the project's hub route is what stays the same, so a connected Studio reconnects on its own.
+- Every daemon registers with the WSync hub on 127.0.0.1:7960 (`WSYNC_HUB_PORT` overrides) over a WebSocket it holds open, and starts the hub when none answers; the hub exits a minute after its last registration closes. Everything reaches the daemon at `http://127.0.0.1:7960/p/<route>`, where the route is the first 16 hex digits of the SHA-256 of the canonical project path. --port only pins the daemon's own port, for a client that cannot use a route, such as a stock Argon plugin.
 - Stop verifies the exact live canonical project and boot ID before graceful shutdown. On graceful timeout it can use an OS-kill fallback only for that verified process; a stale PID record alone is insufficient.
 - Runtime records live in the platform data directory under WSync/daemons, alongside start locks and lifecycle logs. The mutation audit log is WSync/writes.log.
 - Desktop managers can supply an owner token through --owner-token-env <ENV>. Lifecycle JSON does not disclose the token. No --projects-root flag is implemented in this CLI family.
@@ -215,7 +216,7 @@ wsync daemon start --project . --game-id 123 --place-id 456 --raw
 
 ### `wsync places`
 
-Lists every recorded WSync daemon with the places it serves, its port, branch, and whether a Studio plugin is connected.
+Lists every WSync daemon with the places it serves, its port, branch, and whether a Studio plugin is connected.
 
 **Usage**
 
@@ -232,8 +233,8 @@ wsync places --raw
 
 **Notes**
 
-- Reads the runtime records under the state directory and probes `GET /hello` on each recorded port; nothing is started, stopped, or written.
-- A daemon that does not answer is still listed as `unreachable`, with the place ids its project file claims, so a stale record is visible rather than silent.
+- Reads the WSync hub's `GET /daemons` (every registered daemon with its live `/hello`, docs/hub.md), then the runtime records under the state directory; nothing is started, stopped, or written.
+- A record whose daemon is not registered with the hub is still listed as `unreachable`, with the place ids its project file claims, so a stale record is visible rather than silent. A daemon from a build that predates the hub appears this way until it is restarted.
 - The `KIND` column marks scratch projects created by `wsync open <placeId>`: `attach` for one that persists, `attach (ephemeral)` for one that deletes itself when Studio closes.
 - Place ids listed here are what the global `--place <placeId>` option resolves against.
 
@@ -252,16 +253,16 @@ wsync serve [<project> [<session>] | --project <path>] [-H|--host <host>] [-P|--
 **Examples**
 
 ```sh
-wsync serve --project . --port 7978
+wsync serve --project .
 wsync serve --project . --sourcemap
-wsync serve . dev-session --port 7978 --async
+wsync serve . dev-session --async
 ```
 
 **Notes**
 
 - Runs in the foreground unless --async or the run_async configuration is enabled. --async spawns a WSync child process.
 - --project is the named alternative to the positional project. Use the positional form when also supplying a session identifier; both project forms together are rejected.
-- Host/port come from explicit flags, then the project, then configuration. With scan_ports enabled, a busy port scans upward to port_scan_max. The process registers in ~/.wsync/sessions.toml for wsync stop.
+- The host comes from --host, then the project, then configuration. The port comes from --port, then the project file's `port`; with neither, the OS hands out a free one. A pinned port that is taken is an error — nothing scans for another. Either way the server registers with the WSync hub on 127.0.0.1:7960 (starting one if none answers), so Studio and the CLI reach it at its project route `/p/<route>` whatever port it bound. The process registers the port it actually bound in ~/.wsync/sessions.toml for wsync stop.
 - --sourcemap keeps sourcemap.json regenerated from the live tree. --ts enables the roblox-ts watcher.
 - For the project lifecycle record and manager authentication, use wsync daemon start. That command also stays in the current process while serving; launch it through your process manager when background operation is needed.
 - Serve does not accept game/group/place metadata flags. Configure project metadata in the project file or use wsync daemon start --game-id/--group-id/--place-id.
@@ -284,16 +285,17 @@ wsync stop [<session-id>]... [-a|--all] [-l|--list] [-H|--host <host>] [-P|--por
 wsync stop --list
 wsync stop
 wsync stop --all
-wsync stop --port 7978
+wsync stop --port 52814
 ```
 
 **Notes**
 
-- Sessions are the `serve` and daemon entries registered in `~/.wsync/sessions.toml` as id to pid, host, and port.
+- Sessions are the `serve` and daemon entries registered in `~/.wsync/sessions.toml` as id to pid, host, and port. The port is the one each process actually bound, which the OS picks unless it was pinned; `--list` shows it.
 - With no arguments the last started session is stopped. `--all` stops every session, `--list` prints them and stops nothing, and `-H`/`-P` select sessions by address.
 - Mutates local daemon processes only. It never writes to the project, never touches Studio, and never resolves a pending conflict or divergence choice.
 - Shutdown goes through the daemon's authenticated `/stop` route. A PID read from a stale session or runtime record is never authority to kill a process; unreachable entries are pruned and reported instead.
 - `wsync daemon stop --project <path>` is the per-project form and matches the exact canonical project plus boot ID.
+- The WSync hub is not a session and `stop` leaves it alone; it exits on its own a minute after nothing is registered with it.
 
 ---
 
@@ -344,13 +346,14 @@ wsync context [--project <path>] [--port <port>] [--full-commands] [--raw]
 ```sh
 wsync context --project .
 wsync context --project . --full-commands
-wsync context --project . --port 7978
+wsync context --project . --raw
 ```
 
 **Notes**
 
 - Reads project and daemon state without mutation or backlog cleanup. Missing live facts are null/unknown, not zero.
 - Includes canonical project identity, synced roots, generated-file presence, instruction-size warning, daemon/project match, plugin status, read-only backlog count and schema/build fingerprints.
+- The daemon is reached through the project's route on the WSync hub unless --port names a daemon's own port. `daemon.address` is the base URL used, `daemon.port` the port the daemon itself reports, and `daemon.portSource` says how it was chosen (`hub`, `--port` or `--place`).
 - Fetch when necessary project/connection facts are missing or stale. Refresh after project switches, reconnects, daemon restarts, binary upgrades or configuration changes. Reuse a successful snapshot during ordinary work.
 - Includes focused command/value-schema pointers and a concise llmPolicy: retain user authorization, coordinate one Studio lifecycle owner, avoid guessing value schemas, and check partial/unknown writes before retrying.
 - Use --full-commands only when the complete registry is needed; --raw returns a single JSON line.
@@ -1017,7 +1020,7 @@ wsync lint [--project <path>] [--port <port>] [--path <file-or-dir>]... [--data-
 
 ```sh
 wsync lint --project .
-wsync lint --project . --data-model studio --port 7978 --raw
+wsync lint --project . --data-model studio --raw
 wsync lint --project . --path src/Server/Foo.server.luau --path src/Shared
 wsync lint --project . --path src/Server --owned-only --summary
 wsync lint --project . --data-model filesystem --raw
@@ -1029,7 +1032,7 @@ wsync lint --project . --compile required --luau-compile /path/to/luau-compile
 
 - The default `--data-model auto` mode merges the complete live Studio tree into disk script mappings and enables strict DataModel diagnostics when a matching daemon/plugin is connected; otherwise it reports a relaxed filesystem fallback.
 - `--data-model studio` requires that live full-DataModel strict check. `filesystem` performs a strict offline audit that may report false unknown children for Studio-only instances, while `loose` keeps filesystem DataModel expressions gradual.
-- `--port` selects the daemon used for auto/studio discovery. `--raw` returns JSON diagnostics plus DataModel coverage, strictness, live-node count, analyzer status, and suppressed counts.
+- Auto/studio discovery reaches the project's daemon through its route on the WSync hub; `--port` talks to a daemon's own port directly instead. `--raw` returns JSON diagnostics plus DataModel coverage, strictness, live-node count, analyzer status, and suppressed counts.
 - Without `--path`, default vendor ignores hide common dependency/tooling folders such as `Packages`, `_Index`, `Madwork*`, `PlayerModule`, `node_modules`, `tools`, `.git`, `.codex`, `.vscode`, and WSync's `.wsync-*` runtime/backup folders. Any explicit `--path` overrides those defaults so the requested target is never silently skipped.
 - `--scope-only` / `--owned-only` requires at least one `--path`, shows only diagnostics in those scopes, reports suppressed dependency diagnostics, and does not fail solely for diagnostics outside the requested scopes.
 - WSync injects bundled Roblox definitions as the named `@roblox` set. Extra named sets such as `--definitions:@testez=...` coexist; an explicit `--definitions:@roblox=...` after `--` replaces the bundled set.
@@ -1088,7 +1091,7 @@ wsync watch --project . --raw
 **Notes**
 
 - Connects to the daemon WebSocket as a watch-role client and prints received event/lifecycle frames. Protocol heartbeat ping/pong messages are handled internally.
-- Without --port, it discovers the daemon port from the project runtime record, then the project file, then configuration. --project and the positional project are alternatives.
+- Without --port, it connects through the project's route on the WSync hub (`ws://127.0.0.1:7960/p/<route>/ws`, docs/hub.md); --port connects to a daemon's own port instead. --project and the positional project are alternatives.
 - --raw suppresses the status banner and prints NDJSON frames. --compact prints one-line human summaries; combining it with --raw still selects summaries.
 - Use this for daemon/plugin events; wsync logs or wsync tail are the tools for Studio output.
 
@@ -2063,10 +2066,10 @@ wsync config [<setting>] [<value>] [-l|--list] [-d|--default] [-e|--export <path
 
 ```sh
 wsync config --list
-wsync config port
+wsync config host
 wsync config auto_update true
 wsync config changes_threshold 10 --config workspace
-wsync config port --default
+wsync config changes_threshold --default
 ```
 
 **Notes**
@@ -2077,7 +2080,8 @@ wsync config port --default
 - `--default` restores the named setting to its built-in value, or every setting when no name is given.
 - `--export <path>` writes the fully resolved configuration (defaults merged with global and workspace overrides) to the given file instead of reading or writing a single key.
 - Unknown setting names and values that fail the setting's type are rejected before anything is written.
-- WSync-specific settings beyond the inherited set are `syncback_model_json` (false), `conflict_engine` (true), `compat_argon` (false), `port_scan_max` (7990), and `auto_open_app_modal` (true). `port` defaults to 7978 and `share_stats` defaults to false — telemetry is strictly opt-in.
+- WSync-specific settings beyond the inherited set are `syncback_model_json` (false), `conflict_engine` (true), `compat_argon` (false), and `auto_open_app_modal` (true). `share_stats` defaults to false — telemetry is strictly opt-in.
+- There is no port setting: `port`, `scan_ports` and `port_scan_max` were removed when daemons moved behind the WSync hub (`127.0.0.1:7960`, `WSYNC_HUB_PORT` overrides). A daemon binds whatever port the OS hands out unless `--port` or the project file's `port` pins one. `wsync config` rejects the old names as unknown settings; a config file that still sets them loads normally and the keys are ignored.
 
 ---
 

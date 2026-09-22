@@ -11,6 +11,7 @@ mod commands;
 mod daemon;
 mod error;
 mod external;
+mod hub;
 mod loopback;
 mod plugin_install;
 mod secrets;

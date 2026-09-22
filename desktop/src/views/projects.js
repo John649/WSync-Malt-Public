@@ -426,7 +426,7 @@ export function mountProjects(root, api) {
             el("div", { class: "row-title", text: "Run a daemon for this project" }),
             el("div", {
               class: "row-sub",
-              text: "One daemon per project, loopback only, port 7978–7990.",
+              text: "One daemon per project, loopback only, reached through the WSync hub.",
             }),
           ),
           el("div", { class: "row-actions" }, serveToggle(project, { withLabel: true })),

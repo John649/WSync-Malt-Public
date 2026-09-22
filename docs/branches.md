@@ -74,7 +74,12 @@ plugin reads it at boot rather than being told later:
 | `Value` | the branch name — the identity |
 | attribute `GameId` | the real universe id |
 | attribute `PlaceId` | the real place id |
-| attribute `DaemonPort` | the branch daemon's port |
+
+There is no port on it. The branch daemon registers with the hub like every
+other daemon ([hub.md](hub.md)), and the clone finds it there by the branch
+name alone — so a branch daemon that is restarted on a different port is
+found all the same. (Clones assembled before the hub carry a `DaemonPort`
+attribute too; nothing reads it.)
 
 A place opened from a local `.rbxl` reports `0` for both ids, so the plugin
 calls `SetUniverseId` and `SetPlaceId` with the marker's values first, before
@@ -96,9 +101,8 @@ no longer tell them apart and the marker decides first:
 - A Studio **carrying** the marker binds only to the daemon whose `/hello`
   `branch` equals the marker's `Value`. Nothing else ranks, at any strength — a
   clone whose own daemon is down refuses to connect rather than falling through
-  to main and journalling a branch's edits into the live place. The
-  `DaemonPort` attribute is probed first as a shortcut; it is not an override,
-  and the daemon it reaches still has to name the right branch.
+  to main and journalling a branch's edits into the live place. The hub lists
+  every daemon in one answer, so there is nothing to probe first.
 - A Studio **without** the marker never binds to a branch daemon, however well
   the ids line up. Otherwise main's own window would attach to a branch's
   worktree whenever main's daemon happened not to answer.
@@ -392,8 +396,9 @@ nothing and is created as before.
 died keeps recording; `finish` starts a daemon again and waits up to 45 s for
 the clone to find it. The transport fails that reconnect on purpose — a new
 boot means new refs, so Core has to be re-entered — and a branch clone now
-re-enters it on its own instead of waiting for a click, which is what main
-does under the AutoReconnect setting.
+re-enters it on its own instead of waiting for a click. Since the hub, main's
+window does the same: a new boot at the same route is a resync, whatever the
+AutoReconnect setting says.
 
 **The merged files never duplicate the replayed instances.** The replay puts
 the branch's instances into main while the daemon holds disk pushes; the

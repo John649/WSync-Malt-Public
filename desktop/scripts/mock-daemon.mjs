@@ -77,8 +77,8 @@ import process from "node:process";
 // ------------------------------------------------------------------ argv ---
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+/** The port the fake adopt answer names; nothing listens there. */
 const DEFAULT_PORT = 7978;
-const PORT_SCAN_END = 7990;
 const NAME = "wsync-mock";
 const VERSION = "0.1.0-mock";
 const PROTOCOL = 1;
@@ -1599,12 +1599,12 @@ function readJson(request, then) {
   });
 }
 
-/** Design §3.2: default 7978, scan 7978–7990. */
+/**
+ * The engine binds whatever port the OS hands out unless one is pinned, and is
+ * reached through the hub rather than by port (src/hub). Port 0 asks for that.
+ */
 function listenOnFirstFreePort(server, preferred) {
-  const candidates =
-    preferred && Number.isFinite(preferred)
-      ? [preferred]
-      : Array.from({ length: PORT_SCAN_END - DEFAULT_PORT + 1 }, (_, index) => DEFAULT_PORT + index);
+  const candidates = preferred && Number.isFinite(preferred) ? [preferred] : [0];
 
   return new Promise((resolve, reject) => {
     let index = 0;
@@ -1621,7 +1621,7 @@ function listenOnFirstFreePort(server, preferred) {
       };
       const onListening = () => {
         server.removeListener("error", onError);
-        resolve(port);
+        resolve(server.address().port);
       };
       server.once("error", onError);
       server.once("listening", onListening);

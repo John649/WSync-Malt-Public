@@ -50,6 +50,11 @@ tauri-plugin-updater = "2.10"
 # `loopback.rs` and the broker's own listener. `time` bounds every wait;
 # nothing here blocks forever.
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
+# The broker registers with the WSync hub (the engine's src/hub) over a
+# WebSocket it holds open, exactly as every daemon does. Loopback only, so no
+# TLS feature; the same version the engine builds with.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
 [dev-dependencies]
 tempfile = "3"

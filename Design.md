@@ -82,7 +82,7 @@ Argon is an **engine**: a single Rust binary (CLI + actix-web server) plus a Fus
 | Bulk safety | Phased, fenced, backed-up, receipts, one-undo | `changes_threshold` prompt | **Ro-Sync mechanics** (§8.5) |
 | Desktop app | Tauri 2 + vanilla JS views | None | **Ro-Sync** (§9) |
 | Plugin UI | React-Lua panel + fallback UI | Fusion pages/widgets incl. diff viewers | **Argon plugin UI** + Ro-Sync connection model (§10) |
-| Daemon model | One daemon per project, ports 7878–7890, broker | Sessions file, one port per serve | **Merged** (§4.2) |
+| Daemon model | One daemon per project, ports 7878–7890, broker | Sessions file, one port per serve | **Merged**, every daemon behind one hub port (§3.2, amended 2026-09-22) |
 
 ---
 
@@ -92,20 +92,23 @@ Argon is an **engine**: a single Rust binary (CLI + actix-web server) plus a Fus
 
 1. **`wsync` (Rust, one binary)** — the CLI *and* the daemon. Forked from Argon's core (`vfs`, `middleware`, `core/{tree,snapshot,changes,meta,processor,queue}`, `project`, `resolution`, `sessions`, `workspace`, `installer`, `updater`, `studio`, `logger`, `stats`), with the server layer rewritten on **axum 0.7 + tokio** (WebSocket support, and the daemon-lifecycle patterns being adopted are axum-shaped), plus new subsystems: conflict engine, divergence coordinator, remote-op router, artifact store, workflow runner, audit log, lifecycle manager.
 2. **WSync Desktop (Tauri 2)** — reimplementation of Ro-Sync's app: vanilla-JS ES-module frontend (no framework, no build step), Rust host with narrowly scoped commands, `wsync` bundled as a **sidecar** binary, project broker for Studio-triggered project creation, signed updater with key pinning.
-3. **WSync Studio plugin (Luau)** — fork of `argon-roblox` (Fusion 0.3 UI, `Client`/`Core`/`Processor`/`Tree`/`Watcher`/`Lib/Dom`), with: transport swapped to `HttpService:CreateWebStreamClient` WebSocket, Ro-Sync-style daemon discovery (port scan + GameId match + "Create Project"), and a new `Remote/` module family implementing the request/response op surface (codec, reflection, clipboard, capture, playtest — reimplemented, §5.4).
+3. **WSync Studio plugin (Luau)** — fork of `argon-roblox` (Fusion 0.3 UI, `Client`/`Core`/`Processor`/`Tree`/`Watcher`/`Lib/Dom`), with: transport swapped to `HttpService:CreateWebStreamClient` WebSocket, Ro-Sync-style daemon discovery (hub listing + GameId match + "Create Project"), and a new `Remote/` module family implementing the request/response op surface (codec, reflection, clipboard, capture, playtest — reimplemented, §5.4).
 
 ### 3.2 Process & port model
+
+> **Amended 2026-09-22 — the hub.** The original model gave each daemon a port from `7978–7990` (default `7978`) and the broker one from `7968–7971`, and everything found a daemon by that number: the plugin scanned the range, the CLI trusted runtime records, a branch clone's marker stored `DaemonPort`. Sixteen daemons overflowed the range, dead records named ports other projects had since taken, and a restart could not move. One well-known hub port now fronts every daemon. This section, §3.3, §8.4 and §9 describe the amended model; `docs/hub.md` is the reference.
 
 ```mermaid
 graph LR
     subgraph Desktop["WSync Desktop (Tauri 2)"]
         UI["Web views<br/>projects · activity · conflicts · docs · settings"]
         Host["Rust host<br/>state store · secrets · sidecar mgmt · updater"]
-        Broker["Project broker<br/>127.0.0.1:7968–7971"]
+        Broker["Project broker<br/>127.0.0.1:(OS-assigned port)"]
     end
+    Hub["WSync hub<br/>127.0.0.1:7960<br/>GET /daemons · /p/… · /broker/…"]
     subgraph Daemons["one per served project"]
-        D1["wsync daemon (project A)<br/>127.0.0.1:7978"]
-        D2["wsync daemon (project B)<br/>127.0.0.1:7979"]
+        D1["wsync daemon (project A)<br/>127.0.0.1:(OS-assigned port)"]
+        D2["wsync daemon (project B)<br/>127.0.0.1:(OS-assigned port)"]
     end
     subgraph Studio["Roblox Studio"]
         P["WSync plugin<br/>(one WS per open place)"]
@@ -115,23 +118,32 @@ graph LR
     Host -- "spawn sidecar + heartbeat" --> D1
     Host -- "spawn sidecar + heartbeat" --> D2
     UI -- "HTTP + WS (owner capability)" --> D1
-    P -- "port scan /hello → WS" --> D1
-    P -. "no matching daemon →<br/>Create Project" .-> Broker
-    CLI -- "HTTP + WS" --> D1
+    D1 -. "register (held WS)" .-> Hub
+    D2 -. "register (held WS)" .-> Hub
+    Broker -. "register as broker" .-> Hub
+    P -- "GET /daemons → WS /p/…" --> Hub
+    CLI -- "HTTP + WS /p/…" --> Hub
+    Hub -- "forward /p/… (HTTP + WS)" --> D1
+    Hub -- "forward /p/…" --> D2
+    Hub -. "no matching daemon →<br/>Create Project (/broker)" .-> Broker
     D1 --- FSA[("Project A files")]
     D2 --- FSB[("Project B files")]
 ```
 
-- **Daemon ports:** default `7978`, scan range `7978–7990`. **Broker ports:** `7968–7971`. Deliberately disjoint from Ro-Sync (7878–7890 / 7867–7870) and Argon (8000) so all three tools can coexist during migration.
-- **One daemon per project** (Ro-Sync model), tracked two ways: per-project **runtime records** with locks and boot IDs (authoritative, §13) and a **sessions file** for the Argon-style `wsync stop`/`--list` convenience surface.
+- **The hub:** one process, `wsync daemon hub` (a hidden subcommand, never run by hand — any wsync process, or the desktop broker, that finds no hub starts one), listening on `127.0.0.1:7960` (`WSYNC_HUB_PORT` overrides). The port is outside every range a daemon or broker used before, so a hub can start while daemons from an older build still hold `7978–7994`, and it stays disjoint from Ro-Sync (7878–7890 / 7867–7870) and Argon (8000). Binding the port is the only lock. The hub holds no project state and exits after 60 s with nothing registered.
+- **Daemon and broker ports:** whatever the OS hands out (port 0), unless a daemon is pinned by `--port` or the project file's `port`; a pinned port that is taken is a hard error — nothing scans. A daemon registers with the hub over a WebSocket it holds open (`/hub/attach`), and the hub confirms the claim against the daemon's own `/hello` first; the registration lasts exactly as long as the socket. A daemon that finds no hub starts one and registers again. The desktop broker registers the same way, as kind `broker`.
+- **Routes:** every daemon is reached at `http://127.0.0.1:7960/p/<route>/…`, the route being the first 16 hex digits of the SHA-256 of the canonical project path. It names a project, not a process, so a daemon that restarts on another port is at the same address. The hub forwards HTTP and WebSocket upgrades, and `/broker/…` to the broker. `GET /daemons` lists every registered daemon with its live `/hello`, plus the broker. The hub's own `GET /hello` answers `{hub: true, hubProtocol: 1, …}` with no numeric `protocol`, so no plugin takes it for a daemon.
+- **At the door:** the hub refuses a `Host` that is not its own loopback address (DNS rebinding) and any web-page `Origin` (the desktop's Tauri origins pass) before a request reaches a route; the daemon's own gates (§5.2) still apply behind it.
+- **Direct ports:** the CLI's `--project` goes through the route; `--port` talks to a daemon's own port directly — the escape hatch, and how a stock Argon plugin reaches a pinned daemon. The desktop app talks to the daemons it spawns on the port their ready line reports.
+- **One daemon per project** (Ro-Sync model), tracked three ways: per-project **runtime records** with locks and boot IDs (authoritative for lifecycle, §13), the hub's **registrations** (authoritative for reachability — a second daemon for a project is refused while the first still answers as itself, and a record whose daemon is not registered, such as one from a pre-hub build, is unreachable until it is restarted), and a **sessions file** for the Argon-style `wsync stop`/`--list` convenience surface.
 - **One Studio connection per daemon** — a single plugin owns the live bridge at a time; a second connect for the same place is rejected with a typed reason.
 - Everything binds **loopback only**.
 
 ### 3.3 Runtime wiring
 
 - Desktop spawns daemons as sidecars: `wsync daemon start --project <p> --managed-by desktop --owner-token-env WSYNC_OWNER_TOKEN --data-dir <appdata> --raw`, keeps handles for kill-on-exit, and sends `/manager-heartbeat` (5-minute timeout, 30-second "suspect" grace to survive laptop sleep — Ro-Sync's watchdog semantics).
-- Headless use: `wsync serve --project <p>` (foreground, for terminals/launchd/systemd) or `wsync daemon start` (background, idempotent — a matching running daemon is returned, never duplicated; a port serving a *different* canonical project is a hard error).
-- The plugin port-scans `7978–7990` `GET /hello` for a daemon whose project matches the open place's GameId; only if none matches does it offer **Create Project** through the Desktop broker (explicit click — discovery alone never writes to disk).
+- Headless use: `wsync serve --project <p>` (foreground, for terminals/launchd/systemd) or `wsync daemon start` (background, idempotent — a matching running daemon is returned, never duplicated; a pinned port that is taken or serving a *different* canonical project is a hard error). Both register with the hub (§3.2).
+- The plugin asks the hub (one `GET /daemons`) for a daemon whose project matches the open place's GameId and connects through its route; only if none matches does it offer **Create Project** through the Desktop broker, reached at `/broker` on the hub (explicit click — discovery alone never writes to disk).
 
 ---
 
@@ -200,7 +212,7 @@ Argon's `Project` schema, Rojo aliases included, plus WSync extensions (all opti
 {
   "name": "my-game",
   "tree": { "$className": "DataModel", "ReplicatedStorage": { "$path": "src/Shared" }, ... },
-  "host": "localhost", "port": 7978,
+  "host": "localhost", "port": 7978,   // optional pin; without it the daemon takes any free port (§3.2)
   "gameId": 123456, "placeIds": [789],
   "ignoreGlobs": ["**/*.spec.luau"],
   "syncRules": [ { "type": "ModuleScript", "pattern": "*.mod.luau" } ],
@@ -416,7 +428,7 @@ Host-level state (`state.json` on Desktop's data dir / secured widget state else
 
 ### 8.4 Project broker (Studio-triggered creation)
 
-Desktop runs a loopback broker (`7968–7971`) whenever a Projects folder is authorized. The plugin's **Create Project** click POSTs Roblox metadata (never a path) to `/projects/init`; the broker/daemon derives a slug and creates exactly one direct, non-symlink child of the authorized folder, emits a `project-init` event, and the app merges + auto-serves it (idempotent merge by request id). Plugin discovery prefers any matching project daemon over a broker; broker is the last resort.
+Desktop runs a loopback broker (on an OS-assigned port, registered with the hub as kind `broker` and reached at `/broker` on it, §3.2) whenever a Projects folder is authorized. The plugin's **Create Project** click POSTs Roblox metadata (never a path) to `/projects/init`; the broker/daemon derives a slug and creates exactly one direct, non-symlink child of the authorized folder, emits a `project-init` event, and the app merges + auto-serves it (idempotent merge by request id). Plugin discovery prefers any matching project daemon over a broker; broker is the last resort.
 
 ### 8.5 Updater
 
@@ -428,22 +440,22 @@ Tauri updater against GitHub releases `latest.json`, ed25519 public key **pinned
 
 ### 9.1 Architecture
 
-Fork of `argon-roblox`: `App/` (Fusion 0.3 UI), `Client/` (transport), `Core/` (connection lifecycle + sync loops), `Core/Processor` (read = Studio→wire, write = wire→Studio), `Core/Tree` (ref↔Instance registry), `Watcher`, `Lib/Dom` (reflection-database property I/O + tagged-value codec), `Lib/Differ` + Highlighter (script diffs), `Config` (3-scope settings). New: `Transport/WebSocket.luau` (`CreateWebStreamClient` wrapper with the HTTP-long-poll compat fallback), `Remote/` (op dispatch + codec + reflection + clipboard + capture + playtest modules — reimplemented to Ro-Sync's op contracts, §5.4), `Discovery.luau` (port scan + GameId match + broker flow).
+Fork of `argon-roblox`: `App/` (Fusion 0.3 UI), `Client/` (transport), `Core/` (connection lifecycle + sync loops), `Core/Processor` (read = Studio→wire, write = wire→Studio), `Core/Tree` (ref↔Instance registry), `Watcher`, `Lib/Dom` (reflection-database property I/O + tagged-value codec), `Lib/Differ` + Highlighter (script diffs), `Config` (3-scope settings). New: `Transport/WebSocket.luau` (`CreateWebStreamClient` wrapper with the HTTP-long-poll compat fallback), `Remote/` (op dispatch + codec + reflection + clipboard + capture + playtest modules — reimplemented to Ro-Sync's op contracts, §5.4), `Discovery.luau` (hub listing + GameId match + broker flow).
 
 ### 9.2 UI
 
 - Toolbar **"WSync"**, one button toggling the main dock widget; icon reflects state (idle / connected / prompt-pending / error).
-- Pages: **Not Connected** — a **portless, status-driven connection card** (no host:port inputs anywhere in the main flow; the `Host`/`Port` settings remain in the Settings widget as the manual override and are probed as the first discovery candidate): place name, status dot, status line, and ONE dynamic action button. States: "Auto-discover 127.0.0.1:7978–7990" → "Scanning localhost 7978–7990…" → "Found '<project>' on port N — connecting…"; no matching daemon + broker present → "New Studio project · ready to create" with **Create Project**, which leads to an explicit confirm step ("Create '<place>' in your WSync Projects folder?" Confirm/Back — the **two-step confirm**; only Confirm sends `/projects/init`) → "Creating project…" → "Project ready · waiting for the daemon…"; no broker → a message pointing at the desktop app's Projects-folder setting, with Retry. **Connecting** (spinner/cancel), **Connected** (project name, address, ↓/↑ last-synced ticker, disconnect, settings/project info), **Prompt** (Accept / Diff / Cancel, RichText change summary), **Error**, **Unavailable** (playtest).
+- Pages: **Not Connected** — a **portless, status-driven connection card** (no host:port inputs anywhere in the main flow; the `Host`/`Port` settings remain in the Settings widget as the manual override and are probed as the first discovery candidate): place name, status dot, status line, and ONE dynamic action button. States: "Auto-discover through the WSync hub (127.0.0.1:7960)" → "Asking the WSync hub for this place's daemon…" → "Found '<project>' — connecting…" (a daemon reached on its own port through the Settings override adds "on port N"); no matching daemon + broker present → "New Studio project · ready to create" with **Create Project**, which leads to an explicit confirm step ("Create '<place>' in your WSync Projects folder?" Confirm/Back — the **two-step confirm**; only Confirm sends `/projects/init`) → "Creating project…" → "Project ready · waiting for the daemon…"; no broker → a message pointing at the desktop app's Projects-folder setting, with Retry. **Connecting** (spinner/cancel), **Connected** (project name, address, ↓/↑ last-synced ticker, disconnect, settings/project info), **Prompt** (Accept / Diff / Cancel, RichText change summary), **Error**, **Unavailable** (playtest).
 - Widgets: **Settings**, **Help**, **Project info**, **Diff** (additions/updates/removals browser), **Script Diff** (line-numbered, syntax-highlighted unified diff, `DiffLinesLimit` cap).
 - Feedback: icon color, synced ticker, Output logs via leveled logger, ChangeHistory waypoints for every applied op — no toast system (Argon's model; the desktop app is the rich surface).
 
 ### 9.3 Settings (3 scopes: Global < Game < Place, with per-scope restore)
 
-Argon's 17 settings kept with identical names/defaults — `InitialSyncPriority` (Server), `Host` (localhost), `Port` (**7978**), `AutoConnect` (true), `AutoReconnect` (false), `LiveHydrate` (true), `KeepUnknowns` (false), `TwoWaySync` (**true** — WSync flips Argon's default; two-way is the product's point, and the conflict engine makes it safe), `SyncbackProperties` (false), `OnlyCodeMode` (**false** — full-DataModel sync is the default; turn on for code-only workflows), `OpenInEditor` (false), `Https` (false), `DiffLinesLimit` (3000), `DisplayPrompts` (Always), `ChangesThreshold` (5), `LogLevel` (Warn), `OverridePackages` (true) — plus WSync additions: `AutoDiscover` (true: port-scan for a matching daemon before using Host/Port), `PreferAppModal` (true: route connect-time divergence to the desktop app when one is attached).
+Argon's 17 settings kept with identical names/defaults — `InitialSyncPriority` (Server), `Host` (localhost), `Port` (**7960** — the WSync hub), `AutoConnect` (true), `AutoReconnect` (false), `LiveHydrate` (true), `KeepUnknowns` (false), `TwoWaySync` (**true** — WSync flips Argon's default; two-way is the product's point, and the conflict engine makes it safe), `SyncbackProperties` (false), `OnlyCodeMode` (**false** — full-DataModel sync is the default; turn on for code-only workflows), `OpenInEditor` (false), `Https` (false), `DiffLinesLimit` (3000), `DisplayPrompts` (Always), `ChangesThreshold` (5), `LogLevel` (Warn), `OverridePackages` (true) — plus WSync additions: `AutoDiscover` (true: also ask the WSync hub on 127.0.0.1:7960 for this place's daemon, after the Settings `Host:Port`; false = Host/Port only), `PreferAppModal` (true: route connect-time divergence to the desktop app when one is attached).
 
 ### 9.4 Connection lifecycle
 
-`AutoConnect` → discovery scan (candidates: Settings `Host:Port` first, then `127.0.0.1:7978–7990`, dedup; `AutoDiscover=false` restricts to the Settings candidate) → **strict GameId matching**: a published place (`GameId ≠ 0`) matches only daemons claiming that exact `gameId` — a claimless daemon never adopts a published place; an unpublished place takes the first claimless daemon; `placeIds` refine among matches. No match ⇒ the create flow (§9.2), never a connection to the wrong project. Then → WS hello (protocol/capability negotiation; incompatible → typed non-retryable shutdown → Error page, no retry loop) → root `/snapshot` hydrate → divergence check (§7) → live loops. Reconnect: exponential backoff with visible countdown; `retryable:false` shutdowns and `recoveryRequired` receipts **halt** the retry loop by design. Version skew: plugin and daemon exchange semver + protocol; incompatible majors refuse with a clear message (both parents enforce this).
+`AutoConnect` → discovery (asks the Settings `Host:Port` first — by default the hub itself — then the hub on `127.0.0.1:7960`, dedup; a hub answers one `GET /daemons` listing every registered daemon with its live `/hello`, a daemon at the Settings address is a candidate of its own; `AutoDiscover=false` restricts to the Settings address) → **strict GameId matching**: a published place (`GameId ≠ 0`) matches only daemons claiming that exact `gameId` — a claimless daemon never adopts a published place; an unpublished place takes the first claimless daemon; `placeIds` refine among matches. No match ⇒ the create flow (§9.2), never a connection to the wrong project. Then → WS hello through the daemon's hub route `/p/<route>` (protocol/capability negotiation; incompatible → typed non-retryable shutdown → Error page, no retry loop) → root `/snapshot` hydrate → divergence check (§7) → live loops. Reconnect: exponential backoff with visible countdown; `retryable:false` shutdowns and `recoveryRequired` receipts **halt** the retry loop by design. A stopping daemon's shutdown is retryable, and a window whose daemon comes back as a new boot at the same route reconnects and resyncs on its own, whatever `AutoReconnect` says. Version skew: plugin and daemon exchange semver + protocol; incompatible majors refuse with a clear message (both parents enforce this).
 
 ---
 
@@ -468,7 +480,7 @@ Semantics upgraded by the engine (contract-compatible, scope wider): `diff`/`cha
 | Command | Origin | WSync behavior |
 |---|---|---|
 | `init` | both | Merged: Argon templates (`-T place|quick|model|package|plugin|empty`, `--git/--wally/--selene/--docs/--license/--ts`) **+** Ro-Sync config/agent-docs writing (`--name/--game-id/--group-id/--place-id/--raw`). Never starts a daemon. |
-| `serve` | both | Ro-Sync's foreground daemon, plus Argon's `--sourcemap`, `--ts`, session registration, and port auto-scan (`scan_ports`). |
+| `serve` | both | Ro-Sync's foreground daemon, plus Argon's `--sourcemap`, `--ts` and session registration; binds a free port unless `--port`/the project's `port` pins one, and registers with the hub (§3.2). |
 | `build` | Argon | As Argon: `-o`, `-w/--watch`, `-s/--sourcemap`, `-p/--plugin` (to Studio plugins dir), `-x/--xml`, `--ts`; place→`.rbxl(x)`, model→`.rbxm(x)`; serialized from the live tree. |
 | `sourcemap` | Argon | As Argon: `-o`, `--watch`, `--non-scripts`; Rojo-style pruning. |
 | `exec` | Argon | Broadcast Luau to connected clients (`--focus` raises Studio). Distinct from `eval` (Ro-Sync), which is request/response with a returned value. |
@@ -484,7 +496,7 @@ Total surface: 62 + 9 new top-level (`build`, `sourcemap`, `exec`, `studio`, `de
 
 ### 10.4 Configuration
 
-Global `~/.wsync/config.toml`, workspace `wsync.toml` beside the project (workspace > global > defaults; unset keys inherit). Argon's option set is adopted with these dispositions — kept as-is: `host`, `port` (**7978**), `template`, `license`, `include_docs`, `use_git`, `use_wally`, `use_selene`, `run_async`, `scan_ports`, `detect_project`, `smart_paths`, `with_sourcemap`, `build_xml`, `check_updates`, `auto_update`, `install_plugin`, `update_templates`, `rojo_mode`, `ts_mode`, `rename_instances`, `keep_duplicates`, `move_to_bin`, `changes_threshold`, `max_unsynced_changes`, `lua_extension`, `ignore_line_endings`, `package_manager`. Changed: `share_stats` default **false** (telemetry strictly opt-in). Added: `syncback_model_json` (false, §4.2), `conflict_engine` (true), `compat_argon` (false — report the Argon-compatible version string on msgpack `/details` so a stock Argon plugin passes its version gate; the long-poll surface itself is always served as the WS fallback, §5.1), `port_scan_max` (7990), `auto_open_app_modal` (true). `wsync config --list` renders names, values, defaults, and doc strings (config-derive pattern).
+Global `~/.wsync/config.toml`, workspace `wsync.toml` beside the project (workspace > global > defaults; unset keys inherit). Argon's option set is adopted with these dispositions — kept as-is: `host`, `template`, `license`, `include_docs`, `use_git`, `use_wally`, `use_selene`, `run_async`, `detect_project`, `smart_paths`, `with_sourcemap`, `build_xml`, `check_updates`, `auto_update`, `install_plugin`, `update_templates`, `rojo_mode`, `ts_mode`, `rename_instances`, `keep_duplicates`, `move_to_bin`, `changes_threshold`, `max_unsynced_changes`, `lua_extension`, `ignore_line_endings`, `package_manager`. Changed: `share_stats` default **false** (telemetry strictly opt-in). Added: `syncback_model_json` (false, §4.2), `conflict_engine` (true), `compat_argon` (false — report the Argon-compatible version string on msgpack `/details` so a stock Argon plugin passes its version gate; the long-poll surface itself is always served as the WS fallback, §5.1), `auto_open_app_modal` (true). Removed with the hub (§3.2, 2026-09-22): `port`, `scan_ports`, `port_scan_max` — a daemon's port is the OS's unless pinned per project; unknown keys in a config file are ignored, so older files still load. `wsync config --list` renders names, values, defaults, and doc strings (config-derive pattern).
 
 ### 10.5 Command registry & generated docs (single source of truth — the Ro-Sync model)
 
@@ -554,6 +566,7 @@ Adopted from Ro-Sync wholesale:
   state.json                        # app project registry (§8.3)
   secrets.json                      # 0600 credential store (keychain fallback)
   daemons/<sha256(project)>.json    # runtime records (+ .start.lock, .log)
+  hub.log                           # the hub's log (§3.2)
   writes.log                        # mutation audit log (10 MiB rotation)
 
 <project>/

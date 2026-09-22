@@ -6,8 +6,12 @@ talking to a `wsync` daemon over WebSocket (protocol `wsync/1`), with an HTTP
 long-poll fallback for Studio builds without `CreateWebStreamClient`.
 
 Part of the [WSync](../Design.md) project. The plugin discovers a matching
-daemon automatically (localhost port scan `7978–7990`, GameId match), or
-connects to an explicit host and port.
+daemon automatically (one `GET /daemons` to the WSync hub on `127.0.0.1:7960`,
+GameId match) and connects to it through the hub at its route `/p/<route>`, or
+connects to an explicit host and port. The Settings `Host:Port` (default
+`localhost:7960`, the hub itself) is asked first; `AutoDiscover` also asks the
+hub. A daemon that restarts keeps its route, and the plugin reconnects to it on
+its own.
 
 ## Attribution
 
