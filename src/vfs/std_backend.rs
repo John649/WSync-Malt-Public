@@ -46,6 +46,13 @@ impl VfsBackend for StdBackend {
 			paths.push(entry?.path());
 		}
 
+		// The OS hands entries back in whatever order its filesystem keeps
+		// them — sorted on APFS, hash order on ext4 — and that order becomes
+		// the children's order in every snapshot and build. Sorted, the same
+		// tree builds the same bytes on every platform (the plugin artifact's
+		// CI check compares exactly that)
+		paths.sort();
+
 		Ok(paths)
 	}
 

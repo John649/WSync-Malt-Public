@@ -2444,67 +2444,6 @@ fn replay_incomplete(replayed: &Value, name: &str, allow_missing_blobs: bool) ->
 	))
 }
 
-#[cfg(test)]
-mod replay_tests {
-	use super::*;
-
-	/// A replay that ran to the end with every blob in hand may be committed
-	#[test]
-	fn a_complete_replay_is_committed() {
-		let answer = json!({ "applied": 3, "skipped": 0, "conflicts": [], "missingBlobs": [] });
-
-		assert_eq!(replay_incomplete(&answer, "alpha", false), None);
-	}
-
-	/// `stopped` is the plugin's pcall catching an error mid-stream: the
-	/// answer is otherwise a success envelope, and used to be committed
-	#[test]
-	fn a_replay_that_stopped_early_is_not_committed() {
-		let answer = json!({ "applied": 3, "stopped": "attempt to index nil", "missingBlobs": [] });
-		let why = replay_incomplete(&answer, "alpha", false).expect("refused");
-
-		assert!(why.contains("stopped early after 3 event(s)"), "{why}");
-		assert!(why.contains("attempt to index nil"), "{why}");
-		assert!(why.contains("wsync branch finish alpha"), "{why}");
-	}
-
-	/// A skipped subtree is a merge that lost instances, unless the caller
-	/// says those were carried over another way
-	#[test]
-	fn a_replay_that_dropped_a_subtree_is_not_committed_unless_allowed() {
-		let answer = json!({ "applied": 3, "missingBlobs": ["aa", "bb"] });
-
-		let why = replay_incomplete(&answer, "alpha", false).expect("refused");
-
-		assert!(why.contains("2 added subtree(s)"), "{why}");
-		assert!(why.contains("aa, bb"), "{why}");
-		assert!(why.contains("--allow-missing-blobs"), "{why}");
-
-		assert_eq!(replay_incomplete(&answer, "alpha", true), None);
-	}
-
-	/// Decisions are keyed by the event's number within the chunk that
-	/// carries it, and left out of every other chunk
-	#[test]
-	fn decisions_are_rekeyed_per_chunk() {
-		let decisions = vec![
-			json!({ "n": 1, "side": "ours" }),
-			json!({ "n": 250, "side": "theirs" }),
-			json!({ "n": 251, "side": "ours" }),
-			json!({ "n": 600, "side": "theirs" }),
-		];
-
-		let first = decisions_map(&decisions, 0, 250);
-		assert_eq!(first, json!({ "1": "ours", "250": "theirs" }));
-
-		let second = decisions_map(&decisions, 250, 250);
-		assert_eq!(second, json!({ "1": "ours" }));
-
-		let third = decisions_map(&decisions, 500, 250);
-		assert_eq!(third, json!({ "100": "theirs" }));
-	}
-}
-
 fn conflicts_of(replayed: &Value) -> Vec<Value> {
 	replayed
 		.get("conflicts")
@@ -3412,5 +3351,66 @@ mod tests {
 		assert!(output.status.success());
 		let group: u32 = String::from_utf8(output.stdout).unwrap().trim().parse().unwrap();
 		assert_eq!(group, pid);
+	}
+}
+
+#[cfg(test)]
+mod replay_tests {
+	use super::*;
+
+	/// A replay that ran to the end with every blob in hand may be committed
+	#[test]
+	fn a_complete_replay_is_committed() {
+		let answer = json!({ "applied": 3, "skipped": 0, "conflicts": [], "missingBlobs": [] });
+
+		assert_eq!(replay_incomplete(&answer, "alpha", false), None);
+	}
+
+	/// `stopped` is the plugin's pcall catching an error mid-stream: the
+	/// answer is otherwise a success envelope, and used to be committed
+	#[test]
+	fn a_replay_that_stopped_early_is_not_committed() {
+		let answer = json!({ "applied": 3, "stopped": "attempt to index nil", "missingBlobs": [] });
+		let why = replay_incomplete(&answer, "alpha", false).expect("refused");
+
+		assert!(why.contains("stopped early after 3 event(s)"), "{why}");
+		assert!(why.contains("attempt to index nil"), "{why}");
+		assert!(why.contains("wsync branch finish alpha"), "{why}");
+	}
+
+	/// A skipped subtree is a merge that lost instances, unless the caller
+	/// says those were carried over another way
+	#[test]
+	fn a_replay_that_dropped_a_subtree_is_not_committed_unless_allowed() {
+		let answer = json!({ "applied": 3, "missingBlobs": ["aa", "bb"] });
+
+		let why = replay_incomplete(&answer, "alpha", false).expect("refused");
+
+		assert!(why.contains("2 added subtree(s)"), "{why}");
+		assert!(why.contains("aa, bb"), "{why}");
+		assert!(why.contains("--allow-missing-blobs"), "{why}");
+
+		assert_eq!(replay_incomplete(&answer, "alpha", true), None);
+	}
+
+	/// Decisions are keyed by the event's number within the chunk that
+	/// carries it, and left out of every other chunk
+	#[test]
+	fn decisions_are_rekeyed_per_chunk() {
+		let decisions = vec![
+			json!({ "n": 1, "side": "ours" }),
+			json!({ "n": 250, "side": "theirs" }),
+			json!({ "n": 251, "side": "ours" }),
+			json!({ "n": 600, "side": "theirs" }),
+		];
+
+		let first = decisions_map(&decisions, 0, 250);
+		assert_eq!(first, json!({ "1": "ours", "250": "theirs" }));
+
+		let second = decisions_map(&decisions, 250, 250);
+		assert_eq!(second, json!({ "1": "ours" }));
+
+		let third = decisions_map(&decisions, 500, 250);
+		assert_eq!(third, json!({ "100": "theirs" }));
 	}
 }
