@@ -42,6 +42,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- `wsync upload` tags `.rbxm` and `.rbxmx` files as `model/x-rbxm`. They went
+  up as `application/octet-stream` and `application/xml`, which Open Cloud
+  refuses for animations (HTTP 400, "Creating Animation from a
+  application/octet-stream file is not supported yet"), so
+  `--asset-type animation` could never succeed.
 - `wsync open --project <p> --port <n>` without Studio paths is refused
   instead of launching Studio on the project's place. The test suite never
   launches Studio (`WSYNC_NO_STUDIO_LAUNCH`) or touches the real hub

@@ -145,9 +145,12 @@ fn infer(extension: &str) -> Option<(AssetType, &'static str)> {
 		"flac" => (AssetType::Audio, "audio/flac"),
 		"fbx" => (AssetType::Model, "model/fbx"),
 		// `.rbxm` is the documented ambiguity: it uploads as Model unless
-		// --asset-type animation overrides
-		"rbxm" => (AssetType::Model, "application/octet-stream"),
-		"rbxmx" => (AssetType::Model, "application/xml"),
+		// --asset-type animation overrides. Both serialisations are tagged
+		// `model/x-rbxm`: Open Cloud refuses an Animation part tagged with
+		// anything else (HTTP 400, "Creating Animation from a
+		// application/octet-stream file is not supported yet")
+		"rbxm" => (AssetType::Model, "model/x-rbxm"),
+		"rbxmx" => (AssetType::Model, "model/x-rbxm"),
 		"obj" => (AssetType::Mesh, "model/obj"),
 		"mp4" => (AssetType::Video, "video/mp4"),
 		"mov" => (AssetType::Video, "video/quicktime"),
@@ -652,7 +655,8 @@ mod tests {
 		assert!(matches!(infer("png"), Some((AssetType::Image, "image/png"))));
 		assert!(matches!(infer("JPG"), Some((AssetType::Image, "image/jpeg"))));
 		assert!(matches!(infer("mp3"), Some((AssetType::Audio, _))));
-		assert!(matches!(infer("rbxm"), Some((AssetType::Model, _))));
+		assert!(matches!(infer("rbxm"), Some((AssetType::Model, "model/x-rbxm"))));
+		assert!(matches!(infer("RBXMX"), Some((AssetType::Model, "model/x-rbxm"))));
 		assert!(matches!(infer("fbx"), Some((AssetType::Model, "model/fbx"))));
 		assert!(matches!(infer("obj"), Some((AssetType::Mesh, _))));
 		assert!(matches!(infer("mp4"), Some((AssetType::Video, _))));
