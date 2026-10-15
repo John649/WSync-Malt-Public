@@ -3,15 +3,16 @@
   "title": "wsync upload",
   "category": "Open Cloud",
   "description": "Uploads Roblox assets through Open Cloud from files or directories.",
-  "usage": "wsync upload <files-or-directories>... [--project <path>] [--creator user:<id>|group:<id>] [--name <name>] [--asset-type animation|audio|image|decal|mesh|model|video] [--manifest <file>] [--auth bearer] [--api-key-env <name>] [--no-wait] [--raw]",
+  "usage": "wsync upload <files-or-directories>... [--project <path>] [--profile <name>] [--creator user:<id>|group:<id>] [--name <name>] [--asset-type animation|audio|image|decal|mesh|model|video] [--manifest <file>] [--auth bearer] [--api-key-env <name>] [--no-wait] [--raw]",
   "examples": [
     "wsync upload ./icon.png --creator user:123456",
+    "wsync upload ./sound.ogg --project . --profile studio-group --asset-type audio",
     "wsync upload ./sound.mp3 ./models --project . --manifest uploaded-assets.json",
     "wsync upload ./clip.rbxm --project . --asset-type animation"
   ],
   "notes": [
-    "Credentials resolve from the `wsync auth` store first, then the environment variable named by `--api-key-env`, then `ROBLOX_API_KEY`, `CLOUD_API_KEY`, and `ROBLOX_OPEN_CLOUD_API_KEY`.",
-    "Without `--creator`, the project's `groupId` is used as the default creator context.",
+    "Credentials resolve from the selected profile's key (`--profile` or `WSYNC_PROFILE`) first, then the `wsync auth` store, then the environment variable named by `--api-key-env`, then `ROBLOX_API_KEY`, `CLOUD_API_KEY`, and `ROBLOX_OPEN_CLOUD_API_KEY`.",
+    "The creator is `--creator`, else the selected profile's creator, else the project's `groupId`. A profile named but not stored is refused before any upload.",
     "Directories recurse by default, skip unsupported files, and continue after per-file failures.",
     "Use `--auth bearer` for OAuth tokens instead of API keys. `--no-wait` returns operation handles instead of polling each asset to completion."
   ]

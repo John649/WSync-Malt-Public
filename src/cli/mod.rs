@@ -91,8 +91,10 @@ pub struct Cli {
 	#[arg(long, global = true, value_name = "NAME", requires = "place")]
 	branch: Option<String>,
 
+	/// Debug builds: serve puffin flamegraphs (`--profile` names an auth
+	/// profile on the cloud commands)
 	#[arg(long, hide = true, global = true)]
-	profile: bool,
+	profiler: bool,
 
 	/// Output coloring: auto, always, never
 	#[arg(
@@ -124,7 +126,7 @@ impl Cli {
 	}
 
 	pub fn profile(&self) -> bool {
-		self.profile
+		self.profiler
 	}
 
 	pub fn yes(&self) -> bool {

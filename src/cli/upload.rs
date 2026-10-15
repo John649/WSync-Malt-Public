@@ -43,10 +43,15 @@ pub struct Upload {
 	#[arg(long, value_name = "PATH")]
 	project: Option<PathBuf>,
 
-	/// Creator context, `user:<id>` or `group:<id>` (default: the project's
-	/// groupId)
+	/// Creator context, `user:<id>` or `group:<id>` (default: the profile's
+	/// creator, then the project's groupId)
 	#[arg(long, value_name = "USER-OR-GROUP")]
 	creator: Option<String>,
+
+	/// Stored auth profile to upload as — its key and default creator
+	/// (default: `WSYNC_PROFILE`)
+	#[arg(long, value_name = "NAME")]
+	profile: Option<String>,
 
 	/// Display name for the uploaded asset(s) (default: the file stem)
 	#[arg(long, value_name = "NAME")]
@@ -139,13 +144,13 @@ fn infer(extension: &str) -> Option<(AssetType, &'static str)> {
 }
 
 /// `user:<id>` / `group:<id>`, already validated
-enum Creator {
+pub(crate) enum Creator {
 	User(u64),
 	Group(u64),
 }
 
 impl Creator {
-	fn parse(text: &str) -> Result<Self> {
+	pub(crate) fn parse(text: &str) -> Result<Self> {
 		let (kind, id) = text
 			.split_once(':')
 			.with_context(|| format!("--creator must be user:<id> or group:<id>, not `{text}`"))?;
@@ -170,7 +175,7 @@ impl Creator {
 		}
 	}
 
-	fn describe(&self) -> String {
+	pub(crate) fn describe(&self) -> String {
 		match self {
 			Creator::User(id) => format!("user:{id}"),
 			Creator::Group(id) => format!("group:{id}"),
@@ -196,12 +201,17 @@ impl Upload {
 		};
 		let workspace = project_path.get_parent().to_owned();
 
-		let creator = match &self.creator {
+		let profile = cloud::select_profile(self.profile.as_deref())?;
+		let profile_creator = profile
+			.as_ref()
+			.and_then(|selected| selected.profile.creator.as_deref());
+
+		let creator = match self.creator.as_deref().or(profile_creator) {
 			Some(creator) => Creator::parse(creator)?,
 			None => match project.as_ref().and_then(|project| project.group_id) {
 				Some(group_id) => Creator::Group(group_id),
 				None => bail!(
-					"No creator context: pass {} or set `groupId` in the project file",
+					"No creator context: pass {}, use a profile with a creator, or set `groupId` in the project file",
 					"--creator user:<id>|group:<id>".bold()
 				),
 			},
@@ -229,7 +239,7 @@ impl Upload {
 			bail!("Nothing to upload — no supported asset files in the given paths");
 		}
 
-		let credential = cloud::resolve_credential(self.api_key_env.as_deref(), Some(&workspace))?;
+		let credential = cloud::resolve_credential(self.api_key_env.as_deref(), Some(&workspace), profile.as_ref())?;
 		let client = CloudClient::new(credential, self.auth == AuthMode::Bearer)?;
 
 		for plan in &planned {
@@ -251,6 +261,7 @@ impl Upload {
 			let body = json!({
 				"ok": failed == 0,
 				"creator": creator.describe(),
+				"profile": profile.as_ref().map(|selected| selected.name.as_str()),
 				"uploaded": uploaded,
 				"pending": pending,
 				"failed": failed,
@@ -272,12 +283,15 @@ impl Upload {
 
 		if !self.raw {
 			wsync_info!(
-				"{} uploaded, {} pending, {} failed, {} skipped (creator {})",
+				"{} uploaded, {} pending, {} failed, {} skipped (creator {}{})",
 				uploaded.to_string().bold(),
 				pending,
 				failed,
 				skipped,
-				creator.describe()
+				creator.describe(),
+				profile
+					.as_ref()
+					.map_or_else(String::new, |selected| format!(", profile {}", selected.name))
 			);
 		}
 

@@ -91,12 +91,12 @@ wsync plugin install ./scratch-plugins/WSync.rbxm
 
 ### `wsync auth`
 
-Stores, inspects, or clears the CLI Roblox Open Cloud credential without accepting or printing the secret as a command-line value.
+Stores, inspects, or clears the CLI Roblox Open Cloud credential and named per-account profiles without accepting or printing a secret as a command-line value.
 
 **Usage**
 
 ```sh
-wsync auth <set|status|clear> [--from-stdin] [--file <path>] [--from-env <name>] [--data-dir <path>] [--raw]
+wsync auth <set|status|clear> [--from-stdin] [--file <path>] [--from-env <name>] [--profile <name>] [--creator user:<id>|group:<id>] [--data-dir <path>] [--raw]
 ```
 
 **Subcommands**
@@ -110,8 +110,11 @@ wsync auth <set|status|clear> [--from-stdin] [--file <path>] [--from-env <name>]
 ```sh
 printf '%s' "$ROBLOX_API_KEY" | wsync auth set --from-stdin --raw
 wsync auth set --from-env ROBLOX_API_KEY --raw
+printf '%s' "$OWNER_KEY" | wsync auth set --from-stdin --profile owner --creator user:123456 --raw
+wsync auth set --profile studio-group --creator group:654321 --raw
 wsync auth status --raw
 wsync auth clear --raw
+wsync auth clear --profile owner --raw
 ```
 
 **Notes**
@@ -119,6 +122,7 @@ wsync auth clear --raw
 - `auth set` requires exactly one of `--from-stdin`, `--file`, or `--from-env`; the credential itself is never accepted in argv and is never logged.
 - Secrets resolve to the OS keychain first. The CLI fallback store uses a private per-user data directory with mode 0600 on Unix; it is filesystem-permission protected, not an OS keychain.
 - `upload` and `monetization` discover this store before falling back to `--api-key-env` and then to the `ROBLOX_API_KEY`, `CLOUD_API_KEY`, and `ROBLOX_OPEN_CLOUD_API_KEY` environment variables.
+- `--profile <name>` stores a named profile (one per Roblox account or group) holding its own key, a default `--creator`, or both; `--creator` alone makes a profile that switches only the creator and borrows the normal credential chain. `status` lists every profile with masked key tails. `upload` and `monetization` select one with `--profile` or `WSYNC_PROFILE`.
 
 ---
 
@@ -1221,21 +1225,22 @@ Uploads Roblox assets through Open Cloud from files or directories.
 **Usage**
 
 ```sh
-wsync upload <files-or-directories>... [--project <path>] [--creator user:<id>|group:<id>] [--name <name>] [--asset-type animation|audio|image|decal|mesh|model|video] [--manifest <file>] [--auth bearer] [--api-key-env <name>] [--no-wait] [--raw]
+wsync upload <files-or-directories>... [--project <path>] [--profile <name>] [--creator user:<id>|group:<id>] [--name <name>] [--asset-type animation|audio|image|decal|mesh|model|video] [--manifest <file>] [--auth bearer] [--api-key-env <name>] [--no-wait] [--raw]
 ```
 
 **Examples**
 
 ```sh
 wsync upload ./icon.png --creator user:123456
+wsync upload ./sound.ogg --project . --profile studio-group --asset-type audio
 wsync upload ./sound.mp3 ./models --project . --manifest uploaded-assets.json
 wsync upload ./clip.rbxm --project . --asset-type animation
 ```
 
 **Notes**
 
-- Credentials resolve from the `wsync auth` store first, then the environment variable named by `--api-key-env`, then `ROBLOX_API_KEY`, `CLOUD_API_KEY`, and `ROBLOX_OPEN_CLOUD_API_KEY`.
-- Without `--creator`, the project's `groupId` is used as the default creator context.
+- Credentials resolve from the selected profile's key (`--profile` or `WSYNC_PROFILE`) first, then the `wsync auth` store, then the environment variable named by `--api-key-env`, then `ROBLOX_API_KEY`, `CLOUD_API_KEY`, and `ROBLOX_OPEN_CLOUD_API_KEY`.
+- The creator is `--creator`, else the selected profile's creator, else the project's `groupId`. A profile named but not stored is refused before any upload.
 - Directories recurse by default, skip unsupported files, and continue after per-file failures.
 - Use `--auth bearer` for OAuth tokens instead of API keys. `--no-wait` returns operation handles instead of polling each asset to completion.
 
@@ -1249,11 +1254,11 @@ Discovers, lists, creates, edits, and uploads images for Roblox game passes and 
 
 ```sh
 wsync monetization gamepass discover [--project <path>]
-wsync monetization gamepass list [--project <path>] [--universe-id <id>] [--api-key-env <name>] [--raw]
-wsync monetization gamepass create [--project <path>] [--universe-id <id>] [--api-key-env <name>] [--description <text>] [--image <file>] [--not-for-sale] (<entry>... | --name <name> --price <robux>)
-wsync monetization gamepass edit [--project <path>] [--universe-id <id>] [--api-key-env <name>] (--id <id> | --name <existing-name>) [--new-name <name>] [--price <robux>] [--description <text>] [--for-sale true|false]
-wsync monetization gamepass image [--project <path>] [--universe-id <id>] [--api-key-env <name>] (--id <id> | --name <existing-name>) <file>
-wsync monetization gamepass images [--project <path>] [--universe-id <id>] [--api-key-env <name>] <dir>
+wsync monetization gamepass list [--project <path>] [--universe-id <id>] [--api-key-env <name>] [--profile <name>] [--raw]
+wsync monetization gamepass create [--project <path>] [--universe-id <id>] [--api-key-env <name>] [--profile <name>] [--description <text>] [--image <file>] [--not-for-sale] (<entry>... | --name <name> --price <robux>)
+wsync monetization gamepass edit [--project <path>] [--universe-id <id>] [--api-key-env <name>] [--profile <name>] (--id <id> | --name <existing-name>) [--new-name <name>] [--price <robux>] [--description <text>] [--for-sale true|false]
+wsync monetization gamepass image [--project <path>] [--universe-id <id>] [--api-key-env <name>] [--profile <name>] (--id <id> | --name <existing-name>) <file>
+wsync monetization gamepass images [--project <path>] [--universe-id <id>] [--api-key-env <name>] [--profile <name>] <dir>
 # Replace gamepass with product, dp, devproduct, gp, pass, or gamepasses as needed.
 ```
 
@@ -1285,7 +1290,7 @@ wsync monetization product images ./icons --project .
 **Notes**
 
 - Uses multipart/form-data and Roblox Open Cloud API keys.
-- Credential discovery checks the `wsync auth` store, then `ROBLOX_API_KEY`, `CLOUD_API_KEY`, `ROBLOX_OPEN_CLOUD_API_KEY`, and project env files.
+- Credential discovery checks the selected profile's key (`--profile` or `WSYNC_PROFILE`), then the `wsync auth` store, then `ROBLOX_API_KEY`, `CLOUD_API_KEY`, `ROBLOX_OPEN_CLOUD_API_KEY`, and project env files.
 - Universe discovery checks `--universe-id`, `ROBLOX_UNIVERSE_ID`, `UNIVERSE_ID`, `GAMEID`, `GAME_ID`, project env files, and then the `gameId` field in `default.project.json`.
 - `discover` reports likely monetization config files but does not guess project-specific code writes when the schema is ambiguous.
 - `images` matches files to assets by normalized filename, such as coins-small.png to Coins Small.

@@ -5,8 +5,9 @@
 //! `https://apis.roblox.com` (or `WSYNC_CLOUD_BASE_URL`, which is how the
 //! integration tests point the whole family at a local stub).
 //!
-//! The credential chain is fixed by upload.json/monetization.json: the
-//! `wsync auth` store first, then the environment variable named by
+//! The credential chain is fixed by upload.json/monetization.json: a
+//! selected profile's key (`--profile`/`WSYNC_PROFILE`) first, then the
+//! `wsync auth` store, then the environment variable named by
 //! `--api-key-env`, then `ROBLOX_API_KEY`, `CLOUD_API_KEY`, and
 //! `ROBLOX_OPEN_CLOUD_API_KEY`, and finally (where a workspace is known)
 //! the project env files `.env`, `.env.local`, and `info.env`. The
@@ -59,10 +60,38 @@ pub struct Credential {
 	pub source: String,
 }
 
+/// A profile picked by `--profile` or `WSYNC_PROFILE`
+pub struct SelectedProfile {
+	pub name: String,
+	pub profile: auth::Profile,
+}
+
+/// The profile `--profile` names, else the one `WSYNC_PROFILE` names. Naming
+/// a profile that is not stored is an error, never a silent fall-through to
+/// another account's key
+pub fn select_profile(flag: Option<&str>) -> Result<Option<SelectedProfile>> {
+	let name = match flag {
+		Some(name) => name.trim().to_owned(),
+		None => match non_empty_env(auth::PROFILE_ENV) {
+			Some(name) => name,
+			None => return Ok(None),
+		},
+	};
+
+	match auth::stored_profile(&name)? {
+		Some(profile) => Ok(Some(SelectedProfile { name, profile })),
+		None => bail!("No profile named `{name}` — store one with `wsync auth set --profile {name}`"),
+	}
+}
+
 /// Walks the documented credential chain. `workspace` enables the trailing
 /// project-env-file tier (monetization.json); `upload` passes `None` there
-pub fn resolve_credential(api_key_env: Option<&str>, workspace: Option<&Path>) -> Result<Credential> {
-	if let Some(found) = find_credential(api_key_env, workspace)? {
+pub fn resolve_credential(
+	api_key_env: Option<&str>,
+	workspace: Option<&Path>,
+	profile: Option<&SelectedProfile>,
+) -> Result<Credential> {
+	if let Some(found) = find_credential(api_key_env, workspace, profile)? {
 		return Ok(found);
 	}
 
@@ -77,7 +106,22 @@ pub fn resolve_credential(api_key_env: Option<&str>, workspace: Option<&Path>) -
 
 /// [`resolve_credential`] without the failure — `discover` reports presence
 /// instead of requiring it
-pub fn find_credential(api_key_env: Option<&str>, workspace: Option<&Path>) -> Result<Option<Credential>> {
+pub fn find_credential(
+	api_key_env: Option<&str>,
+	workspace: Option<&Path>,
+	profile: Option<&SelectedProfile>,
+) -> Result<Option<Credential>> {
+	// A profile's own key overrides the whole chain; a creator-only profile
+	// falls through to it
+	if let Some(selected) = profile {
+		if let Some(value) = &selected.profile.api_key {
+			return Ok(Some(Credential {
+				value: value.clone(),
+				source: format!("auth profile {}", selected.name),
+			}));
+		}
+	}
+
 	if let Some(value) = auth::stored_credential()? {
 		return Ok(Some(Credential {
 			value,

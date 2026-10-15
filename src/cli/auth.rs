@@ -11,6 +11,13 @@
 //! which auth.json is explicit is a fallback tier below an OS keychain. The
 //! file is written atomically (0600 temp + rename), so a torn write can
 //! never leave a world-readable or half-written secret behind.
+//!
+//! Named **profiles** (`--profile <name>`) sit beside the default credential
+//! under the store's `profiles` object, one per Roblox account or group:
+//! each holds its own Open Cloud key, a default upload creator
+//! (`user:<id>`/`group:<id>`), or both. `upload` and `monetization` pick one
+//! with `--profile` or `WSYNC_PROFILE`; a profile without a key borrows the
+//! normal credential chain and only switches the creator.
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -30,6 +37,16 @@ const CREDENTIAL_KEY: &str = "robloxCloudApiKey";
 /// The store's file name inside the state directory
 const SECRETS_FILE: &str = "secrets.json";
 
+/// The store's object of named profiles
+const PROFILES_KEY: &str = "profiles";
+
+/// A profile's credential and default-creator fields
+const PROFILE_KEY_FIELD: &str = "apiKey";
+const PROFILE_CREATOR_FIELD: &str = "creator";
+
+/// The environment variable that selects a profile when `--profile` is absent
+pub const PROFILE_ENV: &str = "WSYNC_PROFILE";
+
 /// Credentials are small; anything past this is a mistake, not a key
 const MAX_CREDENTIAL_BYTES: u64 = 64 * 1024;
 
@@ -46,8 +63,14 @@ enum AuthCommand {
 	Set(AuthSet),
 	/// Report whether a credential is stored (never prints the credential)
 	Status(AuthStatus),
-	/// Remove the stored credential
+	/// Remove the stored credential (or one profile)
 	Clear(AuthClear),
+}
+
+/// A named profile: its own key, its default creator, or both
+pub(crate) struct Profile {
+	pub api_key: Option<String>,
+	pub creator: Option<String>,
 }
 
 impl Auth {
@@ -75,6 +98,14 @@ struct AuthSet {
 	#[arg(long = "from-env", value_name = "NAME", conflicts_with_all = ["from_stdin", "file"])]
 	from_env: Option<String>,
 
+	/// Store into this named profile instead of the default credential
+	#[arg(long, value_name = "NAME")]
+	profile: Option<String>,
+
+	/// The profile's default upload creator, `user:<id>` or `group:<id>`
+	#[arg(long, value_name = "USER-OR-GROUP", requires = "profile")]
+	creator: Option<String>,
+
 	/// Override the WSync state directory holding the store
 	#[arg(long = "data-dir", value_name = "PATH")]
 	data_dir: Option<PathBuf>,
@@ -90,11 +121,36 @@ impl AuthSet {
 		let sources =
 			usize::from(self.from_stdin) + usize::from(self.file.is_some()) + usize::from(self.from_env.is_some());
 
-		if sources != 1 {
+		if let Some(name) = &self.profile {
+			validate_profile_name(name)?;
+		}
+
+		let creator = match &self.creator {
+			Some(creator) => Some(crate::cli::upload::Creator::parse(creator)?.describe()),
+			None => None,
+		};
+
+		// A profile may take only a creator (it then borrows the normal
+		// credential chain); everything else needs exactly one key source
+		if sources > 1 || (sources == 0 && creator.is_none()) {
 			bail!(
-				"`{}` needs exactly one of --from-stdin, --file, or --from-env",
-				"wsync auth set".bold()
+				"`{}` needs exactly one of --from-stdin, --file, or --from-env{}",
+				"wsync auth set".bold(),
+				if self.profile.is_some() {
+					" (or --creator alone)"
+				} else {
+					""
+				}
 			);
+		}
+
+		let path = store_path(self.data_dir.as_deref())?;
+
+		if sources == 0 {
+			let name = self.profile.as_deref().unwrap_or_default();
+			let profile = write_profile(&path, name, None, creator.as_deref())?;
+
+			return report_profile(&path, name, &profile, self.raw, "Profile stored");
 		}
 
 		let credential = if self.from_stdin {
@@ -136,7 +192,11 @@ impl AuthSet {
 			bail!("The credential exceeds 64 KiB — that is not an API key");
 		}
 
-		let path = store_path(self.data_dir.as_deref())?;
+		if let Some(name) = &self.profile {
+			let profile = write_profile(&path, name, Some(credential), creator.as_deref())?;
+
+			return report_profile(&path, name, &profile, self.raw, "Profile stored");
+		}
 
 		write_credential(&path, credential)?;
 
@@ -146,12 +206,17 @@ impl AuthSet {
 			Some(masked_tail(credential)),
 			self.raw,
 			"Credential stored",
+			None,
 		)
 	}
 }
 
 #[derive(Parser)]
 struct AuthStatus {
+	/// Report only this named profile
+	#[arg(long, value_name = "NAME")]
+	profile: Option<String>,
+
 	/// Override the WSync state directory holding the store
 	#[arg(long = "data-dir", value_name = "PATH")]
 	data_dir: Option<PathBuf>,
@@ -164,7 +229,29 @@ struct AuthStatus {
 impl AuthStatus {
 	fn main(self) -> Result<()> {
 		let path = store_path(self.data_dir.as_deref())?;
+
+		if let Some(name) = &self.profile {
+			validate_profile_name(name)?;
+
+			return match read_profile(&path, name)? {
+				Some(profile) => report_profile(&path, name, &profile, self.raw, "Profile"),
+				None => bail!(
+					"No profile named `{name}` — store one with `{}`",
+					format!("wsync auth set --profile {name}").bold()
+				),
+			};
+		}
+
 		let credential = read_credential(&path)?;
+		let profiles = read_profiles(&path)?;
+
+		if !self.raw && !profiles.is_empty() {
+			for (name, profile) in &profiles {
+				report_profile(&path, name, profile, false, "Profile")?;
+			}
+		}
+
+		let raw_profiles = (self.raw && !profiles.is_empty()).then(|| profiles_json(&profiles));
 
 		match credential {
 			Some(credential) => report(
@@ -173,6 +260,7 @@ impl AuthStatus {
 				Some(masked_tail(&credential)),
 				self.raw,
 				"A credential is stored",
+				raw_profiles,
 			),
 			// The CLI file is empty — the desktop app's keychain entry still
 			// counts (it is what `stored_credential` will hand the cloud
@@ -185,8 +273,16 @@ impl AuthStatus {
 					Some(masked_tail(&credential)),
 					self.raw,
 					"A credential is stored in the desktop app's keychain entry",
+					raw_profiles,
 				),
-				None => report(&path, false, None, self.raw, "No credential stored"),
+				None => report(
+					&path,
+					false,
+					None,
+					self.raw,
+					"No default credential stored",
+					raw_profiles,
+				),
 			},
 		}
 	}
@@ -194,6 +290,10 @@ impl AuthStatus {
 
 #[derive(Parser)]
 struct AuthClear {
+	/// Remove this named profile instead of the default credential
+	#[arg(long, value_name = "NAME")]
+	profile: Option<String>,
+
 	/// Override the WSync state directory holding the store
 	#[arg(long = "data-dir", value_name = "PATH")]
 	data_dir: Option<PathBuf>,
@@ -207,15 +307,37 @@ impl AuthClear {
 	fn main(self) -> Result<()> {
 		let path = store_path(self.data_dir.as_deref())?;
 
+		if let Some(name) = &self.profile {
+			validate_profile_name(name)?;
+			remove_profile(&path, name)?;
+
+			if self.raw {
+				print_json(
+					&json!({ "ok": true, "profile": name, "configured": false, "path": path.to_string_lossy() }),
+				);
+			} else {
+				wsync_info!("Profile {} cleared ({})", name.bold(), path.display());
+			}
+
+			return Ok(());
+		}
+
 		remove_credential(&path)?;
 
-		report(&path, false, None, self.raw, "Credential cleared")
+		report(&path, false, None, self.raw, "Credential cleared", None)
 	}
 }
 
 /// Presence plus location — never the secret. The masked tail is the last
 /// four characters, enough to tell keys apart and useless to an attacker
-fn report(path: &Path, configured: bool, masked: Option<String>, raw: bool, message: &str) -> Result<()> {
+fn report(
+	path: &Path,
+	configured: bool,
+	masked: Option<String>,
+	raw: bool,
+	message: &str,
+	profiles: Option<Value>,
+) -> Result<()> {
 	if raw {
 		let mut record = json!({
 			"ok": true,
@@ -226,6 +348,10 @@ fn report(path: &Path, configured: bool, masked: Option<String>, raw: bool, mess
 
 		if let Some(masked) = &masked {
 			record["maskedTail"] = json!(masked);
+		}
+
+		if let Some(profiles) = profiles {
+			record["profiles"] = profiles;
 		}
 
 		print_json(&record);
@@ -243,6 +369,188 @@ fn report(path: &Path, configured: bool, masked: Option<String>, raw: bool, mess
 	);
 
 	Ok(())
+}
+
+/// One profile's presence report — its creator and masked key tail, never
+/// the key
+fn report_profile(path: &Path, name: &str, profile: &Profile, raw: bool, message: &str) -> Result<()> {
+	if raw {
+		let mut record = profile_json(profile);
+
+		record["ok"] = json!(true);
+		record["profile"] = json!(name);
+		record["path"] = json!(path.to_string_lossy());
+		print_json(&record);
+
+		return Ok(());
+	}
+
+	wsync_info!(
+		"{message} {}: key {}, creator {}",
+		name.bold(),
+		match &profile.api_key {
+			Some(key) => masked_tail(key).bold().to_string(),
+			None => "none (uses the default credential chain)".to_owned(),
+		},
+		profile
+			.creator
+			.as_deref()
+			.unwrap_or("none (uses --creator or the project's groupId)")
+	);
+
+	Ok(())
+}
+
+fn profile_json(profile: &Profile) -> Value {
+	let mut record = json!({
+		"configured": profile.api_key.is_some(),
+		"creator": profile.creator,
+	});
+
+	if let Some(key) = &profile.api_key {
+		record["maskedTail"] = json!(masked_tail(key));
+	}
+
+	record
+}
+
+fn profiles_json(profiles: &[(String, Profile)]) -> Value {
+	Value::Object(
+		profiles
+			.iter()
+			.map(|(name, profile)| (name.clone(), profile_json(profile)))
+			.collect(),
+	)
+}
+
+/// Profile names travel through flags, env vars and messages — keep them
+/// plain
+fn validate_profile_name(name: &str) -> Result<()> {
+	let valid = !name.is_empty()
+		&& name.len() <= 64
+		&& name
+			.chars()
+			.all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.');
+
+	if !valid {
+		bail!("Profile names are 1–64 letters, digits, `-`, `_` or `.`, not `{name}`");
+	}
+
+	Ok(())
+}
+
+fn parse_profile(value: &Value) -> Profile {
+	let field = |key: &str| {
+		value
+			.get(key)
+			.and_then(Value::as_str)
+			.map(str::trim)
+			.filter(|text| !text.is_empty())
+			.map(str::to_owned)
+	};
+
+	Profile {
+		api_key: field(PROFILE_KEY_FIELD),
+		creator: field(PROFILE_CREATOR_FIELD),
+	}
+}
+
+/// Every stored profile, sorted by name
+fn read_profiles(path: &Path) -> Result<Vec<(String, Profile)>> {
+	let store = read_store(path)?;
+	let mut profiles: Vec<(String, Profile)> = match store.get(PROFILES_KEY) {
+		Some(Value::Object(map)) => map
+			.iter()
+			.map(|(name, value)| (name.clone(), parse_profile(value)))
+			.collect(),
+		_ => Vec::new(),
+	};
+
+	profiles.sort_by(|a, b| a.0.cmp(&b.0));
+
+	Ok(profiles)
+}
+
+fn read_profile(path: &Path, name: &str) -> Result<Option<Profile>> {
+	let store = read_store(path)?;
+
+	Ok(store
+		.get(PROFILES_KEY)
+		.and_then(|profiles| profiles.get(name))
+		.map(parse_profile))
+}
+
+/// The named profile from the CLI store — the cloud credential chain's
+/// override tier. `Ok(None)` means no such profile
+pub(crate) fn stored_profile(name: &str) -> Result<Option<Profile>> {
+	validate_profile_name(name)?;
+	read_profile(&store_path(None)?, name)
+}
+
+/// Create or update a profile. A field left `None` keeps its stored value,
+/// so the key and the creator can be set in separate calls
+fn write_profile(path: &Path, name: &str, api_key: Option<&str>, creator: Option<&str>) -> Result<Profile> {
+	let mut store = read_store(path)?;
+	let profiles = store
+		.entry(PROFILES_KEY.to_owned())
+		.or_insert_with(|| Value::Object(Map::new()));
+
+	let Value::Object(profiles) = profiles else {
+		bail!("{} holds a `{PROFILES_KEY}` that is not a JSON object", path.display());
+	};
+
+	let entry = profiles
+		.entry(name.to_owned())
+		.or_insert_with(|| Value::Object(Map::new()));
+
+	let Value::Object(entry) = entry else {
+		bail!("{} holds a profile `{name}` that is not a JSON object", path.display());
+	};
+
+	if let Some(api_key) = api_key {
+		entry.insert(PROFILE_KEY_FIELD.to_owned(), json!(api_key));
+	}
+
+	if let Some(creator) = creator {
+		entry.insert(PROFILE_CREATOR_FIELD.to_owned(), json!(creator));
+	}
+
+	let profile = parse_profile(&Value::Object(entry.clone()));
+
+	write_store(path, &store)?;
+
+	Ok(profile)
+}
+
+fn remove_profile(path: &Path, name: &str) -> Result<()> {
+	let mut store = read_store(path)?;
+
+	let removed = match store.get_mut(PROFILES_KEY) {
+		Some(Value::Object(profiles)) => {
+			let removed = profiles.remove(name).is_some();
+
+			if profiles.is_empty() {
+				store.remove(PROFILES_KEY);
+			}
+
+			removed
+		}
+		_ => false,
+	};
+
+	if !removed {
+		bail!("No profile named `{name}`");
+	}
+
+	if store.is_empty() {
+		match fs::remove_file(path) {
+			Ok(()) => Ok(()),
+			Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+			Err(err) => Err(err).with_context(|| format!("Failed to remove {}", path.display())),
+		}
+	} else {
+		write_store(path, &store)
+	}
 }
 
 fn masked_tail(credential: &str) -> String {
@@ -453,6 +761,47 @@ mod tests {
 		assert_eq!(masked_tail("abcdefgh"), "…efgh");
 		assert_eq!(masked_tail("abc"), "…abc");
 		assert_eq!(masked_tail("k"), "…k");
+	}
+
+	#[test]
+	fn profiles_store_merge_list_and_clear_beside_the_default_credential() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join(SECRETS_FILE);
+
+		write_credential(&path, "default-key").unwrap();
+		write_profile(&path, "owner", Some("owner-key"), Some("user:4774617141")).unwrap();
+		write_profile(&path, "group", None, Some("group:280410213")).unwrap();
+
+		// A later key-only write keeps the stored creator
+		let owner = write_profile(&path, "owner", Some("owner-key-2"), None).unwrap();
+		assert_eq!(owner.api_key.as_deref(), Some("owner-key-2"));
+		assert_eq!(owner.creator.as_deref(), Some("user:4774617141"));
+
+		let names: Vec<String> = read_profiles(&path)
+			.unwrap()
+			.into_iter()
+			.map(|(name, _)| name)
+			.collect();
+		assert_eq!(names, ["group", "owner"]);
+		assert!(read_profile(&path, "group").unwrap().unwrap().api_key.is_none());
+
+		// Profiles never shadow the default credential
+		assert_eq!(read_credential(&path).unwrap().as_deref(), Some("default-key"));
+
+		remove_profile(&path, "owner").unwrap();
+		remove_profile(&path, "group").unwrap();
+		assert!(remove_profile(&path, "group").is_err());
+		assert!(read_store(&path).unwrap().get(PROFILES_KEY).is_none());
+		assert_eq!(read_credential(&path).unwrap().as_deref(), Some("default-key"));
+	}
+
+	#[test]
+	fn profile_names_stay_plain() {
+		assert!(validate_profile_name("igntiino").is_ok());
+		assert!(validate_profile_name("cute-malt_games.2").is_ok());
+		assert!(validate_profile_name("").is_err());
+		assert!(validate_profile_name("a b").is_err());
+		assert!(validate_profile_name("../x").is_err());
 	}
 
 	#[test]

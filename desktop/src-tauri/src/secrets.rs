@@ -279,8 +279,11 @@ fn set_in(
                  without truncating it."
                     .to_string()
             };
-            return Ok(SecretStatus::found(name, value, Store::File)
-                .with_note(format!("{reason} It was written to the 0600 file store instead.")));
+            return Ok(
+                SecretStatus::found(name, value, Store::File).with_note(format!(
+                    "{reason} It was written to the 0600 file store instead."
+                )),
+            );
         }
         match keychain_set(keychain, name, value) {
             Ok(()) => {
@@ -291,11 +294,13 @@ fn set_in(
             }
             Err(why) => {
                 file_set(secrets_file, name, value)?;
-                return Ok(SecretStatus::found(name, value, Store::File).with_note(format!(
-                    "The macOS keychain refused ({why}), so the key was written to the 0600 \
+                return Ok(
+                    SecretStatus::found(name, value, Store::File).with_note(format!(
+                        "The macOS keychain refused ({why}), so the key was written to the 0600 \
                      file store at {} instead.",
-                    secrets_file.display()
-                )));
+                        secrets_file.display()
+                    )),
+                );
             }
         }
     }
@@ -308,11 +313,7 @@ fn set_in(
 }
 
 /// Presence and a masked tail. The value is read only to mask it, and dropped.
-fn get_in(
-    secrets_file: &Path,
-    name: &str,
-    keychain: &Keychain,
-) -> HostResult<SecretStatus> {
+fn get_in(secrets_file: &Path, name: &str, keychain: &Keychain) -> HostResult<SecretStatus> {
     validate_name(name)?;
 
     if keychain.available() {
@@ -339,11 +340,7 @@ fn get_in(
 }
 
 /// Remove the secret from **both** stores, so nothing survives a "Clear".
-fn clear_in(
-    secrets_file: &Path,
-    name: &str,
-    keychain: &Keychain,
-) -> HostResult<SecretStatus> {
+fn clear_in(secrets_file: &Path, name: &str, keychain: &Keychain) -> HostResult<SecretStatus> {
     validate_name(name)?;
 
     let mut note = None;
@@ -453,7 +450,13 @@ fn keychain_delete(keychain: &Keychain, name: &str) -> Result<(), String> {
         .binary()
         .ok_or_else(|| "no keychain on this platform".to_string())?;
     let output = Command::new(&binary)
-        .args(["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", name])
+        .args([
+            "delete-generic-password",
+            "-s",
+            KEYCHAIN_SERVICE,
+            "-a",
+            name,
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -533,10 +536,32 @@ fn file_read(path: &Path) -> HostResult<BTreeMap<String, String>> {
     Ok(secrets)
 }
 
-fn file_write(path: &Path, secrets: &BTreeMap<String, String>) -> HostResult<()> {
-    if secrets.is_empty() {
-        // An empty file is not the same as no file, but for a secret store it
-        // may as well be — and not leaving one behind is tidier.
+/// The whole stored document, foreign keys included. `secrets.json` is shared
+/// with the CLI (`wsync auth`: its own `robloxCloudApiKey` and the named
+/// `profiles`), so every write starts from this and changes only its own keys —
+/// rebuilding the file from the names this app knows would delete the CLI's.
+/// A corrupt store reads as empty here: an explicit write is what replaces it.
+fn file_document(path: &Path) -> HostResult<Map<String, Value>> {
+    let raw = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
+        Err(error) => {
+            return Err(HostError::io(format!(
+                "could not read {}: {error}",
+                path.display()
+            )))
+        }
+    };
+
+    match serde_json::from_slice(&raw) {
+        Ok(Value::Object(document)) => Ok(document),
+        _ => Ok(Map::new()),
+    }
+}
+
+/// Write a document back, removing the file when nothing is left in it.
+fn file_write_document(path: &Path, document: Map<String, Value>) -> HostResult<()> {
+    if document.is_empty() {
         match std::fs::remove_file(path) {
             Ok(()) => return Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -549,30 +574,17 @@ fn file_write(path: &Path, secrets: &BTreeMap<String, String>) -> HostResult<()>
         }
     }
 
-    let mut document = Map::new();
-    for (key, value) in secrets {
-        document.insert(key.clone(), Value::String(value.clone()));
-    }
     let mut bytes = serde_json::to_vec_pretty(&Value::Object(document))
         .map_err(|error| HostError::io(format!("could not serialize the secret store: {error}")))?;
     bytes.push(b'\n');
-    // Same atomic temp+rename as `state.json`, and `0600` rather than `0644`:
-    // the temp file is created with the mode, so there is no window in which
-    // the key is on disk world-readable.
     storage::atomic_write(path, &bytes, 0o600)
 }
 
 fn file_set(path: &Path, name: &str, value: &str) -> HostResult<()> {
-    let mut secrets = file_read(path).or_else(|error| {
-        // A corrupt store must not wedge the app: an explicit write rebuilds it.
-        if error.code == crate::error::code::CORRUPT_STATE {
-            Ok(BTreeMap::new())
-        } else {
-            Err(error)
-        }
-    })?;
-    secrets.insert(name.to_string(), value.to_string());
-    file_write(path, &secrets)
+    // A corrupt store must not wedge the app: an explicit write rebuilds it.
+    let mut document = file_document(path)?;
+    document.insert(name.to_string(), Value::String(value.to_string()));
+    file_write_document(path, document)
 }
 
 fn file_get(path: &Path, name: &str) -> HostResult<Option<String>> {
@@ -580,16 +592,175 @@ fn file_get(path: &Path, name: &str) -> HostResult<Option<String>> {
 }
 
 fn file_clear(path: &Path, name: &str) -> HostResult<()> {
-    let mut secrets = match file_read(path) {
-        Ok(secrets) => secrets,
-        // Clearing a corrupt store is exactly what should replace it.
-        Err(error) if error.code == crate::error::code::CORRUPT_STATE => BTreeMap::new(),
-        Err(error) => return Err(error),
-    };
-    if secrets.remove(name).is_none() && !path.exists() {
+    if !path.exists() {
         return Ok(());
     }
-    file_write(path, &secrets)
+    // Clearing a corrupt store is exactly what should replace it.
+    let mut document = file_document(path)?;
+    document.remove(name);
+    file_write_document(path, document)
+}
+
+// ----------------------------------------------------------------- profiles --
+//
+// Named upload profiles, one per Roblox account or group, in the same
+// `profiles` object `wsync auth set --profile` writes:
+// `{"profiles": {"<name>": {"apiKey": "…", "creator": "user:<id>"}}}`. Each
+// holds its own key, a default creator, or both; `wsync upload --profile
+// <name>` uses them. Profile keys live in the 0600 file only — an Open Cloud
+// key is ~600 bytes, past what the keychain prompt can carry anyway.
+
+const PROFILES_KEY: &str = "profiles";
+const PROFILE_KEY_FIELD: &str = "apiKey";
+const PROFILE_CREATOR_FIELD: &str = "creator";
+
+/// What the webview learns about a profile: never its key.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProfileStatus {
+    pub(crate) name: String,
+    /// Whether the profile has its own key (otherwise it borrows the default)
+    pub(crate) present: bool,
+    pub(crate) masked: Option<String>,
+    pub(crate) creator: Option<String>,
+}
+
+/// Same rule as the CLI's `validate_profile_name`.
+pub(crate) fn validate_profile_name(name: &str) -> HostResult<()> {
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.');
+    if valid {
+        Ok(())
+    } else {
+        Err(HostError::invalid_argument(
+            "a profile name is 1–64 letters, digits, `-`, `_` or `.`",
+        ))
+    }
+}
+
+/// `user:<id>` / `group:<id>`, normalized; anything else is refused.
+fn normalize_creator(creator: &str) -> HostResult<String> {
+    let refused = || HostError::invalid_argument("the creator must be user:<id> or group:<id>");
+    let (kind, id) = creator.trim().split_once(':').ok_or_else(refused)?;
+    let id: u64 = id.trim().parse().map_err(|_| refused())?;
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "user" => Ok(format!("user:{id}")),
+        "group" => Ok(format!("group:{id}")),
+        _ => Err(refused()),
+    }
+}
+
+fn profile_status(name: &str, entry: &Value) -> ProfileStatus {
+    let field = |key: &str| {
+        entry
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    let key = field(PROFILE_KEY_FIELD);
+    ProfileStatus {
+        name: name.to_string(),
+        present: key.is_some(),
+        masked: key.as_deref().map(mask),
+        creator: field(PROFILE_CREATOR_FIELD),
+    }
+}
+
+/// Every stored profile, sorted by name.
+pub(crate) fn profile_list(secrets_file: &Path) -> HostResult<Vec<ProfileStatus>> {
+    let document = file_document(secrets_file)?;
+    let mut profiles: Vec<ProfileStatus> = match document.get(PROFILES_KEY) {
+        Some(Value::Object(map)) => map
+            .iter()
+            .map(|(name, entry)| profile_status(name, entry))
+            .collect(),
+        _ => Vec::new(),
+    };
+    profiles.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(profiles)
+}
+
+/// Create or update a profile. A `None` field keeps what is stored, so the key
+/// and the creator can be changed separately; a new profile needs one of them.
+pub(crate) fn profile_set(
+    secrets_file: &Path,
+    name: &str,
+    creator: Option<&str>,
+    value: Option<&str>,
+) -> HostResult<ProfileStatus> {
+    validate_profile_name(name)?;
+    let creator = match creator.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(creator) => Some(normalize_creator(creator)?),
+        None => None,
+    };
+    let value = match value.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(value) if value.len() > MAX_SECRET_BYTES => {
+            return Err(HostError::invalid_argument(
+                "that is too long to be an API key",
+            ))
+        }
+        other => other,
+    };
+
+    let mut document = file_document(secrets_file)?;
+    let profiles = document
+        .entry(PROFILES_KEY.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !profiles.is_object() {
+        *profiles = Value::Object(Map::new());
+    }
+    let Value::Object(profiles) = profiles else {
+        unreachable!()
+    };
+    let entry = profiles
+        .entry(name.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !entry.is_object() {
+        *entry = Value::Object(Map::new());
+    }
+    let Value::Object(fields) = entry else {
+        unreachable!()
+    };
+
+    if let Some(value) = value {
+        fields.insert(
+            PROFILE_KEY_FIELD.to_string(),
+            Value::String(value.to_string()),
+        );
+    }
+    if let Some(creator) = creator {
+        fields.insert(PROFILE_CREATOR_FIELD.to_string(), Value::String(creator));
+    }
+    let status = profile_status(name, entry);
+    if !status.present && status.creator.is_none() {
+        return Err(HostError::invalid_argument(
+            "a profile needs an API key, a creator, or both",
+        ));
+    }
+
+    file_write_document(secrets_file, document)?;
+    Ok(status)
+}
+
+/// Remove one profile; removing one that is not there is not an error.
+pub(crate) fn profile_clear(secrets_file: &Path, name: &str) -> HostResult<()> {
+    validate_profile_name(name)?;
+    if !secrets_file.exists() {
+        return Ok(());
+    }
+    let mut document = file_document(secrets_file)?;
+    if let Some(Value::Object(profiles)) = document.get_mut(PROFILES_KEY) {
+        profiles.remove(name);
+        if profiles.is_empty() {
+            document.remove(PROFILES_KEY);
+        }
+    }
+    file_write_document(secrets_file, document)
 }
 
 #[cfg(test)]
@@ -607,7 +778,9 @@ mod tests {
     fn unknown_names_are_refused_before_any_store_is_touched() {
         let (_directory, path) = store();
         assert_eq!(
-            set_in(&path, "nope", "value", &Keychain::None).unwrap_err().code,
+            set_in(&path, "nope", "value", &Keychain::None)
+                .unwrap_err()
+                .code,
             crate::error::code::INVALID_ARGUMENT
         );
         assert_eq!(
@@ -621,12 +794,16 @@ mod tests {
     fn an_empty_or_oversized_value_is_refused() {
         let (_directory, path) = store();
         assert_eq!(
-            set_in(&path, "openCloudApiKey", "   ", &Keychain::None).unwrap_err().code,
+            set_in(&path, "openCloudApiKey", "   ", &Keychain::None)
+                .unwrap_err()
+                .code,
             crate::error::code::INVALID_ARGUMENT
         );
         let huge = "k".repeat(MAX_SECRET_BYTES + 1);
         assert_eq!(
-            set_in(&path, "openCloudApiKey", &huge, &Keychain::None).unwrap_err().code,
+            set_in(&path, "openCloudApiKey", &huge, &Keychain::None)
+                .unwrap_err()
+                .code,
             crate::error::code::INVALID_ARGUMENT
         );
     }
@@ -650,7 +827,10 @@ mod tests {
             let masked = mask(&value);
             assert_ne!(masked, value);
             let revealed = masked.chars().count() - 1;
-            assert!(revealed <= MASK_TAIL, "{masked} reveals {revealed} of {value}");
+            assert!(
+                revealed <= MASK_TAIL,
+                "{masked} reveals {revealed} of {value}"
+            );
             assert!(
                 revealed * 2 <= length,
                 "{masked} reveals over half of a {length}-character value",
@@ -694,7 +874,10 @@ mod tests {
         file_set(&path, "openCloudApiKey", "sk-live-zyxwvu987654").unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "a secret store must not be group/world readable");
+        assert_eq!(
+            mode, 0o600,
+            "a secret store must not be group/world readable"
+        );
 
         let entries: Vec<_> = std::fs::read_dir(directory.path())
             .unwrap()
@@ -733,9 +916,63 @@ mod tests {
     }
 
     #[test]
+    fn writes_keep_the_cli_keys_and_profiles_in_the_shared_store() {
+        let (_directory, path) = store();
+        std::fs::write(
+            &path,
+            br#"{"robloxCloudApiKey":"cli-key","profiles":{"owner":{"apiKey":"owner-key"}}}"#,
+        )
+        .unwrap();
+
+        file_set(&path, "openCloudApiKey", "sk-app-1234").unwrap();
+        file_clear(&path, "openCloudApiKey").unwrap();
+
+        let document = file_document(&path).unwrap();
+        assert_eq!(document["robloxCloudApiKey"], "cli-key");
+        assert_eq!(document["profiles"]["owner"]["apiKey"], "owner-key");
+    }
+
+    #[test]
+    fn profiles_round_trip_mask_and_clear() {
+        let (_directory, path) = store();
+
+        assert!(profile_set(&path, "empty", None, None).is_err());
+        assert!(profile_set(&path, "bad name", Some("user:1"), None).is_err());
+        assert!(profile_set(&path, "x", Some("team:1"), None).is_err());
+
+        let owner =
+            profile_set(&path, "owner", Some(" User:4774 "), Some("sk-owner-abcd")).unwrap();
+        assert_eq!(owner.creator.as_deref(), Some("user:4774"));
+        assert_eq!(owner.masked.as_deref(), Some("…abcd"));
+        assert!(!serde_json::to_string(&owner).unwrap().contains("sk-owner"));
+
+        // A creator-only change keeps the key
+        let owner = profile_set(&path, "owner", Some("group:2804"), None).unwrap();
+        assert!(owner.present);
+        assert_eq!(owner.creator.as_deref(), Some("group:2804"));
+
+        profile_set(&path, "art", Some("user:9"), None).unwrap();
+        let names: Vec<String> = profile_list(&path)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["art", "owner"]);
+
+        profile_clear(&path, "art").unwrap();
+        profile_clear(&path, "owner").unwrap();
+        assert!(profile_list(&path).unwrap().is_empty());
+        assert!(!path.exists(), "an empty store should not linger");
+    }
+
+    #[test]
     fn a_foreign_key_in_the_store_is_ignored() {
         let (_directory, path) = store();
-        std::fs::write(&path, br#"{"openCloudApiKey":"sk-1234","somethingElse":"x"}"#).unwrap();
+        std::fs::write(
+            &path,
+            br#"{"openCloudApiKey":"sk-1234","somethingElse":"x"}"#,
+        )
+        .unwrap();
         let secrets = file_read(&path).unwrap();
         assert_eq!(secrets.len(), 1);
         assert!(secrets.contains_key("openCloudApiKey"));
@@ -771,16 +1008,23 @@ mod tests {
         // to reach the file store whole — so it must be diverted *before*
         // `security` runs, which the failing stub backend below proves.
         assert!(keychain_can_carry(&"k".repeat(KEYCHAIN_PROMPT_MAX_BYTES)));
-        assert!(!keychain_can_carry(&"k".repeat(KEYCHAIN_PROMPT_MAX_BYTES + 1)));
+        assert!(!keychain_can_carry(
+            &"k".repeat(KEYCHAIN_PROMPT_MAX_BYTES + 1)
+        ));
 
-        let long_key: String = std::iter::repeat(['a', 'b', 'c', 'd']).flatten().take(600).collect();
+        let long_key: String = std::iter::repeat(['a', 'b', 'c', 'd'])
+            .flatten()
+            .take(600)
+            .collect();
         assert!(long_key.len() > KEYCHAIN_PROMPT_MAX_BYTES);
 
         let (_directory, path) = store();
         let keychain = Keychain::Stub(PathBuf::from("/nonexistent/security"));
         let status = set_in(&path, "openCloudApiKey", &long_key, &keychain).unwrap();
         assert_eq!(status.store, Some(Store::File));
-        let note = status.note.expect("a diverted long key must explain itself");
+        let note = status
+            .note
+            .expect("a diverted long key must explain itself");
         assert!(note.contains("128") && note.contains("truncat"), "{note}");
         assert_eq!(
             file_get(&path, "openCloudApiKey").unwrap().as_deref(),
@@ -823,10 +1067,19 @@ mod tests {
         // `Keychain::None` is what every non-macOS build uses, so this is the
         // whole shipped path on those platforms.
         let (_directory, path) = store();
-        assert!(!get_in(&path, "openCloudApiKey", &Keychain::None).unwrap().present);
+        assert!(
+            !get_in(&path, "openCloudApiKey", &Keychain::None)
+                .unwrap()
+                .present
+        );
 
-        let written = set_in(&path, "openCloudApiKey", "  sk-live-trimmed-9876  ", &Keychain::None)
-            .unwrap();
+        let written = set_in(
+            &path,
+            "openCloudApiKey",
+            "  sk-live-trimmed-9876  ",
+            &Keychain::None,
+        )
+        .unwrap();
         assert_eq!(written.store, Some(Store::File));
         assert_eq!(written.masked.as_deref(), Some("…9876"));
 
@@ -840,7 +1093,11 @@ mod tests {
         );
 
         clear_in(&path, "openCloudApiKey", &Keychain::None).unwrap();
-        assert!(!get_in(&path, "openCloudApiKey", &Keychain::None).unwrap().present);
+        assert!(
+            !get_in(&path, "openCloudApiKey", &Keychain::None)
+                .unwrap()
+                .present
+        );
     }
 
     // --- the keychain call's shape, checked without a keychain --------------

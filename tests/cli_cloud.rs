@@ -612,3 +612,111 @@ fn monetization_discover_reports_locally_without_a_credential() {
 	assert!(!cli_stdout(&output).contains("sk-env-file"));
 	assert!(!cli_stderr(&output).contains("sk-env-file"));
 }
+
+#[test]
+fn upload_profiles_pick_their_own_key_and_creator() {
+	let stub = assets_stub(None);
+	let sandbox = CliSandbox::new();
+	let icon = sandbox.work.path().join("icon.png");
+
+	fs::write(&icon, b"png").unwrap();
+
+	let stored = sandbox.run_with_stdin(&["auth", "set", "--from-stdin"], b"sk-default\n");
+
+	assert!(stored.status.success());
+
+	// A keyed profile with a user creator, and a creator-only group profile
+	let owner = sandbox.run_with_stdin(
+		&[
+			"auth",
+			"set",
+			"--from-stdin",
+			"--profile",
+			"owner",
+			"--creator",
+			"user:4774",
+		],
+		b"sk-owner\n",
+	);
+
+	assert!(owner.status.success(), "profile set failed: {}", cli_stderr(&owner));
+
+	let group = sandbox.run(&["auth", "set", "--profile", "studio", "--creator", "group:2804"]);
+
+	assert!(
+		group.status.success(),
+		"creator-only profile failed: {}",
+		cli_stderr(&group)
+	);
+
+	let status = sandbox.run(&["auth", "status", "--raw"]);
+	let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+
+	assert_eq!(status["profiles"]["owner"]["creator"], "user:4774");
+	assert_eq!(status["profiles"]["owner"]["maskedTail"], "…wner");
+	assert_eq!(status["profiles"]["studio"]["configured"], false);
+	assert!(
+		!status.to_string().contains("sk-owner"),
+		"status must never print a key"
+	);
+
+	let upload = |args: &[&str], envs: &[(&str, &str)]| {
+		let mut full = vec!["upload", icon.to_str().unwrap(), "--no-wait", "--raw"];
+		let mut all_envs = vec![("WSYNC_CLOUD_BASE_URL", stub.base_url.as_str())];
+
+		full.extend_from_slice(args);
+		all_envs.extend_from_slice(envs);
+
+		let output = sandbox.run_with_envs(&full, &all_envs);
+
+		assert!(
+			output.status.success(),
+			"upload {args:?} failed: {}",
+			cli_stderr(&output)
+		);
+
+		let create = stub.requests_to("/assets/v1/assets").pop().unwrap();
+		let request = create.part_json("request").unwrap();
+
+		(create.header("x-api-key").map(str::to_owned), request)
+	};
+
+	// --profile: the profile's key beats the default store, its creator applies
+	let (key, request) = upload(&["--profile", "owner"], &[]);
+
+	assert_eq!(key.as_deref(), Some("sk-owner"));
+	assert_eq!(request["creationContext"]["creator"]["userId"], "4774");
+
+	// An explicit --creator still overrides the profile's
+	let (_, request) = upload(&["--profile", "owner", "--creator", "group:9"], &[]);
+
+	assert_eq!(request["creationContext"]["creator"]["groupId"], "9");
+
+	// WSYNC_PROFILE selects too; a creator-only profile keeps the default key
+	let (key, request) = upload(&[], &[("WSYNC_PROFILE", "studio")]);
+
+	assert_eq!(key.as_deref(), Some("sk-default"));
+	assert_eq!(request["creationContext"]["creator"]["groupId"], "2804");
+
+	// An unknown profile is refused before any request
+	let before = stub.requests_to("/assets/v1/assets").len();
+	let output = sandbox.run_with_envs(
+		&["upload", &icon.to_string_lossy(), "--profile", "nobody", "--raw"],
+		&[("WSYNC_CLOUD_BASE_URL", &stub.base_url)],
+	);
+
+	assert!(!output.status.success());
+	assert!(cli_stderr(&output).contains("No profile named `nobody`"));
+	assert_eq!(stub.requests_to("/assets/v1/assets").len(), before);
+
+	// Clearing a profile leaves the default credential alone
+	let cleared = sandbox.run(&["auth", "clear", "--profile", "owner"]);
+
+	assert!(cleared.status.success());
+
+	let status = sandbox.run(&["auth", "status", "--raw"]);
+	let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+
+	assert_eq!(status["configured"], true);
+	assert!(status["profiles"].get("owner").is_none());
+}

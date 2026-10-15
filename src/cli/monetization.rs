@@ -202,6 +202,10 @@ struct Common {
 	#[arg(long = "api-key-env", value_name = "NAME")]
 	api_key_env: Option<String>,
 
+	/// Stored auth profile whose key to use (default: `WSYNC_PROFILE`)
+	#[arg(long, value_name = "NAME")]
+	profile: Option<String>,
+
 	/// Print machine-readable JSON
 	#[arg(long)]
 	raw: bool,
@@ -259,7 +263,9 @@ impl Common {
 
 	fn connect(&self) -> Result<Context_> {
 		let (universe, _) = self.resolve_universe()?;
-		let credential = cloud::resolve_credential(self.api_key_env.as_deref(), Some(&self.workspace()?))?;
+		let profile = cloud::select_profile(self.profile.as_deref())?;
+		let credential =
+			cloud::resolve_credential(self.api_key_env.as_deref(), Some(&self.workspace()?), profile.as_ref())?;
 
 		Ok(Context_ {
 			universe,
@@ -291,7 +297,9 @@ impl Discover {
 
 		let workspace = project_path.get_parent().to_owned();
 		let universe = self.common.resolve_universe().ok();
-		let credential = cloud::find_credential(self.common.api_key_env.as_deref(), Some(&workspace))?;
+		let profile = cloud::select_profile(self.common.profile.as_deref())?;
+		let credential =
+			cloud::find_credential(self.common.api_key_env.as_deref(), Some(&workspace), profile.as_ref())?;
 
 		let mut files: Vec<PathBuf> = Vec::new();
 

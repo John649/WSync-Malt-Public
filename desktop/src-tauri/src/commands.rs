@@ -25,7 +25,7 @@ use crate::{
     error::{HostError, HostResult},
     external::{self, ExternalDaemon},
     plugin_install,
-    secrets::{self, SecretStatus},
+    secrets::{self, ProfileStatus, SecretStatus},
     storage, AppState,
 };
 
@@ -686,6 +686,39 @@ pub(crate) async fn secret_clear(
     let _guard = state.secrets_lock.lock().await;
     let path = state.paths.secrets_file.clone();
     blocking(move || secrets::clear(&path, &name)).await
+}
+
+/// Every named upload profile: name, creator, and a masked tail — never a key.
+#[tauri::command]
+pub(crate) async fn profile_list(state: State<'_, AppState>) -> HostResult<Vec<ProfileStatus>> {
+    let _guard = state.secrets_lock.lock().await;
+    let path = state.paths.secrets_file.clone();
+    blocking(move || secrets::profile_list(&path)).await
+}
+
+/// Create or update a named upload profile (`wsync upload --profile <name>`).
+/// `value`, like `secret_set`'s, only travels inward.
+#[tauri::command]
+pub(crate) async fn profile_set(
+    state: State<'_, AppState>,
+    name: String,
+    creator: Option<String>,
+    value: Option<String>,
+) -> HostResult<ProfileStatus> {
+    secrets::validate_profile_name(&name)?;
+    let _guard = state.secrets_lock.lock().await;
+    let path = state.paths.secrets_file.clone();
+    blocking(move || secrets::profile_set(&path, &name, creator.as_deref(), value.as_deref()))
+        .await
+}
+
+/// Remove a named upload profile.
+#[tauri::command]
+pub(crate) async fn profile_clear(state: State<'_, AppState>, name: String) -> HostResult<()> {
+    secrets::validate_profile_name(&name)?;
+    let _guard = state.secrets_lock.lock().await;
+    let path = state.paths.secrets_file.clone();
+    blocking(move || secrets::profile_clear(&path, &name)).await
 }
 
 /// Reserved: hand the stored key to a spawned daemon by environment variable.

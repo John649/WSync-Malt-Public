@@ -214,6 +214,14 @@ export const host = {
   secretGet: (name) => call("secret_get", { name }),
   secretClear: (name) => call("secret_clear", { name }),
 
+  // Named upload profiles (`wsync upload --profile <name>`): one per Roblox
+  // account or group, each with its own key, a default creator, or both.
+  // Answers are `{name, present, masked, creator}` — never a key.
+  profileList: () => call("profile_list"),
+  profileSet: (name, creator, value) =>
+    call("profile_set", { name, creator: creator || null, value: value || null }),
+  profileClear: (name) => call("profile_clear", { name }),
+
   /**
    * Reserved: hand the stored key to a spawned daemon by environment variable.
    * Answers `not_implemented` until the CLI credential handoff lands — the

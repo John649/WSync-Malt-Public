@@ -581,7 +581,7 @@ Adopted from Ro-Sync wholesale:
 
 ## 13. Performance
 
-Targets: sub-100 ms disk→Studio propagation for a single-file edit on a 25 000-instance project; divergence comparison and selective staging usable at 25 000+ instances (bounded pages, no unbounded payload anywhere); `build` from live tree with zero rescan. Techniques inherited: §4 (incremental diffing, interned ids, path index, single-writer thread, debouncing, echo suppression), Ro-Sync's batch normalization (create/update parent-first, delete child-first, rename-chain collapse `A→B→C ⇒ A→C`, per-batch — not per-entry — debounce cost), bounded queues with explicit overload signaling, and WS push replacing long-poll. Profiling hooks (`puffin` flamegraphs behind a hidden `--profile`) kept from Argon.
+Targets: sub-100 ms disk→Studio propagation for a single-file edit on a 25 000-instance project; divergence comparison and selective staging usable at 25 000+ instances (bounded pages, no unbounded payload anywhere); `build` from live tree with zero rescan. Techniques inherited: §4 (incremental diffing, interned ids, path index, single-writer thread, debouncing, echo suppression), Ro-Sync's batch normalization (create/update parent-first, delete child-first, rename-chain collapse `A→B→C ⇒ A→C`, per-batch — not per-entry — debounce cost), bounded queues with explicit overload signaling, and WS push replacing long-poll. Profiling hooks (`puffin` flamegraphs behind a hidden `--profiler`) kept from Argon.
 
 ---
 

@@ -411,6 +411,182 @@ export function mountSettings(root, api) {
     ),
   );
 
+  // --------------------------------------------------------------- profiles --
+  //
+  // One profile per Roblox account or group the uploads go out as. A profile
+  // holds its own key, a default creator, or both; a creator-only profile
+  // borrows the key above. `wsync upload --profile <name>` picks one. Like the
+  // key above, a profile's key goes in and only its masked tail comes back.
+
+  const profileList = el("div", { class: "row-list" });
+  const profileNotice = el("div", { hidden: true });
+  const profileNameInput = el("input", {
+    class: "input",
+    placeholder: "Profile name, e.g. owner",
+    autocomplete: "off",
+    spellcheck: "false",
+    "aria-label": "Profile name",
+    on: { input: () => renderProfileButtons() },
+  });
+  const profileCreatorInput = el("input", {
+    class: "input",
+    placeholder: "Creator: user:<id> or group:<id>",
+    autocomplete: "off",
+    spellcheck: "false",
+    "aria-label": "Profile creator",
+    on: { input: () => renderProfileButtons() },
+  });
+  const profileKeyInput = el("input", {
+    class: "input",
+    type: "password",
+    placeholder: "API key (optional — blank keeps the stored one or uses the default)",
+    autocomplete: "off",
+    spellcheck: "false",
+    "aria-label": "Profile API key",
+    on: { input: () => renderProfileButtons() },
+  });
+  const profileSaveButton = el(
+    "button",
+    { class: "btn btn-primary", type: "button", disabled: true, on: { click: saveProfile } },
+    "Save profile",
+  );
+
+  let profiles = [];
+  let profileBusy = false;
+
+  function renderProfileButtons() {
+    const name = profileNameInput.value.trim();
+    const hasField = profileCreatorInput.value.trim() !== "" || profileKeyInput.value.trim() !== "";
+    profileSaveButton.disabled = profileBusy || name === "" || !hasField;
+    profileSaveButton.textContent = profileBusy ? "Working…" : "Save profile";
+  }
+
+  function renderProfiles() {
+    profileList.replaceChildren();
+    if (profiles.length === 0) {
+      profileList.append(
+        el("div", { class: "row" }, el("div", { class: "row-copy" }, el("div", { class: "row-sub", text: "No profiles yet" }))),
+      );
+      return;
+    }
+    for (const profile of profiles) {
+      const key = profile.present ? `key ${profile.masked}` : "default key";
+      const creator = profile.creator ?? "no creator (uses --creator or the project's groupId)";
+      const editButton = el(
+        "button",
+        {
+          class: "btn",
+          type: "button",
+          on: {
+            click: () => {
+              profileNameInput.value = profile.name;
+              profileCreatorInput.value = profile.creator ?? "";
+              profileKeyInput.value = "";
+              renderProfileButtons();
+              profileCreatorInput.focus();
+            },
+          },
+        },
+        "Edit",
+      );
+      const removeButton = el(
+        "button",
+        { class: "btn", type: "button", on: { click: () => removeProfile(profile.name) } },
+        "Remove",
+      );
+      profileList.append(
+        el(
+          "div",
+          { class: "row" },
+          el(
+            "div",
+            { class: "row-copy" },
+            el("div", { class: "row-title", text: profile.name }),
+            el("div", { class: "row-sub", text: `${creator} · ${key}` }),
+          ),
+          el("div", { class: "row-actions" }, editButton, removeButton),
+        ),
+      );
+    }
+  }
+
+  function reportProfileError(error) {
+    showNotice(
+      profileNotice,
+      error?.isHostless || error?.isNotImplemented ? "warn" : "danger",
+      error?.isHostless
+        ? "Profiles are held by the desktop host, so they cannot be read or written in a browser preview."
+        : (error?.message ?? String(error)),
+    );
+  }
+
+  async function refreshProfiles() {
+    try {
+      profiles = await api.host.profileList();
+      renderProfiles();
+    } catch (error) {
+      reportProfileError(error);
+    }
+  }
+
+  async function saveProfile() {
+    const name = profileNameInput.value.trim();
+    profileBusy = true;
+    renderProfileButtons();
+    try {
+      const saved = await api.host.profileSet(name, profileCreatorInput.value.trim(), profileKeyInput.value);
+      // Cleared on success only, like the key above
+      profileNameInput.value = "";
+      profileCreatorInput.value = "";
+      profileKeyInput.value = "";
+      showNotice(
+        profileNotice,
+        "ok",
+        `Saved ${saved.name}. Upload with: wsync upload <files> --profile ${saved.name}`,
+      );
+      await refreshProfiles();
+    } catch (error) {
+      reportProfileError(error);
+    } finally {
+      profileBusy = false;
+      renderProfileButtons();
+    }
+  }
+
+  async function removeProfile(name) {
+    try {
+      await api.host.profileClear(name);
+      showNotice(profileNotice, "ok", `Removed ${name}.`);
+      await refreshProfiles();
+    } catch (error) {
+      reportProfileError(error);
+    }
+  }
+
+  renderProfiles();
+  void refreshProfiles();
+
+  layout.append(
+    section(
+      "Upload profiles",
+      "One per Roblox account or group you upload as. Each holds its own Open Cloud key, a default creator, or both — a profile without a key uses the key above. Pick one with: wsync upload --profile <name>",
+      profileList,
+      el(
+        "div",
+        { class: "row" },
+        el("div", { class: "row-copy", style: "flex:1" }, profileNameInput),
+        el("div", { class: "row-copy", style: "flex:1" }, profileCreatorInput),
+      ),
+      el(
+        "div",
+        { class: "row" },
+        el("div", { class: "row-copy", style: "flex:1" }, profileKeyInput),
+        el("div", { class: "row-actions" }, profileSaveButton),
+      ),
+      profileNotice,
+    ),
+  );
+
   // ---------------------------------------------------------- studio plugin --
   //
   // The host does the resolving, the verifying and the copying; this section
