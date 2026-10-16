@@ -720,3 +720,150 @@ fn upload_profiles_pick_their_own_key_and_creator() {
 	assert_eq!(status["configured"], true);
 	assert!(status["profiles"].get("owner").is_none());
 }
+
+/// The assets stub plus the Asset Permissions API: asset 98765 (what every
+/// upload completes as) and 111 are granted; 222 comes back in `errors` on a
+/// 200, the way the real API reports an asset its key cannot share
+fn grant_stub() -> CloudStub {
+	let assets = assets_stub(None);
+	let assets_base = assets.base_url.clone();
+
+	let stub = start_cloud_stub(Arc::new(move |request: &StubRequest| {
+		if request.method == "PATCH" && request.path == "/asset-permissions-api/v1/assets/permissions" {
+			let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+			let ids: Vec<u64> = body["requests"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.map(|item| item["assetId"].as_u64().unwrap())
+				.collect();
+
+			return (
+				200,
+				json!({
+					"successAssetIds": ids.iter().filter(|id| **id != 222).collect::<Vec<_>>(),
+					"errors": ids.iter().filter(|id| **id == 222).map(|id| json!({ "assetId": id, "code": "NoPermission" })).collect::<Vec<_>>(),
+				}),
+			);
+		}
+
+		// Everything else is the assets flow, proxied to its own stub
+		let client = reqwest::blocking::Client::new();
+		let response = client
+			.request(
+				reqwest::Method::from_bytes(request.method.as_bytes()).unwrap(),
+				format!("{assets_base}{}", request.path),
+			)
+			.headers(
+				request
+					.headers
+					.iter()
+					.filter(|(name, _)| name.as_str() != "host" && name.as_str() != "content-length")
+					.map(|(name, value)| {
+						(
+							reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+							reqwest::header::HeaderValue::from_str(value).unwrap(),
+						)
+					})
+					.collect(),
+			)
+			.body(request.body.clone())
+			.send()
+			.unwrap();
+		let status = response.status().as_u16();
+
+		(status, response.json().unwrap_or(Value::Null))
+	}));
+
+	std::mem::forget(assets);
+	stub
+}
+
+#[test]
+fn upload_grants_the_universe_use_and_grants_existing_assets() {
+	let stub = grant_stub();
+	let sandbox = CliSandbox::new();
+	let sound = sandbox.work.path().join("meow.ogg");
+
+	fs::write(&sound, b"OggS").unwrap();
+
+	let stored = sandbox.run_with_stdin(&["auth", "set", "--from-stdin"], b"sk-grant\n");
+
+	assert!(stored.status.success());
+
+	// Upload + grant: one upload line, then one grant line
+	let output = sandbox.run_with_envs(
+		&[
+			"upload",
+			&sound.to_string_lossy(),
+			"--creator",
+			"group:2804",
+			"--grant-universe",
+			"10769543567",
+			"--raw",
+		],
+		&[("WSYNC_CLOUD_BASE_URL", &stub.base_url)],
+	);
+
+	assert!(
+		output.status.success(),
+		"upload + grant failed: {}",
+		cli_stderr(&output)
+	);
+
+	let records = ndjson(&output);
+
+	assert_eq!(records.len(), 2, "{records:?}");
+	assert_eq!(records[0]["status"], "uploaded");
+	assert_eq!(records[1]["status"], "granted");
+	assert_eq!(records[1]["assetId"], "98765");
+	assert_eq!(records[1]["universeId"], "10769543567");
+
+	let grants = stub.requests_to("/asset-permissions-api/v1/assets/permissions");
+
+	assert_eq!(grants.len(), 1);
+	assert_eq!(grants[0].method, "PATCH");
+	assert_eq!(grants[0].header("x-api-key"), Some("sk-grant"));
+
+	let body: Value = serde_json::from_slice(&grants[0].body).unwrap();
+
+	assert_eq!(body["subjectType"], "Universe");
+	assert_eq!(body["subjectId"], "10769543567");
+	assert_eq!(body["action"], "Use");
+	assert_eq!(body["requests"][0]["assetId"], 98765);
+
+	// Grant-only: a 200 that lists an asset in `errors` is a failure
+	let output = sandbox.run_with_envs(
+		&[
+			"upload",
+			"--asset-id",
+			"111",
+			"--asset-id",
+			"222",
+			"--grant-universe",
+			"77",
+			"--raw",
+		],
+		&[("WSYNC_CLOUD_BASE_URL", &stub.base_url)],
+	);
+
+	assert!(!output.status.success(), "a refused grant must fail the command");
+
+	let records = ndjson(&output);
+
+	assert_eq!(records.len(), 2);
+	assert_eq!(records[0]["status"], "granted");
+	assert_eq!(records[0]["assetId"], "111");
+	assert_eq!(records[1]["status"], "grant-failed");
+	assert_eq!(records[1]["error"], "NoPermission");
+	assert_eq!(
+		stub.requests_to("/assets/v1/assets").len(),
+		1,
+		"--asset-id must not upload anything"
+	);
+
+	// --asset-id without a universe is refused by the parser
+	let output = sandbox.run(&["upload", "--asset-id", "111"]);
+
+	assert!(!output.status.success());
+}

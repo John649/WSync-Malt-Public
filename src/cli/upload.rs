@@ -36,8 +36,23 @@ use crate::{
 #[derive(Parser)]
 pub struct Upload {
 	/// Files or directories to upload (directories recurse)
-	#[arg(value_name = "FILES-OR-DIRECTORIES", required = true)]
+	#[arg(value_name = "FILES-OR-DIRECTORIES", required_unless_present = "asset_ids")]
 	targets: Vec<PathBuf>,
+
+	/// Grant this universe (experience) id permission to use every uploaded
+	/// asset, through the Asset Permissions API
+	#[arg(long = "grant-universe", value_name = "UNIVERSE-ID")]
+	grant_universe: Option<u64>,
+
+	/// Grant existing assets instead of uploading (repeatable; needs
+	/// --grant-universe)
+	#[arg(
+		long = "asset-id",
+		value_name = "ID",
+		requires = "grant_universe",
+		conflicts_with = "targets"
+	)]
+	asset_ids: Vec<u64>,
 
 	/// Project path (supplies the default group creator)
 	#[arg(long, value_name = "PATH")]
@@ -202,6 +217,11 @@ impl Upload {
 		let workspace = project_path.get_parent().to_owned();
 
 		let profile = cloud::select_profile(self.profile.as_deref())?;
+
+		if !self.asset_ids.is_empty() {
+			return self.grant_only(&workspace, profile.as_ref());
+		}
+
 		let profile_creator = profile
 			.as_ref()
 			.and_then(|selected| selected.profile.creator.as_deref());
@@ -251,6 +271,12 @@ impl Upload {
 			records.push(self.emit(record));
 		}
 
+		let mut grant_failures = 0;
+
+		if let Some(universe) = self.grant_universe {
+			grant_failures = self.grant_uploaded(&client, universe, &mut records)?;
+		}
+
 		let failed = count(&records, "failed");
 		let uploaded = count(&records, "uploaded");
 		let pending = count(&records, "pending");
@@ -262,6 +288,8 @@ impl Upload {
 				"ok": failed == 0,
 				"creator": creator.describe(),
 				"profile": profile.as_ref().map(|selected| selected.name.as_str()),
+				"grantUniverse": self.grant_universe,
+				"grantFailed": grant_failures,
 				"uploaded": uploaded,
 				"pending": pending,
 				"failed": failed,
@@ -299,7 +327,130 @@ impl Upload {
 			bail!("{failed} of {} upload(s) failed", uploaded + pending + failed);
 		}
 
+		if grant_failures > 0 {
+			bail!("{grant_failures} asset(s) uploaded but not granted to the universe");
+		}
+
 		Ok(())
+	}
+
+	/// Grants the universe use of every asset this run uploaded, and marks
+	/// each record. Pending (`--no-wait`) uploads have no asset id yet, so
+	/// they are reported as not granted rather than silently passed over
+	fn grant_uploaded(&self, client: &CloudClient, universe: u64, records: &mut [Value]) -> Result<usize> {
+		let ids: Vec<u64> = records
+			.iter()
+			.filter(|record| record["status"] == "uploaded")
+			.filter_map(|record| asset_id_of(&record["assetId"]))
+			.collect();
+
+		let outcome = if ids.is_empty() {
+			cloud::GrantOutcome {
+				granted: Vec::new(),
+				failed: Vec::new(),
+			}
+		} else {
+			cloud::grant_universe_use(client, universe, &ids)?
+		};
+
+		let mut failures = 0;
+
+		for record in records.iter_mut() {
+			match record["status"].as_str() {
+				Some("uploaded") => {
+					let Some(id) = asset_id_of(&record["assetId"]) else {
+						continue;
+					};
+
+					let error = outcome.failed.iter().find(|(failed, _)| *failed == id);
+
+					record["granted"] = json!(error.is_none());
+
+					if let Some((_, reason)) = error {
+						record["grantError"] = json!(reason);
+						failures += 1;
+					}
+
+					self.emit_grant(
+						id,
+						universe,
+						error.map(|(_, reason)| reason.as_str()),
+						record["file"].as_str(),
+					);
+				}
+				Some("pending") => {
+					record["granted"] = json!(false);
+					record["grantError"] = json!("no asset id yet (--no-wait); grant it later with --asset-id");
+					failures += 1;
+
+					if !self.raw {
+						wsync_warn!(
+							"Not granted {}: no asset id yet (--no-wait)",
+							record["file"].as_str().unwrap_or_default()
+						);
+					}
+				}
+				_ => {}
+			}
+		}
+
+		Ok(failures)
+	}
+
+	/// `--asset-id`: grant assets that already exist, upload nothing
+	fn grant_only(&self, workspace: &Path, profile: Option<&cloud::SelectedProfile>) -> Result<()> {
+		let universe = self
+			.grant_universe
+			.context("--asset-id needs --grant-universe <universe-id>")?;
+
+		let credential = cloud::resolve_credential(self.api_key_env.as_deref(), Some(workspace), profile)?;
+		let client = CloudClient::new(credential, self.auth == AuthMode::Bearer)?;
+		let outcome = cloud::grant_universe_use(&client, universe, &self.asset_ids)?;
+
+		for id in &self.asset_ids {
+			let error = outcome.failed.iter().find(|(failed, _)| failed == id);
+
+			self.emit_grant(*id, universe, error.map(|(_, reason)| reason.as_str()), None);
+		}
+
+		if !outcome.failed.is_empty() {
+			bail!(
+				"{} of {} asset(s) not granted to universe {universe}",
+				outcome.failed.len(),
+				self.asset_ids.len()
+			);
+		}
+
+		Ok(())
+	}
+
+	/// One grant result: an NDJSON line under --raw, a log line otherwise
+	fn emit_grant(&self, asset: u64, universe: u64, error: Option<&str>, file: Option<&str>) {
+		if self.raw {
+			let mut record = json!({
+				"ok": error.is_none(),
+				"status": if error.is_none() { "granted" } else { "grant-failed" },
+				"assetId": asset.to_string(),
+				"universeId": universe.to_string(),
+			});
+
+			if let Some(file) = file {
+				record["file"] = json!(file);
+			}
+
+			if let Some(error) = error {
+				record["error"] = json!(error);
+			}
+
+			print_json(&record);
+
+			return;
+		}
+
+		match error {
+			None => wsync_info!("Granted universe {universe} use of asset {}", asset.to_string().bold()),
+			Some(error) => wsync_warn!("Universe {universe} was not granted asset {asset}: {error}"),
+		}
 	}
 
 	/// Recursive directory walk in deterministic order. Unsupported files
@@ -470,6 +621,13 @@ impl Upload {
 
 		record
 	}
+}
+
+/// An asset id from a record — Open Cloud sends int64s as strings
+fn asset_id_of(value: &Value) -> Option<u64> {
+	value
+		.as_u64()
+		.or_else(|| value.as_str().and_then(|text| text.parse().ok()))
 }
 
 fn record_failed(path: &Path, error: &str) -> Value {

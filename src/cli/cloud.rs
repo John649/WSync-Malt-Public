@@ -311,6 +311,16 @@ impl CloudClient {
 		Ok(Self::finish(response))
 	}
 
+	pub fn patch_json(&self, path: &str, body: &Value) -> Result<CloudResponse> {
+		let response = self
+			.apply_auth(self.http.patch(format!("{}{path}", self.base)))
+			.json(body)
+			.send()
+			.with_context(|| format!("Failed to reach {}{path}", self.base))?;
+
+		Ok(Self::finish(response))
+	}
+
 	pub fn patch_multipart(&self, path: &str, form: Form) -> Result<CloudResponse> {
 		let response = self
 			.apply_auth(self.http.patch(format!("{}{path}", self.base)))
@@ -366,6 +376,101 @@ impl CloudClient {
 
 /// The trailing id of an operation handle — accepts a bare id, an
 /// `operations/<id>` path, or a full URL tail
+/// The Asset Permissions API's batch grant
+const GRANT_PATH: &str = "/asset-permissions-api/v1/assets/permissions";
+
+/// Assets per grant request — the API takes a list, and 100 requests a
+/// minute per key owner is its limit, so batch rather than loop
+const GRANT_BATCH: usize = 50;
+
+/// Per-asset results of a grant: which assets the universe may now use, and
+/// why the rest may not
+pub struct GrantOutcome {
+	pub granted: Vec<u64>,
+	pub failed: Vec<(u64, String)>,
+}
+
+/// Grant a universe (experience) permission to **use** assets the
+/// credential's owner controls — what Studio's "grant access to the
+/// destination experience" does, so audio or a mesh uploaded under one
+/// account or group plays in another's game.
+///
+/// The API answers 200 even when it granted nothing (a key without
+/// `asset-permissions:write`, an asset its owner does not control), naming
+/// the failures in `errors`; so an asset counts as granted only when it is
+/// listed in `successAssetIds`.
+pub fn grant_universe_use(client: &CloudClient, universe: u64, asset_ids: &[u64]) -> Result<GrantOutcome> {
+	let mut outcome = GrantOutcome {
+		granted: Vec::new(),
+		failed: Vec::new(),
+	};
+
+	for batch in asset_ids.chunks(GRANT_BATCH) {
+		let body = serde_json::json!({
+			"subjectType": "Universe",
+			"subjectId": universe.to_string(),
+			"action": "Use",
+			"requests": batch.iter().map(|id| serde_json::json!({ "assetId": id })).collect::<Vec<_>>(),
+		});
+
+		let response = client.patch_json(GRANT_PATH, &body)?;
+
+		if !response.success() {
+			let mut reason = response.error_message();
+
+			if response.status == 401 || response.status == 403 {
+				reason.push_str(" — the key needs the asset-permissions:write scope");
+			}
+
+			outcome.failed.extend(batch.iter().map(|id| (*id, reason.clone())));
+			continue;
+		}
+
+		let value = response.value();
+		let id_of = |item: &Value| {
+			item.as_u64()
+				.or_else(|| item.as_str().and_then(|text| text.parse().ok()))
+		};
+		let succeeded: Vec<u64> = value
+			.get("successAssetIds")
+			.and_then(Value::as_array)
+			.map(|ids| ids.iter().filter_map(id_of).collect())
+			.unwrap_or_default();
+		let errors: Vec<(u64, String)> = value
+			.get("errors")
+			.and_then(Value::as_array)
+			.map(|errors| {
+				errors
+					.iter()
+					.filter_map(|error| {
+						let id = error.get("assetId").and_then(id_of)?;
+						let code = error
+							.get("code")
+							.map(|code| code.as_str().map_or_else(|| code.to_string(), str::to_owned))
+							.unwrap_or_else(|| "unknown error".to_owned());
+
+						Some((id, code))
+					})
+					.collect()
+			})
+			.unwrap_or_default();
+
+		for id in batch {
+			if succeeded.contains(id) {
+				outcome.granted.push(*id);
+			} else if let Some((_, code)) = errors.iter().find(|(error_id, _)| error_id == id) {
+				outcome.failed.push((*id, code.clone()));
+			} else {
+				outcome
+					.failed
+					.push((*id, "Roblox did not confirm the grant".to_owned()));
+			}
+		}
+	}
+
+	Ok(outcome)
+}
+
 pub fn operation_id(handle: &str) -> &str {
 	handle.rsplit('/').next().unwrap_or(handle)
 }

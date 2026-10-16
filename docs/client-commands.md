@@ -1225,7 +1225,7 @@ Uploads Roblox assets through Open Cloud from files or directories.
 **Usage**
 
 ```sh
-wsync upload <files-or-directories>... [--project <path>] [--profile <name>] [--creator user:<id>|group:<id>] [--name <name>] [--asset-type animation|audio|image|decal|mesh|model|video] [--manifest <file>] [--auth bearer] [--api-key-env <name>] [--no-wait] [--raw]
+wsync upload (<files-or-directories>... | --asset-id <id>...) [--project <path>] [--profile <name>] [--creator user:<id>|group:<id>] [--grant-universe <universe-id>] [--name <name>] [--asset-type animation|audio|image|decal|mesh|model|video] [--manifest <file>] [--auth bearer] [--api-key-env <name>] [--no-wait] [--raw]
 ```
 
 **Examples**
@@ -1233,6 +1233,8 @@ wsync upload <files-or-directories>... [--project <path>] [--profile <name>] [--
 ```sh
 wsync upload ./icon.png --creator user:123456
 wsync upload ./sound.ogg --project . --profile studio-group --asset-type audio
+wsync upload ./meow.ogg --project . --profile studio-group --grant-universe 10769543567
+wsync upload --asset-id 1234567890 --grant-universe 10769543567 --profile owner
 wsync upload ./sound.mp3 ./models --project . --manifest uploaded-assets.json
 wsync upload ./clip.rbxm --project . --asset-type animation
 ```
@@ -1243,6 +1245,7 @@ wsync upload ./clip.rbxm --project . --asset-type animation
 - The creator is `--creator`, else the selected profile's creator, else the project's `groupId`. A profile named but not stored is refused before any upload.
 - Directories recurse by default, skip unsupported files, and continue after per-file failures.
 - Use `--auth bearer` for OAuth tokens instead of API keys. `--no-wait` returns operation handles instead of polling each asset to completion.
+- `--grant-universe <id>` grants that experience permission to use every uploaded asset through the Open Cloud Asset Permissions API, so an asset owned by one account or group can be used in another's game; `--asset-id` (repeatable) grants existing assets without uploading. The key needs the `asset-permissions:write` scope. The API can answer 200 while refusing an asset, so only assets it lists as granted count; anything else, and `--no-wait` uploads that have no asset id yet, fails the command.
 
 ---
 
