@@ -255,6 +255,7 @@ impl Cli {
 
 			// Live inspection & Studio control additions
 			Commands::Snapshot(command) => command.main(),
+			Commands::Rbxl(command) => command.main(),
 			Commands::Backlog(command) => command.main(),
 			Commands::Services(command) => command.main(),
 			Commands::Open(command) => command.main(),
@@ -349,6 +350,7 @@ pub enum Commands {
 	Branch(branch::Branch),
 
 	Snapshot(live::Snapshot),
+	Rbxl(live::Rbxl),
 	Backlog(live::Backlog),
 	Services(live::Services),
 	Open(open::Open),

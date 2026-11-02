@@ -112,6 +112,11 @@ pub const CHOICE_DETAILS_BYTE_BUDGET: usize = 512 * 1024;
 pub const SELECTION_CHUNK_MAX_IDS: usize = 2048;
 pub const SELECTION_BODY_MAX_BYTES: usize = 64 * 1024;
 
+/// The place file the daemon keeps beside the project file: the connected
+/// Studio's place as a binary `.rbxl`, for tools that read places offline
+/// (Lune's `roblox.deserializePlace`). See docs/place-file.md
+pub const PLACE_FILE: &str = "place.rbxl";
+
 /// Runtime directories WSync creates inside a served workspace. They are part
 /// of the default ignore set (Design §12: gitignored runtime dirs) so their
 /// churn never re-enters the sync pipeline

@@ -692,7 +692,19 @@ impl Client {
 	}
 
 	pub fn post_endpoint(&self, path: &str, body: &Value) -> Result<Endpoint> {
-		let response = self.http.post(self.url(path)).json(body).send().with_context(|| {
+		self.post_endpoint_with_timeout(path, body, self.timeout_ms)
+	}
+
+	/// [`Self::post_endpoint`] for a route that legitimately outlasts the 5 s
+	/// default, such as `/place-file`, which serializes a place in Studio
+	pub fn post_endpoint_with_timeout(&self, path: &str, body: &Value, timeout_ms: u64) -> Result<Endpoint> {
+		let response = self
+			.http
+			.post(self.url(path))
+			.timeout(Duration::from_millis(timeout_ms + HTTP_SLACK_MS))
+			.json(body)
+			.send()
+			.with_context(|| {
 			format!(
 				"Failed to reach {path} on the daemon at {}",
 				self.target.route.describe()

@@ -2,7 +2,7 @@
 
 # wsync command reference
 
-70 commands in 15 categories. Every entry is generated from one JSON file
+71 commands in 15 categories. Every entry is generated from one JSON file
 under `docs/commands/`; edit the JSON and re-run `node scripts/build-command-docs.mjs`.
 
 `wsync commands [name] [--compact]` serves this same registry from the binary, and the desktop
@@ -14,7 +14,7 @@ Docs view renders it from `docs/client-commands.generated.json`.
 - [Daemon](#daemon) (4) — `daemon`, `places`, `serve`, `stop`
 - [Command registry](#command-registry) (3) — `commands`, `context`, `plan`
 - [Agent runtime](#agent-runtime) (4) — `capabilities`, `capture`, `playtest`, `run`
-- [Live inspection](#live-inspection) (14) — `query`, `get`, `ls`, `tree`, `snapshot`, `backlog`, `services`, `props`, `source`, `find`, `find-attr`, `classinfo`, `enums`, `enum`
+- [Live inspection](#live-inspection) (15) — `query`, `get`, `ls`, `tree`, `snapshot`, `rbxl`, `backlog`, `services`, `props`, `source`, `find`, `find-attr`, `classinfo`, `enums`, `enum`
 - [Path tools](#path-tools) (3) — `path`, `meta`, `where`
 - [Live diagnostics](#live-diagnostics) (8) — `lint`, `tail`, `watch`, `logs`, `status`, `doctor`, `ping`, `version`
 - [Open Cloud](#open-cloud) (2) — `upload`, `monetization`
@@ -701,6 +701,35 @@ wsync snapshot --project . --output snapshots/
 - The export covers the whole DataModel projection, not only script-backed instances, and uses the same tagged-value encoding as the sync protocol.
 - Backed by the daemon `/snapshot` route, which also serves subtree exports by ref.
 - This is a backup and debugging tool. It is the most expensive read in the CLI; reach for `tree`, `ls`, or `query` first.
+
+---
+
+### `wsync rbxl`
+
+Refreshes place.rbxl beside the project file: the connected Studio's whole place as a binary place file, for offline tools such as Lune.
+
+**Usage**
+
+```sh
+wsync rbxl [--project <path>] [--port <port>] [--timeout <seconds>] [--raw]
+```
+
+**Examples**
+
+```sh
+wsync rbxl --project .
+wsync rbxl --project . --raw
+wsync rbxl --project . --timeout 600
+```
+
+**Notes**
+
+- The file is always `place.rbxl` next to the project file. Open it from Lune with `roblox.deserializePlace(fs.readFile("place.rbxl"))`; run this command first when the script needs Studio's current state.
+- It is made from what Studio holds, not from disk, so Studio-only instances (parts, UI, models) are in it even in a code-scope project. Each service is serialized by Roblox SerializationService, so classes, properties, attributes, tags, scripts, and references within a service survive; references that cross services are dropped, and a service's own properties travel separately (refs excluded).
+- The daemon also refreshes the file in the background while Studio is connected: every `place_file_interval` seconds (default 300), never during a playtest or in the first 30 seconds of a connection. Set `place_file = false` in `wsync.toml` to turn the background refresh off; this command still works.
+- Only services that changed since their last capture are serialized again. Serializing freezes Studio while it runs (seconds for a very large service), so an unchanged place costs nothing and a first capture costs the most.
+- The write is atomic: a reader never sees a half-written file. When nothing is connected the command fails and says whether an older copy is on disk.
+- The daemon adds `place.rbxl` to the repository's `.git/info/exclude` when nothing ignores it yet, so a branch finish never commits it.
 
 ---
 

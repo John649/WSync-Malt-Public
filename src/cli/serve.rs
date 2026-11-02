@@ -158,7 +158,9 @@ impl Serve {
 			});
 		}
 
-		let server = Server::new(core, &host, port, ServerIdentity::unmanaged()).with_hub(true);
+		let server = Server::new(core, &host, port, ServerIdentity::unmanaged())
+			.with_hub(true)
+			.with_place_file(true);
 		let bound = Arc::new(AtomicU16::new(port));
 
 		let ready: Box<dyn FnOnce(u16) + Send> = {

@@ -95,6 +95,7 @@ use std::{
 
 use crate::{
 	cli::client::{print_json, truncate, Client, Envelope, Target, Targeting},
+	constants::PLACE_FILE,
 	daemon, docsgen,
 	ext::PathExt,
 	hub,
@@ -893,7 +894,10 @@ impl Finish {
 		// an unstage of a path that is not staged is simply a no-op
 		git_out(&worktree, &["add", "-A", "--", "."])?;
 
-		let mut unstage = vec!["reset", "-q", "--"];
+		// The branch daemon's place file goes back out with the docs: the
+		// daemon excludes it from git, but a repository whose exclude file it
+		// could not write would otherwise merge a multi-megabyte binary
+		let mut unstage = vec!["reset", "-q", "--", PLACE_FILE];
 
 		unstage.extend(GENERATED_DOCS.iter().copied());
 		git_try(&worktree, &unstage).ok();

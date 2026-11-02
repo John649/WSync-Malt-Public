@@ -13,7 +13,9 @@
 -- and their PlayServer/PlayClient runtime agents over PluginConnectionService
 -- (playtest.json; wave-6 pinned contracts); Branch carries the branch and
 -- journal ops (docs/branches.md — checkpoint numbering, the append-only
--- journal and the Studio replay a merge runs on main). Every handler returns a
+-- journal and the Studio replay a merge runs on main); PlaceFile serializes
+-- the place service by service for the daemon's `place.rbxl`
+-- (docs/place-file.md). Every handler returns a
 -- JSON-safe value or raises a RemoteError (Remote/Error.luau).
 
 local Meta = require(script.Meta)
@@ -30,6 +32,7 @@ local Transmit = require(script.Transmit)
 local Clipboard = require(script.Clipboard)
 local Playtest = require(script.Playtest)
 local Branch = require(script.Branch)
+local PlaceFile = require(script.PlaceFile)
 
 export type Handler = (args: { [string]: any }, ctx: any) -> any
 
@@ -51,6 +54,7 @@ for _, family in
 		Clipboard.ops,
 		Playtest.ops,
 		Branch.ops,
+		PlaceFile.ops,
 	} :: { { [string]: Handler } }
 do
 	for name, handler in family do

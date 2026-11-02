@@ -212,6 +212,22 @@ impl WsState {
 		slot.as_ref().map(|conn| (conn.name.clone(), conn.transport_name()))
 	}
 
+	/// The queue id of the connected WS plugin. Every connection gets a new
+	/// one, so it tells "the same Studio connection" from "a reconnect", which
+	/// the plugin's name cannot
+	pub fn plugin_connection(&self) -> Option<u32> {
+		let slot = lock!(self.plugin);
+
+		match &*slot {
+			Some(PluginConn {
+				queue_id,
+				transport: PluginTransport::Ws { .. },
+				..
+			}) => Some(*queue_id),
+			_ => None,
+		}
+	}
+
 	/// Returns the WS plugin's outbound frame queue, or a typed reason why
 	/// requests cannot be routed right now
 	pub fn plugin_frames(&self) -> Result<mpsc::Sender<String>, &'static str> {

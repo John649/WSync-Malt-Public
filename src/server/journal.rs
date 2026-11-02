@@ -970,7 +970,7 @@ pub async fn pull(State(state): State<AppState>) -> Response {
 /// One blob, over the ops the CLI's own pull uses: `branch_blob_open` for the
 /// size and digest, `branch_blob_read` in bounded base64 parts, and the
 /// digest checked before anything is called stored
-async fn pull_blob(state: &AppState, id: &str) -> Result<Vec<u8>, String> {
+pub(crate) async fn pull_blob(state: &AppState, id: &str) -> Result<Vec<u8>, String> {
 	let opened = bulk::plugin_request(
 		state,
 		"branch_blob_open",

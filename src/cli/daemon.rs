@@ -544,7 +544,8 @@ impl Start {
 
 		let server = Server::new(core, &host, port, identity)
 			.with_ephemeral(self.ephemeral)
-			.with_hub(true);
+			.with_hub(true)
+			.with_place_file(true);
 		let bound_port = Arc::new(AtomicU16::new(port));
 
 		let ready: Box<dyn FnOnce(u16) + Send> = {

@@ -39,6 +39,7 @@ mod open;
 pub mod operation;
 pub mod ops;
 mod pause;
+pub mod place_file;
 mod read;
 pub mod request;
 pub mod resolve;
@@ -153,6 +154,7 @@ pub struct AppState {
 	backlog: Arc<backlog::BacklogStore>,
 	audit: Arc<audit::WritesLog>,
 	journal: Arc<journal::JournalStore>,
+	place_file: Arc<place_file::PlaceFileStore>,
 }
 
 pub struct Server {
@@ -168,6 +170,11 @@ pub struct Server {
 	/// Register with the hub (src/hub) for as long as the server runs. Off
 	/// for embedded and test servers, which are addressed by their port
 	hub: bool,
+	/// Keep `place.rbxl` refreshed in the background while a Studio is
+	/// connected (docs/place-file.md). Off for embedded and test servers,
+	/// whose fake plugins would be asked for captures nobody scripted;
+	/// `POST /place-file` works either way
+	place_file: bool,
 }
 
 impl Server {
@@ -180,6 +187,7 @@ impl Server {
 			state_dir: None,
 			ephemeral: false,
 			hub: false,
+			place_file: false,
 		}
 	}
 
@@ -187,6 +195,13 @@ impl Server {
 	/// registered (starting a hub when none answers) until it stops
 	pub fn with_hub(mut self, hub: bool) -> Self {
 		self.hub = hub;
+		self
+	}
+
+	/// Refreshes `place.rbxl` in the background while a Studio is connected,
+	/// as the `place_file` settings say (docs/place-file.md)
+	pub fn with_place_file(mut self, place_file: bool) -> Self {
+		self.place_file = place_file;
 		self
 	}
 
@@ -293,6 +308,7 @@ impl Server {
 			// branch is fully described by its clone plus its journal, and
 			// both have to survive being copied with the project
 			journal: Arc::new(journal::JournalStore::new(&workspace_dir)),
+			place_file: Arc::new(place_file::PlaceFileStore::new()),
 		};
 
 		// A clash is never a question. The engine still parks — that is where
@@ -318,6 +334,10 @@ impl Server {
 
 		lifecycle::spawn_watchdog(state.clone());
 		lifecycle::spawn_ephemeral_watchdog(state.clone());
+
+		if self.place_file {
+			place_file::spawn_background(state.clone());
+		}
 
 		if self.hub {
 			let canonical_project = daemon::canonical_project(&self.core.project().path)
@@ -408,6 +428,7 @@ impl Server {
 					.post(journal::put_blob)
 					.fallback(Self::default_redirect),
 			)
+			.route("/place-file", post(place_file::main).fallback(Self::default_redirect))
 			.route("/sync", get(pause::status).fallback(Self::default_redirect))
 			.route("/sync/pause", post(pause::pause).fallback(Self::default_redirect))
 			.route("/sync/resume", post(pause::resume).fallback(Self::default_redirect))

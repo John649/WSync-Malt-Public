@@ -57,6 +57,10 @@ pub struct Config {
 	pub with_sourcemap: bool,
 	/// Build using XML format by default
 	pub build_xml: bool,
+	/// Keep place.rbxl in the project up to date while Studio is connected (a copy of the place Lune can read)
+	pub place_file: bool,
+	/// Seconds between automatic place.rbxl refreshes; only services that changed are serialized again
+	pub place_file_interval: usize,
 
 	/// Legacy compatibility setting; startup never checks for updates (use `wsync update`)
 	pub check_updates: bool,
@@ -131,6 +135,8 @@ impl Default for Config {
 			smart_paths: false,
 			with_sourcemap: false,
 			build_xml: false,
+			place_file: true,
+			place_file_interval: 300,
 
 			check_updates: true,
 			auto_update: false,
