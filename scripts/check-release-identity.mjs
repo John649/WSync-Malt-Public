@@ -387,7 +387,7 @@ async function main() {
 		}
 
 		// The embedded docs bundle, verbatim. This is the binary <-> docs link.
-		const bundleRun = runBinary(binPath, ["commands"]);
+		const bundleRun = runBinary(binPath, ["commands", "--full"]);
 		if (!bundleRun.ok) {
 			report.fail(
 				relative(binPath),
