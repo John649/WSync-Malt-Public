@@ -50,10 +50,19 @@
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
-      "icons/icon.png"
+      "icons/icon.png",
+      "icons/icon.ico"
     ],
     "macOS": {
       "minimumSystemVersion": "11.0"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "startMenuFolder": "WSync",
+        "displayLanguageSelector": false,
+        "installerHooks": "./windows/hooks.nsh"
+      }
     }
   },
   "plugins": {
