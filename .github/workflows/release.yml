@@ -118,6 +118,17 @@ jobs:
           rojo --version
           wally --version
 
+      # build.mjs needs a wsync binary: the middleware it injects comes from
+      # the engine (same step as ci.yml's plugin-artifact job).
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-plugin-builder
+
+      - name: Build the engine that packages the plugin
+        run: cargo build
+
       # --check first, against the manifest exactly as committed: a release
       # must not be the moment anyone discovers the manifest was stale.
       - name: Committed manifest matches a fresh build
