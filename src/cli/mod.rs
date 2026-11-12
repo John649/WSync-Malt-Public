@@ -8,6 +8,7 @@ use std::env;
 use crate::util;
 
 mod auth;
+#[cfg(feature = "branches")]
 mod branch;
 mod build;
 mod client;
@@ -251,6 +252,7 @@ impl Cli {
 			Commands::Auth(command) => command.main(),
 
 			// Branches
+			#[cfg(feature = "branches")]
 			Commands::Branch(command) => command.main(),
 
 			// Live inspection & Studio control additions
@@ -347,6 +349,7 @@ pub enum Commands {
 
 	Auth(auth::Auth),
 
+	#[cfg(feature = "branches")]
 	Branch(branch::Branch),
 
 	Snapshot(live::Snapshot),

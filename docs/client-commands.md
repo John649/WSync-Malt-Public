@@ -2,7 +2,7 @@
 
 # wsync command reference
 
-71 commands in 15 categories. Every entry is generated from one JSON file
+70 commands in 15 categories. Every entry is generated from one JSON file
 under `docs/commands/`; edit the JSON and re-run `node scripts/build-command-docs.mjs`.
 
 `wsync commands [name] [--compact]` serves this same registry from the binary, and the desktop
@@ -10,7 +10,7 @@ Docs view renders it from `docs/client-commands.generated.json`.
 
 ## Contents
 
-- [Project setup](#project-setup) (4) — `init`, `plugin`, `auth`, `branch`
+- [Project setup](#project-setup) (3) — `init`, `plugin`, `auth`
 - [Daemon](#daemon) (4) — `daemon`, `places`, `serve`, `stop`
 - [Command registry](#command-registry) (3) — `commands`, `context`, `plan`
 - [Agent runtime](#agent-runtime) (4) — `capabilities`, `capture`, `playtest`, `run`
@@ -123,53 +123,6 @@ wsync auth clear --profile owner --raw
 - Secrets resolve to the OS keychain first. The CLI fallback store uses a private per-user data directory with mode 0600 on Unix; it is filesystem-permission protected, not an OS keychain.
 - `upload` and `monetization` discover this store before falling back to `--api-key-env` and then to the `ROBLOX_API_KEY`, `CLOUD_API_KEY`, and `ROBLOX_OPEN_CLOUD_API_KEY` environment variables.
 - `--profile <name>` stores a named profile (one per Roblox account or group) holding its own key, a default `--creator`, or both; `--creator` alone makes a profile that switches only the creator and borrows the normal credential chain. `status` lists every profile with masked key tails. `upload` and `monetization` select one with `--profile` or `WSYNC_PROFILE`.
-
----
-
-### `wsync branch`
-
-Creates, lists, reopens, closes and merges branches: a git worktree, its own daemon, a Studio on an immutable clone of the place, and the journal of what that Studio changed.
-
-**Usage**
-
-```sh
-wsync branch <new|ls|up|rm|finish|pick> [<name>] [--project <path>] [options]
-```
-
-**Subcommands**
-
-- `new` — safety `controls-local-service`, requires `project`, `daemon`, `studio-plugin`, `studio-application`, `git`
-- `ls` — safety `read-only`, requires `project`, `git`
-- `up` — safety `controls-local-service`, requires `project`, `studio-application`, `git`
-- `rm` — safety `controls-local-service`, requires `project`, `git`
-- `finish` — safety `mutates-studio`, requires `project`, `daemon`, `studio-plugin`, `git`
-- `pick` — safety `writes-local-files`, requires `project`
-
-**Examples**
-
-```sh
-wsync branch new reward-rooms --project .
-wsync branch ls --project . --raw
-wsync branch up reward-rooms --project .
-wsync branch finish reward-rooms --project .
-wsync branch finish reward-rooms --allow-missing-blobs --project .
-wsync branch pick reward-rooms 2 theirs --project .
-wsync branch rm reward-rooms --purge --project .
-```
-
-**Notes**
-
-- A branch is four things: the git worktree .wsync-branches/<name>/tree on branch wsync/<name>, a daemon started on that worktree, a Studio opened on the immutable clone .wsync-branches/<name>/<name>.rbxl, and the journal that clone's plugin pushes to its daemon. The record .wsync-branches/<name>/branch.json describes all four.
-- New takes the checkpoint from main's Studio, downloads one blob per service, assembles the clone with a ServerStorage/WSyncBranch marker, writes the worktree's project file with initialSync disk and a synthetic placeId derived from the name, starts the branch daemon, launches Studio, and has the branch plugin adopt main's numbering. The counts are not expected to match, because Studio adds instances of its own as it opens a place file: the checkpoint also carries a compact shape of the numbered tree, which travels to the branch daemon and lets adopt align by name and class. A clone the shape cannot be aligned against is refused, with what it matched and what was extra or missing.
-- The clone is immutable and the journal is the state, so up reopens the clone, adopts the numbering again and replays the branch's own journal into its own Studio. Nothing is rewritten on autosave.
-- Finish commits the worktree, then commits exactly the files main has changed that the branch also touched (the daemon regenerates the agent docs on every plugin connect, which would otherwise make git refuse the merge outright); unrelated changes in main are left alone and counted. It then runs git merge --no-ff --no-commit in the main checkout, flushes the branch journal, pauses main's sync, and replays the events into main's Studio. Git conflicts and replay conflicts both stop the merge and exit 3; replay conflicts are parked in .wsync-branches/<name>/conflicts.json.
-- Pick writes .wsync-branches/<name>/decisions.json; ours keeps main's value, theirs takes the branch's. Run branch finish again to apply the rest: that rerun resumes the merge git already has in progress instead of starting another, skipping the parking commit that git would reject as a partial commit mid-merge. A merge someone already committed is treated as done, not as a failure, and both files are cleared once the branch is finished.
-- A merge is not committed when the replay stopped early or had to skip an added subtree whose bytes exist nowhere any more; the git merge stays in progress and a rerun resumes it, the plugin's per-checkpoint ledger skipping what already landed. Before a subtree is called lost, finish asks the live branch Studio to serialize the instance again (journal_recapture), because its pinned copy expires ten minutes after the daemon last touched it and a daemon that was down or restarted never pulled it; a branch daemon that is not answering is started again first. The replay itself goes over in chunks of 250 events so no single call outlasts the daemon's heartbeat. --allow-missing-blobs commits anyway, for subtrees carried over by hand; the wsync-branch-recovery skill is the manual ladder for everything the rerun does not clear.
-- The merge commit is scoped to git diff --name-only HEAD...MERGE_HEAD plus the conflicted paths. The branch directory is never added, and the main checkout's sync is resumed whether the replay succeeded or failed. Main's own project file is restored from HEAD before the commit, so a merge never hands main the branch's name, branch field or synthetic place ID. WSync does not request a programmatic place save. Branch state is preserved by the serialized clone and journal until explicitly purged; save merged instance changes through main Studio's native save controls when needed.
-- Rm stops the Studio and the daemon and keeps the worktree, the clone and the journal. --purge also removes the worktree, deletes the branch wsync/<name> and the directory, and refuses a dirty worktree unless --force.
-- One owner per branch is recorded in branch.json. A branch whose owner process is gone is adopted by the next command; a branch whose owner is still running is refused unless --steal. At most three branch Studios are live at once (--budget overrides), because past Roblox's window cap a launch succeeds into a windowless stub; a refusal names branch rm.
-- Every subcommand runs from the main checkout. Running inside a branch worktree is refused: a branch of a branch has no checkpoint to fork from.
-- Scripts are not in the journal. WSync writes every script to disk as it changes, so a branch's script work is its worktree and finish merges it with git; the Studio replay skips file-backed script sources.
 
 ---
 

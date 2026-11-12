@@ -23,6 +23,9 @@ path = "src/lib.rs"
 
 [features]
 plugin = []
+# `wsync branch` (worktree + daemon + Studio clone + journal merge). Off in
+# this build: the code stays, the command is not compiled in.
+branches = []
 
 [dependencies]
 rbx_xml = "3.0.0"
